@@ -4,10 +4,10 @@ setup(
     name='django-cmd-async',
     version='2.2.0',
     packages=['commands_async'],
-    url='https://github.com/alexsilva/django-cmd-async',
+    url='https://github.com/alessandrohc/django-cmd-async',
     license='MIT',
-    author='alex',
-    author_email='alex@fabricadigital.com.br',
+    author='Alessandro Hecht',
+    author_email='alessandrohc@gmail.com',
     description='Web execution of commands asynchronously.',
     include_package_data=True,
     classifiers=[

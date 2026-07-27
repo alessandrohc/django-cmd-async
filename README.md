@@ -34,5 +34,10 @@ In browser: http://localhost:8080/app/commands/async
 
 ## Visual Result
 
-![Input view](https://github.com/alexsilva/django-cmd-async/raw/master/look/command.output.input.method.PNG)
-![List view](https://github.com/alexsilva/django-cmd-async/raw/master/look/command.output.list.method.PNG)
+![Input view](https://github.com/alessandrohc/django-cmd-async/raw/python3-dj32/look/command.output.input.method.PNG)
+![List view](https://github.com/alessandrohc/django-cmd-async/raw/python3-dj32/look/command.output.list.method.PNG)
+
+## Credits
+
+Maintained by [Alessandro Hecht](https://github.com/alessandrohc).
+Originally created by [Alex Sandro](https://github.com/alexsilva) — released under the MIT license (see [LICENSE](LICENSE)).
