@@ -5,155 +5,37 @@
 {% block title %}{% trans "Run tasks" %}{% endblock %}
 
 {% block extrahead %}
-       <!-- Latest compiled and minified CSS -->
     <link rel="stylesheet" href="{% static "cmdasync/styles.css" %}">
-    <script type="application/javascript" src="{% static "cmdasync/js/cmdhandler.js" %}"></script>
+    <script nonce="{{ csp_nonce }}" src="{% static "cmdasync/js/cmdhandler.js" %}"></script>
     {% if settings.COMMANDS_ASYNC_WORKERS_STATUS_CHECK %}
-    <script type="application/javascript" src="{% static 'cmdasync/js/celery.workers.status.js' %}"></script>
+    <script nonce="{{ csp_nonce }}" src="{% static "cmdasync/js/celery.workers.status.js" %}"></script>
     {% endif %}
-    <script type="application/javascript">
-        $(document).ready(function () {
-            {% if settings.COMMANDS_ASYNC_WORKERS_STATUS_CHECK %}
-            workers_check_status();
-            {% endif %}
-            cmdasyncform.init("#task-output");
-            var rel_inputs = {
-                'args': 'task-args',
-                'kwargs': 'task-kwargs',
-                'app_command': 'task-app-command'
-            };
-            $("#task-copy").click(function(){
-               cmdasyncform.copyToClipboard("#task-output");
-            });
-            // passing parameters.
-            $("#task-args").change(function(){ $("#id_args").val($(this).val());});
-            $("#task-kwargs").change(function(){ $("#id_kwargs").val($(this).val());});
-            // show/hide copy button
-            $("#task-app-command").focusin(function () {
-                $("#task-copy").addClass("d-none");
-            }).focusout(function () {
-                if ($("#task-output").text().length > 0)
-                    $("#task-copy").removeClass("d-none");
-            });
-            var $btnSubmit = $("#btn-task-submit");
-            $btnSubmit.click(function() {
-                $(this).find(".task-progress").removeClass("d-none");
-                $("#task-copy").addClass("d-none");
-                cmdasyncform.clear_output();
-            });
-            {% if settings.COMMANDS_ASYNC_LIST %}
-            $(".dropdown-menu > a").on('click', function () {
-                var value = $(this).attr("href");
-                value = value.substring(1, value.length);
-
-                var items = value.split(".");
-                var app_command = items[items.length-1];
-                var app_name = items.slice(0, -1).join(".").toUpperCase();
-
-                $("#form-app_name").html(app_name);
-                $("#task-app-command").find("> span.info").html(app_command);
-
-                $("input#id_app_command").val(value);
-                // stop status update
-                cmdasyncform.update_abort();
-                cmdasyncform.clear_output();
-            });
-            {% else %}
-            $btnSubmit.click(function(){
-                $("#id_app_command").val($("#task-app-command").val());
-            });
-            {% endif %}
-
-            $("#btn-task-cancel").click(function () {
-                var $btnCancel = $(this).prop('disabled', true);
-                $btnCancel.find(".task-progress").removeClass("d-none");
-                cmdasyncform.update_abort();
-            });
-
-            $("#btn-task-revoke").click(function () {
-                var $btnRevoke = $(this).prop('disabled', true);
-                $btnRevoke.find(".task-progress").removeClass("d-none");
-                cmdasyncform.revoke_task.bind(cmdasyncform)();
-            });
-
-            var requestErrorClean = function() {
-                $(".invalid-feedback").remove();
-                for (var name in rel_inputs) {
-                    $("#" + rel_inputs[name]).removeClass("is-invalid");
-                }
-            };
-
-            var requestUpdateFinish = function() {
-                var $btnSubmit = $('#btn-task-submit').prop('disabled', false);
-                $btnSubmit.find(".task-progress").addClass("d-none");
-
-                var $btnCancel = $("#btn-task-cancel").prop('disabled', true);
-                $btnCancel.find(".task-progress").addClass("d-none");
-
-                var $btnRevoke = $("#btn-task-revoke").prop('disabled', true);
-                $btnRevoke.find(".task-progress").addClass("d-none");
-
-                // show/hide copy button
-                $("#task-copy")[$("#task-output").text().length > 0 ? "removeClass" : "addClass"]("d-none");
-            };
-
-            cmdasyncform.ajax("form#taskform", {
-                beforeSubmit: function(arr, $form, options) {
-                    var $btnSubmit = $form.find('#btn-task-submit');
-                    if ($btnSubmit.attr('disabled'))
-                        return false;
-                    $btnSubmit.prop('disabled', true);
-                    $form.find("#btn-task-cancel").prop('disabled', false);
-                    $form.find("#btn-task-revoke").prop('disabled', false);
-                },
-                error: function(xhr) {
-                    requestErrorClean();
-                    switch (xhr.status) {
-                        case 200:  // need login
-                            var url = ["{{ settings.COMMANDS_ASYNC_LOGIN_URL }}"];
-                            url.push("?{{ settings.COMMANDS_ASYNC_REDIRECT_FIELD_NAME }}=");
-                            url.push("{% url 'command-async:index' %}");
-                            window.location = url.join("");
-                            break;
-                        case 400:
-                            var $input, data = xhr.responseJSON;
-                            var $feedback = $('<div class="invalid-feedback"></div>');
-                            for (var name in data.form.errors) {
-                                $input = $("#" + rel_inputs[name]);
-                                $input.addClass("is-invalid");
-                                $input.parent().append($feedback.clone().html(data.form.errors[name][0]));
-                            }
-                            break;
-                    }
-                    requestUpdateFinish();
-                }
-            });
-            cmdasyncform.add_event_callback("updating", function($form) {
-                $("#task-output").text("{% trans "Running command..." %}");
-            });
-            cmdasyncform.add_event_callback("form-valid",
-                function(responseText, statusText, xhr, $form) {
-                requestErrorClean();
-            });
-            cmdasyncform.add_event_callback("update-finish",
-                function(form) {
-                requestUpdateFinish();
-            })
-        });
-    </script>
+    {# Last: it calls into the files above on DOM ready. #}
+    <script nonce="{{ csp_nonce }}" src="{% static "cmdasync/js/cmdasync-page.js" %}"></script>
 {% endblock %}
 
 {% block body %}
 {% include 'cmdasync/toast.html' %}
 
 <div class="container" id="wrap">
-    <div class="card" id="task-panel">
+{% comment %}
+Everything cmdasync-page.js needs from the server. The two flags are rendered as
+JSON booleans so jQuery.data() hands them over typed, and the message is
+translated here rather than in the .js so it stays in the catalog.
+{% endcomment %}
+    <div class="card" id="task-panel"
+         data-commands-list="{{ settings.COMMANDS_ASYNC_LIST|yesno:"true,false" }}"
+         data-workers-status-check="{{ settings.COMMANDS_ASYNC_WORKERS_STATUS_CHECK|yesno:"true,false" }}"
+         data-login-url="{{ settings.COMMANDS_ASYNC_LOGIN_URL }}"
+         data-redirect-field="{{ settings.COMMANDS_ASYNC_REDIRECT_FIELD_NAME }}"
+         data-index-url="{% url 'command-async:index' %}"
+         data-running-text="{% trans "Running command..." %}">
         <div class="card-body">
             {% block panelbody %}
             <h4>{% trans "Checking and updating environment" %}</h4>
             <p>
-                <strong>{% trans "Atenção:" %}</strong>
-                {% trans "It is strongly recommended that the systembe usedwith the aid of an approved technician." %}
+                <strong>{% trans "Warning:" %}</strong>
+                {% trans "It is strongly recommended that the system be used with the aid of an approved technician." %}
             </p>
             {% endblock %}
             <form id="taskform" action="." method="post">{% csrf_token %}
@@ -177,7 +59,7 @@
                     {{ form.as_ul }}
                     <button class="btn btn-success" type="submit" id="btn-task-submit">
                       <span class="spinner-grow spinner-grow-sm d-none task-progress" role="status" aria-hidden="true"></span>
-                      Execute
+                      {% trans "Execute" %}
                     </button>
 
                     <button class="btn btn-warning" type="button" id="btn-task-cancel" disabled>
@@ -200,5 +82,4 @@
         </div>
     </div>
 </div>
-{{ body.super }}
 {% endblock %}

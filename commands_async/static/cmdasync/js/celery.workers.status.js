@@ -13,12 +13,14 @@ var workers_check_status = function() {
     }).done(function(data) {
         var $body = $toast.find(".toast-body").empty();
         if (data.status) {
-            $toast.find('.online').html(data.workers.length);
+            $toast.find('.online').text(data.workers.length);
+            // Worker names and broker errors come from outside this process: build
+            // the element and set its text, never concatenate them into markup.
             $.each(data.workers, function (i, name) {
-                $body.append('<p class="text-muted">' + name + '</p>')
+                $body.append($('<p class="text-muted"></p>').text(name))
             })
         } else {
-            $body.html('<p class="text-muted">' + data.message + '</p>');
+            $body.append($('<p class="text-muted"></p>').text(data.message));
             setTimeout(workers_check_status, 5000);
         }
         $toast.toast("show");

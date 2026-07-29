@@ -6,28 +6,24 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
 
-    <!-- Latest compiled and minified CSS -->
-    <link rel="stylesheet" href="{% static "cmdasync/bootstrap-4.3.1/css/bootstrap.min.css" %}">
+    <link rel="stylesheet" href="{% static "cmdasync/bootstrap-4.6.2/css/bootstrap.min.css" %}">
 
-    <!-- HTML5 shim and Respond.js for IE8 support of HTML5 elements and media queries -->
-    <!-- WARNING: Respond.js doesn't work if you view the page via file:// -->
-    <!--[if lt IE 9]>
-      <script src="{% static "cmdasync/js/html5shiv.min.js" %}"></script>
-      <script src="{% static "cmdasync/js/respond.min.js" %}"></script>
-    <![endif]-->
+{% comment %}
+Every <script> carries the host project's CSP nonce. Under a nonce-only policy
+with 'strict-dynamic' the host allowlist ('self', https:) is ignored for scripts,
+so an external file is refused exactly like an inline block. `csp_nonce` comes
+from the project's context processor; standalone, or with the CSP off, it is empty
+and this renders as a harmless empty attribute.
+{% endcomment %}
+    <script nonce="{{ csp_nonce }}" src="{% static "cmdasync/js/jquery-3.7.1.min.js" %}"></script>
+    <script nonce="{{ csp_nonce }}" src="{% static "cmdasync/js/jquery.form.v4.4.2.min.js" %}"></script>
 
-    <!-- jQuery (necessary for Bootstrap's JavaScript plugins) -->
-    <script src="{% static "cmdasync/js/jquery-3.2.1.min.js" %}"></script>
-
-    <script src="{% static "cmdasync/js/jquery.form.v4.4.2.min.js" %}"></script>
-
-    <script src="{% static "cmdasync/bootstrap-4.3.1/js/util.js" %}"></script>
     <title>{% block title %}{% endblock %}</title>
     {% block extrahead %}{% endblock %}
 </head>
 <body>
 {% block body %}{% endblock %}
-<script src="{% static "cmdasync/bootstrap-4.3.1/js/popper.min.js" %}"></script>
-<script src="{% static "cmdasync/bootstrap-4.3.1/js/bootstrap.min.js" %}"></script>
+{# Bundle: Bootstrap plus the Popper build it expects, in one nonced request. #}
+<script nonce="{{ csp_nonce }}" src="{% static "cmdasync/bootstrap-4.6.2/js/bootstrap.bundle.min.js" %}"></script>
 </body>
 </html>

@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [python3-dj32, master]
+  pull_request:
+    branches: [python3-dj32, master]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: py${{ matrix.python-version }} / django${{ matrix.django-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+        django-version: ['4.2', '5.0', '5.1', '5.2']
+        exclude:
+          # Django 4.2 and 5.0 do not support Python 3.13.
+          - python-version: '3.13'
+            django-version: '4.2'
+          - python-version: '3.13'
+            django-version: '5.0'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package and pinned Django
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "Django~=${{ matrix.django-version }}.0" -e ".[test]"
+
+      - name: Show resolved versions
+        run: python -c "import sys, django, celery; print(sys.version); print(django.get_version()); print(celery.__version__)"
+
+      - name: Install gettext
+        # Not present on the ubuntu-latest image, so msgfmt has to be installed
+        # explicitly -- without it test_locale.py skips and a stale .mo sails through.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gettext
+
+      - name: Check msgfmt is available
+        run: msgfmt --version
+
+      - name: Run test suite
+        run: python runtests.py -v 1
+
+  deprecations:
+    name: deprecations as errors (py3.13 / django5.2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install package and the newest supported Django
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "Django~=5.2.0" -e ".[test]"
+
+      - name: Install gettext
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gettext
+
+      - name: Run test suite with deprecations promoted to errors
+        # Django announces removals as RemovedInDjangoXXWarning, which subclass
+        # (Pending)DeprecationWarning -- this is what turns "passes on 5.2" into
+        # "will still pass on 6.0". Scoped to the newest combination on purpose:
+        # older Django releases warn about their own internals, which says nothing
+        # about this package.
+        run: |
+          python -W error::DeprecationWarning \
+                 -W error::PendingDeprecationWarning \
+                 runtests.py -v 1
+
+  build:
+    name: build and metadata check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Validate distribution metadata
+        run: python -m twine check dist/*
+
+      - name: Assert the package data made it into the wheel
+        # Templates, static assets and compiled catalogs are most of this package;
+        # a packaging change that drops them still imports fine.
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+          wheel, = glob.glob('dist/*.whl')
+          names = zipfile.ZipFile(wheel).namelist()
+          for kind, pred in [
+              ('templates', lambda n: '/templates/' in n and n.endswith('.html')),
+              ('static', lambda n: '/static/' in n),
+              ('catalogs', lambda n: n.endswith('.mo')),
+          ]:
+              found = [n for n in names if pred(n)]
+              assert found, f'no {kind} in {wheel}'
+              print(f'{kind}: {len(found)}')
+          # The suite must not ship inside the distribution.
+          leaked = [n for n in names if n.startswith('test_cmdasync/')]
+          assert not leaked, f'the test package leaked into the wheel: {leaked[:3]}'
+          PY

@@ -1,3 +1,15 @@
+/**
+ * Everything a command prints is untrusted input.
+ *
+ * A management command's stdout can carry anything the system logged, including
+ * data submitted by third parties -- `read_logs` is the example in the project's
+ * own admin action. Handing that to jQuery as a string parses it as HTML, so it
+ * only ever reaches the DOM through a text node.
+ */
+function cmdasyncTextNode(value) {
+    return document.createTextNode(value === null || value === undefined ? '' : String(value));
+}
+
 cmdasyncform = {
     csrfSafeMethod: function(method) {
         // these HTTP methods do not require CSRF protection
@@ -66,14 +78,14 @@ cmdasyncform = {
                 if (task.ready) {
                     $output.empty();
                     if (!task.failed) {
-                        $output.append(task.output)
+                        $output.append(cmdasyncTextNode(task.output))
                     } else {
-                        $output.append(task.traceback)
+                        $output.append(cmdasyncTextNode(task.traceback))
                     }
                     if (self.debug) {
-                        $output.prepend("arguments(" + self.$form.serialize()  + ")\n");
-                        $output.prepend("command(" + self.task.command.name  + ")\n");
-                        $output.prepend("task-id(" + task.id + ")\n");
+                        $output.prepend(cmdasyncTextNode("arguments(" + self.$form.serialize() + ")\n"));
+                        $output.prepend(cmdasyncTextNode("command(" + self.task.command.name + ")\n"));
+                        $output.prepend(cmdasyncTextNode("task-id(" + task.id + ")\n"));
                     }
                     self.running = false;
                     self.exc_event_callbacks('update-finish', self.$form);

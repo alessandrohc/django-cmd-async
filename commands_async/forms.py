@@ -22,6 +22,12 @@ class TaskForm(forms.Form):
         self.app_name = None
 
     def clean_app_command(self):
+        """Splits the submitted value into the app name and the command name.
+
+        The dropdown submits ``app.label.command`` with a trailing ``#`` (kept in
+        the anchor href so clicking it does not navigate); the text input submits
+        a bare command name, and then there is no app to record.
+        """
         app_command = self.cleaned_data['app_command']
         app_command = app_command.rstrip("#")
         try:
@@ -31,6 +37,14 @@ class TaskForm(forms.Form):
         return app_command
 
     def clean_args(self):
+        """Parses the free-text arguments into a tuple.
+
+        The user types what they would type on a command line, so the brackets
+        are added when missing -- ``"a", "b"``, ``("a", "b")`` and ``["a", "b"]``
+        all have to work. ``literal_eval`` and never ``eval``: this input reaches
+        the form from the browser, so an expression must be a validation error,
+        not something the worker evaluates.
+        """
         command_args = self.cleaned_data['args']
         command_args = command_args.strip("() ")
         if isinstance(command_args, str):
@@ -45,6 +59,7 @@ class TaskForm(forms.Form):
         return command_args
 
     def clean_kwargs(self):
+        """Parses the free-text options into a dict -- see clean_args."""
         command_kwargs = self.cleaned_data['kwargs']
         command_kwargs = command_kwargs.strip()
         if isinstance(command_kwargs, str):

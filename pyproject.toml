@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "django-cmd-async"
+version = "2.3.0"
+description = "Web execution of Django management commands asynchronously, through Celery."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["django", "celery", "management", "commands", "async"]
+authors = [
+    { name = "Alex Sandro" },
+]
+maintainers = [
+    { name = "Alessandro Hecht", email = "alessandrohc@gmail.com" },
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Web Environment",
+    "Framework :: Django",
+    "Framework :: Django :: 4.2",
+    "Framework :: Django :: 5.0",
+    "Framework :: Django :: 5.1",
+    "Framework :: Django :: 5.2",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Natural Language :: English",
+    "Natural Language :: Portuguese (Brazilian)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    # Upper bound on purpose: the validated range -- and what the classifiers
+    # above claim -- stops at 5.2. Without a ceiling the resolver would install
+    # the next major unannounced.
+    "django>=4.2,<6.0",
+    # tasks.py builds on shared_task; views.py reads current_app.control and
+    # AsyncResult. The 5.5 floor is not about the API but about the interpreter:
+    # it is the first release declaring support for Python 3.13, which this
+    # package claims above.
+    "celery>=5.5,<6.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "coverage>=7.0",
+    # test_packaging.py reads this file; tomllib is only stdlib from 3.11 on.
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.urls]
+Homepage = "https://github.com/alessandrohc/django-cmd-async"
+Source = "https://github.com/alessandrohc/django-cmd-async"
+Upstream = "https://github.com/alexsilva/django-cmd-async"
+
+[tool.setuptools]
+# Templates, static assets and compiled catalogs live inside the package and are
+# selected by MANIFEST.in. Stated explicitly rather than relying on the default so
+# the wheel contents do not hinge on a setuptools version.
+include-package-data = true
+
+[tool.setuptools.packages.find]
+# Keeps test_cmdasync out of the wheel -- it is shipped in the sdist only.
+include = ["commands_async*"]
+namespaces = false
+
+[tool.coverage.run]
+source = ["commands_async"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]

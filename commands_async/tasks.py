@@ -11,6 +11,19 @@ logger = get_task_logger(__name__)
 
 
 class Output(object):
+    """Collects a command's output, wherever the command decided to write it.
+
+    Passing ``stdout=`` to ``call_command`` only covers commands that write
+    through ``self.stdout``; anything using ``print()`` or a library that writes
+    to the real ``sys.stdout`` would escape. So this both is handed to
+    ``call_command`` and swaps ``sys.stdout`` for the duration of the call --
+    which is why restoring it on ``__exit__`` matters: a worker process is
+    long-lived and would otherwise keep writing into a dead buffer.
+
+    Attribute access falls through to the wrapped stream, so it can stand in for
+    a file object anywhere the command machinery expects one.
+    """
+
     encoding = 'utf-8'
 
     def __init__(self, stream):
@@ -35,7 +48,15 @@ class Output(object):
              track_started=True,
              **settings.COMMANDS_ASYNC_TASK_OPTIONS)
 def command_exec(name, *args, **kwargs):
-    """ Run a Django command by name """
+    """ Run a Django command by name
+
+    Returns everything the command wrote, which the page polls for and shows.
+
+    A command that ends in ``SystemExit`` is a normal outcome, not a crash: exit
+    code 0 is swallowed so the task is not marked failed (at the cost of the
+    output collected so far, since there is no return in that path), while any
+    other code propagates so the result carries the traceback.
+    """
     with Output(StringIO()) as stream:
         kwargs['stdout'] = stream
         try:

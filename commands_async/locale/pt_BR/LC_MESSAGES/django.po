@@ -1,87 +1,99 @@
-# SOME DESCRIPTIVE TITLE.
-# Copyright (C) YEAR THE PACKAGE'S COPYRIGHT HOLDER
-# This file is distributed under the same license as the PACKAGE package.
-# FIRST AUTHOR <EMAIL@ADDRESS>, YEAR.
+# Brazilian Portuguese translation for django-cmd-async.
+# Copyright (C) 2017 the django-cmd-async authors
+# This file is distributed under the same license as the django-cmd-async package.
 #
-#, fuzzy
 msgid ""
 msgstr ""
-"Project-Id-Version: PACKAGE VERSION\n"
+"Project-Id-Version: django-cmd-async 2.3.0\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2017-12-19 11:59-0200\n"
-"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
-"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
-"Language-Team: LANGUAGE <LL@li.org>\n"
-"Language: \n"
+"POT-Creation-Date: 2026-07-29 09:07-0300\n"
+"PO-Revision-Date: 2026-07-29 08:38-0300\n"
+"Last-Translator: Alessandro Hecht <alessandrohc@gmail.com>\n"
+"Language-Team: Brazilian Portuguese\n"
+"Language: pt_BR\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n > 1);\n"
 
-#: .\commands_async\apps.py:10
+#: apps.py:10
 msgid "Asynchronous commands"
 msgstr "Comandos assíncronos"
 
-#: .\commands_async\templates\cmdasync\form-dropdown.html:9
+#: templates/cmdasync/form-dropdown.html:9
 msgid "Choose one"
 msgstr "Escolha uma opção"
 
-#: .\commands_async\templates\cmdasync\index.html:5
+#: templates/cmdasync/index.html:5
 msgid "Run tasks"
 msgstr "Execute tarefas"
 
-#: .\commands_async\templates\cmdasync\index.html:117
+#: templates/cmdasync/index.html:32
 msgid "Running command..."
 msgstr "Executando comando..."
 
-#: .\commands_async\templates\cmdasync\index.html:145
+#: templates/cmdasync/index.html:35
 msgid "Checking and updating environment"
 msgstr "Verificação e atualização de ambiente"
 
-#: .\commands_async\templates\cmdasync\index.html:147
-msgid "Atenção:"
+#: templates/cmdasync/index.html:37
+msgid "Warning:"
 msgstr "Atenção:"
 
-#: .\commands_async\templates\cmdasync\index.html:148
+#: templates/cmdasync/index.html:38
 msgid ""
-"It is strongly recommended that the systembe usedwith the aid of an approved "
-"technician."
-msgstr "É altamente recomendado que o sistema seja utilizado com o auxílio de um técnico homologado."
+"It is strongly recommended that the system be used with the aid of an "
+"approved technician."
+msgstr ""
+"É altamente recomendado que o sistema seja utilizado com o auxílio de um "
+"técnico homologado."
 
-#: .\commands_async\templates\cmdasync\index.html:156
-#: .\commands_async\templates\cmdasync\index.html:159
+#: templates/cmdasync/index.html:45
 msgid "COMMAND"
 msgstr "COMANDO"
 
-#: .\commands_async\templates\cmdasync\index.html:168
-msgid "args"
-msgstr ""
-
-#: .\commands_async\templates\cmdasync\index.html:170
-#: .\commands_async\templates\cmdasync\index.html:176
-msgid "Insert arguments"
-msgstr "Insira argumentos"
-
-#: .\commands_async\templates\cmdasync\index.html:174
-msgid "kwargs"
-msgstr ""
-
-#: .\commands_async\templates\cmdasync\index.html:182
-msgid "Cancel"
-msgstr "Cancelar"
-
-#: .\commands_async\templates\cmdasync\index.html:183
-msgid "Revoke"
-msgstr "Revogar"
-
-#: .\commands_async\templates\cmdasync\index.html:193
+#: templates/cmdasync/index.html:52
 msgid "Execute a command"
 msgstr "Execute um comando"
 
-#: .\commands_async\templates\cmdasync\index.html:195
+#: templates/cmdasync/index.html:62
+msgid "Execute"
+msgstr "Executar"
+
+#: templates/cmdasync/index.html:67
+msgid "Cancel"
+msgstr "Cancelar"
+
+#: templates/cmdasync/index.html:72
+msgid "Revoke"
+msgstr "Revogar"
+
+#: templates/cmdasync/index.html:80
 msgid "Copy"
 msgstr "Copiar"
 
-#: .\commands_async\views.py:82
+#: templates/cmdasync/response-form-task-args-lg.html:7
+#: templates/cmdasync/response-form-task-args-md.html:6
+msgid "args"
+msgstr ""
+
+#: templates/cmdasync/response-form-task-args-lg.html:11
+#: templates/cmdasync/response-form-task-args-lg.html:21
+#: templates/cmdasync/response-form-task-args-md.html:10
+#: templates/cmdasync/response-form-task-args-md.html:19
+msgid "Insert arguments"
+msgstr "Insira argumentos"
+
+#: templates/cmdasync/response-form-task-args-lg.html:17
+#: templates/cmdasync/response-form-task-args-md.html:15
+msgid "kwargs"
+msgstr ""
+
+#: views.py:104
 msgid "not allowed to run this command"
 msgstr "não é permitido executar esse comando"
+
+#: views.py:117
+#, python-format
+msgid "command %(command)s failed to execute"
+msgstr "falha ao executar o comando %(command)s"

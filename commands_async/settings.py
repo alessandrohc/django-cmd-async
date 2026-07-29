@@ -1,4 +1,12 @@
 # coding=utf-8
+"""App settings, read from the project once at import time.
+
+The snapshot is part of the contract: the view captures the ignore list and the
+permission name as class attributes, and the task decorator is fed the options
+dict when the module is first imported. Changing any COMMANDS_ASYNC_* value at
+runtime -- including through override_settings -- has no effect until the process
+restarts.
+"""
 from django.conf import settings
 from django.contrib.auth import REDIRECT_FIELD_NAME
 

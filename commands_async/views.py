@@ -12,6 +12,17 @@ from celery import current_app as celery_app
 from . import settings
 
 
+def is_ajax(request):
+    """Whether the request was issued by XHR.
+
+    Stands in for ``HttpRequest.is_ajax()``, deprecated in Django 3.1 and removed
+    in 4.0. The header is what jQuery sets on every XHR, and the bundled
+    cmdhandler.js submits this form through jquery.form -- so the check is exact
+    for this page, which is the only caller.
+    """
+    return request.headers.get('x-requested-with') == 'XMLHttpRequest'
+
+
 class TaskFormView(FormView):
     """ Task execution form """
 
@@ -24,6 +35,12 @@ class TaskFormView(FormView):
     command_permission_name = settings.COMMANDS_ASYNC_PERMISSION_NAME
 
     def is_command_valid(self, command_name, app_name=None):
+        """Whether the command is allowed by COMMANDS_ASYNC_COMMANDS_IGNORE.
+
+        Both spellings have to miss the ignore list: the bare name (``shell``)
+        and the app-qualified one (``django.core.shell``). Ignoring by bare name
+        therefore blocks the command in every app that provides it.
+        """
         items = [command_name]
         if app_name is not None:
             items.append(app_name + "." + command_name)
@@ -62,6 +79,11 @@ class TaskFormView(FormView):
         return context
 
     def form_invalid(self, form):
+        """Answers with the field errors instead of re-rendering the page.
+
+        Deliberately unlike FormView: the form is submitted through jquery.form
+        and the page paints the errors next to the inputs it already has.
+        """
         return JsonResponse({
             'form': {
                 'errors': form.errors
@@ -75,7 +97,7 @@ class TaskFormView(FormView):
         command_kwargs = form.cleaned_data['kwargs']
 
         if not self.is_command_valid(app_command, app_name=form.app_name) or not self.has_permission():
-            if not self.request.is_ajax():
+            if not is_ajax(self.request):
                 raise PermissionDenied  # Can not execute this command.
             else:
                 return JsonResponse({
@@ -85,7 +107,7 @@ class TaskFormView(FormView):
             task = command_exec.apply_async(args=(app_command,) + command_args,
                                             kwargs=command_kwargs,
                                             priority=settings.COMMANDS_ASYNC_TASK_PRIORITY)
-        except:
+        except Exception:
             logger.exception('failed to execute {0!s}'.format(app_command))
             task = None
         if task is None:
