@@ -64,6 +64,15 @@ A script that polls this route without a session, or that only asks for JSON (wi
 `X-Requested-With` header), now has to authenticate. The check does not tie a task to the user
 who launched it: any authorized user can still read or revoke any task id they know.
 
+`command-async:workers` lists the names of the Celery workers that answer (`GET`). It was open
+to any authenticated user, whatever `COMMANDS_ASYNC_PERMISSION_NAME` said: since this release it
+has the same gate as `status`, with the same rules, and every denial is answered before Celery
+is asked anything (the probe asks every worker and waits for the answers). The denial of an XHR
+is a `403` with `{"status": false, "workers": []}`; any other request is redirected to
+`COMMANDS_ASYNC_LOGIN_URL` (not logged in) or gets the plain `403` (no permission). A denied
+request gets that answer with any method, where it used to get `405` for a method other than
+`GET`; an authorized one still gets the `405`.
+
 ## DJANGO settings
 
 ### It should show a list of commands to the user. Otherwise, a text input will be displayed.
@@ -91,6 +100,10 @@ decorator.
 [dict] COMMANDS_ASYNC_TASK_OPTIONS  (default: {"expires": 1800, "retries": 0})
 
 ### Whether the page should probe the workers and warn when none is up.
+The probe asks `command-async:workers`, which needs the same permission as the form: when
+`COMMANDS_ASYNC_PERMISSION_NAME` names one, a user without it who opens the page gets a `403`,
+and the bundled JS asks again every 5 seconds (it retries after any failure).
+
 [bool] COMMANDS_ASYNC_WORKERS_STATUS_CHECK  (default: False)
 
 > These settings are read **once, at import time**. Changing them at runtime (including with

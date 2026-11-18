@@ -46,7 +46,7 @@ def login_redirect(request):
 
 
 class CommandPermissionMixin(object):
-    """The optional permission to run commands, shared by the form and the status route."""
+    """The optional permission to run commands, shared by the form and the status and workers routes."""
 
     command_permission_name = settings.COMMANDS_ASYNC_PERMISSION_NAME
 
@@ -56,6 +56,36 @@ class CommandPermissionMixin(object):
         else:
             has_perm = True
         return has_perm
+
+
+class CommandGateMixin(CommandPermissionMixin):
+    """Login and permission for the routes that read or act on tasks, checked by the view itself.
+
+    The routes used to stay open to anyone (the status) or to any logged user (the workers). The gate lives in
+    ``dispatch``, and not in the URLconf: a host that mounts or subclasses the view keeps it. Every denial is a
+    response the view returns (never a raised ``PermissionDenied``, which Django turns into the 403 outside this view),
+    marked ``no-store`` here so that it does not depend on the ``never_cache`` of ``urls.py``, and it comes before
+    anything the view does (a denied request never makes the workers view ask Celery). An XHR (what the bundled JS
+    sends) gets a 403 in JSON, which its ``.fail`` handles; a 302 to the login page would be followed and read as an
+    answer, so any other request is redirected, or answered the plain 403.
+
+    The JSON of the denial is each view's own: ``forbidden_json`` has no default, so that a new view does not
+    inherit the body of another. A view that uses this mixin must not be a subclass of ``TaskFormStatus`` or of
+    ``TaskFormView``: the host project swaps the route of every view that is (``plus_base``, ``_is_route_of``).
+    """
+
+    def dispatch(self, request, *args, **kwargs):
+        if not request.user.is_authenticated:
+            response = self.forbidden_json() if is_ajax(request) else login_redirect(request)
+        elif not self.has_permission():
+            response = self.forbidden_json() if is_ajax(request) else HttpResponseForbidden()
+        else:
+            return super().dispatch(request, *args, **kwargs)
+        add_never_cache_headers(response)
+        return response
+
+    def forbidden_json(self):
+        raise NotImplementedError('{0} has to answer its own denial in JSON'.format(type(self).__name__))
 
 
 class TaskFormView(CommandPermissionMixin, FormView):
@@ -155,8 +185,14 @@ class TaskFormView(CommandPermissionMixin, FormView):
         })
 
 
-class CeleryWorkerStatus(View):
-    """Reports status of workers celery"""
+class CeleryWorkerStatus(CommandGateMixin, View):
+    """Reports status of workers celery, for an authenticated user who may run commands."""
+
+    @staticmethod
+    def forbidden_json():
+        # The shape the route already answers on failure, with no ``message`` and no worker name.
+        return JsonResponse({'status': False, 'workers': []}, status=403)
+
     def get(self, request, **kwargs):
         data = {'status': True, 'workers': []}
         try:
@@ -168,26 +204,12 @@ class CeleryWorkerStatus(View):
         return JsonResponse(data)
 
 
-class TaskFormStatus(CommandPermissionMixin, View):
+class TaskFormStatus(CommandGateMixin, View):
     """Reads and revokes a task, for an authenticated user who may run commands.
 
-    The route used to stay open, and it answered the output of any task to anyone. The gate lives here, in
-    ``dispatch``, and not in the URLconf: a host that mounts or subclasses this view keeps it. Every denial is a
-    response the view returns (never a raised ``PermissionDenied``, which Django turns into the 403 outside
-    this view) and it is marked ``no-store`` here, so it does not depend on the ``never_cache`` of ``urls.py``.
-    An XHR (what the bundled JS sends) gets a 403 in JSON, which its ``.fail`` handles; a 302 to the login page
-    would be followed and read as a status, so any other request is redirected, or answered the plain 403.
+    The route used to stay open, and it answered the output of any task to anyone: the gate is the one of
+    ``CommandGateMixin``, and its denial in JSON carries the ``task`` this route answers.
     """
-
-    def dispatch(self, request, *args, **kwargs):
-        if not request.user.is_authenticated:
-            response = self.forbidden_json() if is_ajax(request) else login_redirect(request)
-        elif not self.has_permission():
-            response = self.forbidden_json() if is_ajax(request) else HttpResponseForbidden()
-        else:
-            return super().dispatch(request, *args, **kwargs)
-        add_never_cache_headers(response)
-        return response
 
     @staticmethod
     def forbidden_json():

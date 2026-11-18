@@ -8,14 +8,16 @@ JavaScript consumes, since that is the actual public interface of these views.
 import json
 from contextlib import contextmanager
 from unittest import mock
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from django.conf import settings as project_settings
 from django.contrib.auth.models import AnonymousUser
-from django.test import Client, RequestFactory, TestCase
+from django.test import Client, RequestFactory, SimpleTestCase, TestCase
+from django.views.generic import View
 
 from commands_async import settings as app_settings
-from commands_async.views import TaskFormStatus, TaskFormView
+from celery.app.control import Inspect
+from commands_async.views import CeleryWorkerStatus, TaskFormStatus, TaskFormView
 
 from test_cmdasync.harness import (AJAX, INDEX_URL, WORKERS_URL, async_result,
                                    create_user, grant, queued_task, status_url)
@@ -313,7 +315,10 @@ class TaskFormStatusAccessTest(TestCase):
 
     @contextmanager
     def permission_required(self):
-        """The host names a permission. Before #8836 the status view had no such attribute, hence ``create=True``."""
+        """The host names a permission for this view only (``create=True``: the attribute is inherited from the mixin).
+
+        Patched on the view class, never on the mixin, so the gate of the workers view stays as it is.
+        """
         with mock.patch.object(TaskFormStatus, 'command_permission_name', self.permission, create=True):
             yield
 
@@ -346,7 +351,7 @@ class TaskFormStatusAccessTest(TestCase):
                     self.assertNoTaskData(response, label)
 
     def test_anonymous_xhr_gets_a_json_403(self):
-        """AC-8836-2: an anonymous query by XHR is answered 403 in JSON, with no task data."""
+        """AC-8836-2, AC-8835-12 (controle): an anonymous query by XHR is answered 403 in JSON, with no task data."""
         self.assertReads(self.logged(self.plain), 'logged in', **AJAX)
         for task_id in (DONE_ID, FAILED_ID):
             with self.subTest(task=task_id):
@@ -364,7 +369,7 @@ class TaskFormStatusAccessTest(TestCase):
                 self.revoke.assert_not_called()
 
     def test_anonymous_revoke_is_denied_like_the_anonymous_query(self):
-        """AC-8836-13: an anonymous revoke is redirected to the login page, or answered 403 in JSON by XHR."""
+        """AC-8836-13, AC-8835-12 (controle): an anonymous revoke is redirected to the login page, or answered 403 in JSON by XHR."""
         with self.subTest(request='navigation'):
             response = self.client.post(status_url(DONE_ID))
             self.assertRedirects(response, '/login/?next={0}'.format(status_url(DONE_ID)),
@@ -390,7 +395,7 @@ class TaskFormStatusAccessTest(TestCase):
                     self.assertNoTaskData(response, method)
 
     def test_a_user_without_the_named_permission_is_forbidden_to_query(self):
-        """AC-8836-4: when a permission is named, a user without it is answered 403 (JSON by XHR), no task data."""
+        """AC-8836-4, AC-8835-12 (controle): when a permission is named, a user without it is answered 403 (JSON by XHR), no task data."""
         with self.permission_required():
             self.assertReads(self.logged(self.runner), 'holds the permission')
             client = self.logged(self.plain)
@@ -404,7 +409,7 @@ class TaskFormStatusAccessTest(TestCase):
                         self.assertNoTaskData(response, label)
 
     def test_a_user_without_the_named_permission_is_forbidden_to_revoke(self):
-        """AC-8836-5: when a permission is named, a user without it who revokes is answered 403 (JSON by XHR)."""
+        """AC-8836-5, AC-8835-12 (controle): when a permission is named, a user without it who revokes is answered 403 (JSON by XHR)."""
         with self.permission_required():
             client = self.logged(self.plain)
             for label, extra in (('navigation', {}), ('xhr', AJAX)):
@@ -504,6 +509,7 @@ class CeleryWorkerStatusTest(TestCase):
 
     @mock.patch('commands_async.views.celery_app')
     def test_get_lists_the_workers_reported_as_active(self, celery_app):
+        """AC-8835-4 (controle): a user without any named permission lists the workers that answered."""
         celery_app.control.inspect.return_value.active.return_value = {
             'worker-1@host': [], 'worker-2@host': [],
         }
@@ -514,18 +520,222 @@ class CeleryWorkerStatusTest(TestCase):
 
     @mock.patch('commands_async.views.celery_app')
     def test_get_reports_failure_when_inspection_raises(self, celery_app):
+        """AC-8835-5 (controle): a failing inspection is answered 200, with its reason and no worker name."""
         celery_app.control.inspect.side_effect = RuntimeError('no broker')
-        data = json.loads(self.client.get(WORKERS_URL).content)
+        response = self.client.get(WORKERS_URL)
+        data = json.loads(response.content)
 
+        # 200, not an error status: the bundled JS shows the message of a false status from ``.done`` and sends any
+        # error status to ``.fail``, which only asks again (static/cmdasync/js/celery.workers.status.js:13-29).
+        self.assertEqual(response.status_code, 200)
         self.assertFalse(data['status'])
+        self.assertEqual(data['workers'], [])
         self.assertEqual(data['message'], 'no broker')
 
     @mock.patch('commands_async.views.celery_app')
     def test_get_reports_failure_when_no_worker_answers(self, celery_app):
-        # inspect().active() answers None when nobody is listening; the view
-        # reports that as a failed probe rather than an empty worker list.
+        """AC-8835-6 (controle): when no worker answers the probe fails, answered 200 with no worker name (the text of ``message`` is not promised)."""
+        # inspect().active() answers None when nobody is listening (celery/app/control.py:92-103, `_prepare` only
+        # returns something `if reply:`); the view reports that as a failed probe rather than an empty worker list.
         celery_app.control.inspect.return_value.active.return_value = None
-        data = json.loads(self.client.get(WORKERS_URL).content)
+        response = self.client.get(WORKERS_URL)
+        data = json.loads(response.content)
 
+        self.assertEqual(response.status_code, 200)
         self.assertFalse(data['status'])
         self.assertEqual(data['workers'], [])
+
+
+# #8835: who may ask the workers route, and what the gate hands back. The canary is a worker name: a denial that
+# leaks anything shows it in the body. A task running on a worker shows that only names are listed.
+WORKER = 'worker-canary-8835@host'
+METHODS = ('get', 'post', 'put', 'patch', 'delete', 'head', 'options')
+MOUNTINGS = ('urlconf', 'direct')
+
+
+class CeleryWorkerStatusAccessTest(TestCase):
+    """The workers route answers only an authenticated user who holds the permission the form asks for.
+
+    The same two ways of asking as the status route: through the package URLconf (``Client``) and with the view
+    mounted straight (``RequestFactory``, no decorator of ``urls.py``), because the gate belongs to the class.
+    Unsafe methods go through the default ``Client``, which does not enforce CSRF: the token is "valid".
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.plain = create_user('plain')
+        cls.runner = create_user('runner')
+        cls.permission = grant(cls.runner, 'run_commands')
+
+    def setUp(self):
+        celery = mock.patch('commands_async.views.celery_app')
+        self.celery_app = celery.start()
+        self.addCleanup(celery.stop)
+        self.inspect = self.celery_app.control.inspect
+        self.inspect.return_value.active.return_value = {WORKER: []}
+
+    @contextmanager
+    def permission_required(self):
+        """The host names a permission for the workers view only (the attribute is inherited from the mixin)."""
+        with mock.patch.object(CeleryWorkerStatus, 'command_permission_name', self.permission, create=True):
+            yield
+
+    @staticmethod
+    def asks(who, mounting, method='get', **extra):
+        """Asks the route as ``who`` (a user, or ``None`` for the anonymous), through the URLconf or mounted straight."""
+        url = WORKERS_URL + '?refresh=1'
+        if mounting == 'urlconf':
+            client = Client()
+            if who is not None:
+                client.force_login(who)
+            return getattr(client, method)(url, **extra)
+        request = getattr(RequestFactory(), method)(url, **extra)
+        request.user = AnonymousUser() if who is None else who
+        return CeleryWorkerStatus.as_view()(request)
+
+    def assertLists(self, who, mounting, label, **extra):
+        """The user lists the canary worker and the inspection runs: what the denials are measured against."""
+        self.inspect.reset_mock()
+        response = self.asks(who, mounting, 'get', **extra)
+        self.assertEqual(response.status_code, 200, msg='precondition (%s, %s): the user lists the workers' % (mounting, label))
+        self.assertIn(WORKER, response.content.decode('utf-8'),
+                      msg='precondition (%s, %s): the canary is listed' % (mounting, label))
+        self.inspect.assert_called_once()
+        self.inspect.reset_mock()
+
+    def assertNoWorkerData(self, response, label):
+        self.assertNotIn(WORKER, response.content.decode('utf-8'), msg='%s: the denial must not carry a worker name' % label)
+
+    def assertJsonDenial(self, response, label, mounting, method):
+        """The denial of an XHR is a JSON body with a false status and no worker, whatever the user or the method."""
+        if method == 'head' and mounting == 'urlconf':
+            return  # the test client takes the body off a HEAD answer (django/test/client.py:139-152); mounted straight, it stays
+        self.assertTrue(response.content, msg='%s: the denial must carry a JSON body' % label)
+        body = json.loads(response.content)
+        self.assertEqual(body['status'], False, msg='%s: status is false' % label)
+        self.assertEqual(body['workers'], [], msg='%s: no worker is listed' % label)
+
+    def test_anonymous_navigation_is_sent_to_the_login_url_the_package_names(self):
+        """AC-8835-1: an anonymous request by navigation, with any method, goes to the package's login page, with the route to come back to."""
+        # The test project's LOGIN_URL is '/login/' and the package setting inherits it (commands_async/settings.py:22),
+        # so a test that redirects to '/login/' cannot tell the two apart: the host points the package elsewhere.
+        elsewhere = '/elsewhere/'
+        self.assertNotEqual(project_settings.LOGIN_URL, elsewhere, msg='precondition: the two login pages differ')
+        expected = '{0}?{1}'.format(elsewhere, urlencode({'next': WORKERS_URL + '?refresh=1'}, safe='/'))
+        for mounting in MOUNTINGS:
+            self.assertLists(self.runner, mounting, 'logged in')
+            with mock.patch.object(app_settings, 'COMMANDS_ASYNC_LOGIN_URL', elsewhere):
+                for method in METHODS:
+                    with self.subTest(mounting=mounting, method=method):
+                        response = self.asks(None, mounting, method)
+                        self.assertEqual(response.status_code, 302, msg='an anonymous request must be redirected')
+                        self.assertEqual(response['Location'], expected)
+                        self.assertNoWorkerData(response, method)
+
+    def test_anonymous_xhr_gets_a_json_403(self):
+        """AC-8835-2: an anonymous request by XHR, with any method, is answered 403 in JSON, with no worker name."""
+        for mounting in MOUNTINGS:
+            self.assertLists(self.runner, mounting, 'logged in', **AJAX)
+            for method in METHODS:
+                with self.subTest(mounting=mounting, method=method):
+                    response = self.asks(None, mounting, method, **AJAX)
+                    self.assertEqual(response.status_code, 403, msg='an anonymous XHR must be denied, not redirected')
+                    self.assertJsonDenial(response, method, mounting, method)
+                    self.assertNoWorkerData(response, method)
+
+    def test_a_user_without_the_named_permission_is_forbidden(self):
+        """AC-8835-3: when a permission is named, a user without it is answered 403 (JSON by XHR), with no worker name."""
+        with self.permission_required():
+            for mounting in MOUNTINGS:
+                self.assertLists(self.runner, mounting, 'holds the permission')
+                for label, extra in (('navigation', {}), ('xhr', AJAX)):
+                    for method in METHODS:
+                        with self.subTest(mounting=mounting, request=label, method=method):
+                            response = self.asks(self.plain, mounting, method, **extra)
+                            self.assertEqual(response.status_code, 403, msg='%s: must be forbidden' % label)
+                            if extra:
+                                self.assertJsonDenial(response, label, mounting, method)
+                            self.assertNoWorkerData(response, label)
+
+    def test_a_user_with_the_named_permission_lists_the_workers(self):
+        """AC-8835-4 (controle): the holder of the named permission lists the workers, with or without a task on them."""
+        self.inspect.return_value.active.return_value = {WORKER: [{'id': 'task-8835', 'name': 'busy'}], 'idle@host': []}
+        with self.permission_required():
+            for mounting in MOUNTINGS:
+                with self.subTest(mounting=mounting):
+                    response = self.asks(self.runner, mounting)
+                    data = json.loads(response.content)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertTrue(data['status'])
+                    self.assertEqual(sorted(data['workers']), sorted([WORKER, 'idle@host']))
+                    self.assertNotIn('task-8835', response.content.decode('utf-8'), msg='only the names are listed')
+
+    def test_every_denial_is_marked_no_store(self):
+        """AC-8835-7: every denial (login or permission, by navigation or XHR), through the URLconf or not, is no-store."""
+        denials = []
+        with self.permission_required():
+            for method in ('get', 'post'):
+                for label, extra in (('navigation', {}), ('xhr', AJAX)):
+                    for mounting in MOUNTINGS:
+                        for who_label, who in (('anonymous', None), ('no permission', self.plain)):
+                            denials.append(('%s %s %s %s' % (mounting, who_label, method, label),
+                                            self.asks(who, mounting, method, **extra)))
+        self.assertEqual(len(denials), 16, msg='precondition: every form of denial is exercised')
+        for label, response in denials:
+            with self.subTest(denial=label):
+                self.assertIn(response.status_code, (302, 403), msg='%s: must be a denial' % label)
+                self.assertIn('no-store', response.headers.get('Cache-Control', ''),
+                              msg='%s: the denial must be no-store' % label)
+
+    def test_a_denied_request_never_reaches_the_workers(self):
+        """AC-8835-10: no denied request, by any method, mounting or kind of request, makes the inspection run."""
+        with self.permission_required():
+            for mounting in MOUNTINGS:
+                self.assertLists(self.runner, mounting, 'holds the permission')  # the inspection runs for the holder
+            for mounting in MOUNTINGS:
+                for who in (None, self.plain):
+                    for extra in ({}, AJAX):
+                        for method in METHODS:
+                            self.asks(who, mounting, method, **extra)
+            self.inspect.assert_not_called()
+
+    def test_an_authorized_user_gets_405_for_a_method_other_than_get(self):
+        """AC-8835-11 (controle): the holder of the named permission is answered 405 by POST, PUT, PATCH and DELETE."""
+        with self.permission_required():
+            self.assertLists(self.runner, 'urlconf', 'holds the permission')
+            for method in ('post', 'put', 'patch', 'delete'):
+                with self.subTest(method=method):
+                    self.assertEqual(self.asks(self.runner, 'urlconf', method).status_code, 405)
+            self.inspect.assert_not_called()
+
+    def test_the_workers_denial_by_xhr_carries_the_shape_of_the_route(self):
+        # The body is a design choice (the spec of #8835): the shape the route already answers on failure, with
+        # no `message` and no worker, and not the `{"task": null}` of the status route.
+        response = self.asks(None, 'direct', 'get', **AJAX)
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(json.loads(response.content), {'status': False, 'workers': []})
+
+
+class CommandGateStructureTest(SimpleTestCase):
+    """What the project's URLconf and the tests above rely on (no criterion: robustness of the design)."""
+
+    def test_the_workers_view_is_not_a_view_the_project_swaps(self):
+        # plus_base/publique/urls_commands_async.py:39-43,52 swaps the callback of every route whose view class is a
+        # subclass of TaskFormStatus or TaskFormView: the workers route would be served by the project's view.
+        self.assertFalse(issubclass(CeleryWorkerStatus, (TaskFormStatus, TaskFormView)))
+
+    def test_the_status_and_workers_views_share_one_gate(self):
+        self.assertIsNot(TaskFormStatus.dispatch, View.dispatch, msg='precondition: the status view has the gate')
+        self.assertIs(CeleryWorkerStatus.dispatch, TaskFormStatus.dispatch)
+
+
+class InspectAnswerTest(SimpleTestCase):
+    """What the installed Celery answers, which the workers tests double (no criterion: an assumption of a double)."""
+
+    def test_no_reply_is_none_and_a_reply_is_a_dict_by_node(self):
+        # celery/app/control.py:92-103: `_prepare` only returns something `if reply:`.
+        inspect = Inspect()
+
+        self.assertIsNone(inspect._prepare([]), msg='no worker answered: no reply, not an empty collection')
+        self.assertEqual(inspect._prepare([{WORKER: []}]), {WORKER: []})

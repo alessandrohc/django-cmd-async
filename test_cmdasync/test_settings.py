@@ -14,7 +14,7 @@ from django.contrib.auth import REDIRECT_FIELD_NAME
 from django.test import RequestFactory, SimpleTestCase, TestCase, override_settings
 
 from commands_async import settings as app_settings
-from test_cmdasync.harness import AJAX, async_result, create_user, grant, status_url
+from test_cmdasync.harness import AJAX, WORKERS_URL, async_result, create_user, grant, status_url
 
 
 class DefaultsTest(SimpleTestCase):
@@ -159,3 +159,36 @@ class PermissionNameTest(TestCase):
                 form = views.TaskFormView()
                 form.request = request_by(user)
                 self.assertIs(form.has_permission(), allowed)
+
+    def test_the_workers_view_asks_for_the_permission_the_project_names(self):
+        """AC-8835-3: the permission named in the settings reaches the workers view, and only its holder lists the workers."""
+        # Before #8835 the workers view had no such attribute: the attribute is read with a default, so that the
+        # test fails on the assertion and not on an AttributeError.
+        unnamed = views_read_afresh()
+        self.assertIsNone(getattr(unnamed.CeleryWorkerStatus, 'command_permission_name', None),
+                          msg='precondition: nothing is named by default')
+        runner = create_user('runner')
+        plain = create_user('plain')
+        permission = grant(runner, self.PERMISSION_CODENAME)
+        views = self.views_with_the_permission_named(permission)
+
+        self.assertEqual(getattr(views.CeleryWorkerStatus, 'command_permission_name', None), permission)
+
+        def request_by(user, **extra):
+            request = RequestFactory().get(WORKERS_URL, **extra)
+            request.user = user
+            return request
+
+        with mock.patch.object(views, 'celery_app') as celery_app:
+            celery_app.control.inspect.return_value.active.return_value = {'worker-1@host': []}
+            workers = views.CeleryWorkerStatus.as_view()
+            for label, extra in (('navigation', {}), ('xhr', AJAX)):
+                with self.subTest(request=label):
+                    celery_app.control.inspect.reset_mock()
+                    self.assertEqual(workers(request_by(runner, **extra)).status_code, 200,
+                                     msg='precondition: the holder lists the workers')
+                    celery_app.control.inspect.assert_called_once()
+
+                    celery_app.control.inspect.reset_mock()
+                    self.assertEqual(workers(request_by(plain, **extra)).status_code, 403)
+                    celery_app.control.inspect.assert_not_called()

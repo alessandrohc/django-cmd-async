@@ -5,6 +5,7 @@ The names and the ``command-async`` namespace are load-bearing outside this
 package: the host project reaches the page through
 ``reverse("command-async:index")``, so a rename here breaks it silently.
 """
+import json
 from unittest import mock
 
 from django.test import TestCase
@@ -21,7 +22,9 @@ class ReverseTest(TestCase):
         self.assertEqual(reverse('command-async:index'), INDEX_URL)
 
     def test_workers_reverses_under_the_command_async_namespace(self):
+        """AC-8835-9 (controle): the workers route builds its address under the namespace, ending where it always did."""
         self.assertEqual(reverse('command-async:workers'), WORKERS_URL)
+        self.assertTrue(reverse('command-async:workers').endswith('command/async/workers/status/'))
 
     def test_status_reverses_with_the_task_id_in_the_path(self):
         self.assertEqual(reverse('command-async:status', kwargs={'task_id': 'abc-123'}),
@@ -82,6 +85,18 @@ class RoundTripTest(TestCase):
                 async_result_class.assert_called_once()
                 self.assertEqual(async_result_class.call_args.kwargs['id'], task_id)
 
+    @mock.patch('commands_async.views.celery_app')
+    def test_the_workers_address_built_by_reverse_reaches_the_view(self, celery_app):
+        """AC-8835-9 (controle): the address built for the workers route is requested and reaches the view."""
+        celery_app.control.inspect.return_value.active.return_value = {'worker-1@host': []}
+        url = reverse('command-async:workers')
+
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 200, msg='the built address must be served')
+        self.assertEqual(json.loads(response.content)['workers'], ['worker-1@host'])
+        celery_app.control.inspect.assert_called_once()
+
 
 class LoginGateTest(TestCase):
     """Which routes demand a session, and where they send anonymous callers."""
@@ -124,9 +139,11 @@ class NeverCacheTest(TestCase):
 
     @mock.patch('commands_async.views.celery_app')
     def test_workers_response_is_not_cacheable(self, celery_app):
+        """AC-8835-8 (controle): the response an authorized user gets from the workers route is no-store."""
         celery_app.control.inspect.return_value.active.return_value = {}
         response = self.client.get(WORKERS_URL)
         self.assertIn('no-cache', response.headers['Cache-Control'])
+        self.assertIn('no-store', response.headers['Cache-Control'])
 
     @mock.patch('commands_async.views.AsyncResult')
     def test_status_response_is_not_cacheable(self, async_result_class):
