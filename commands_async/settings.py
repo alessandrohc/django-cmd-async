@@ -25,3 +25,9 @@ COMMANDS_ASYNC_PERMISSION_NAME = getattr(settings, "COMMANDS_ASYNC_PERMISSION_NA
 COMMANDS_ASYNC_REDIRECT_FIELD_NAME = REDIRECT_FIELD_NAME
 COMMANDS_ASYNC_WORKERS_STATUS_CHECK = getattr(settings, 'COMMANDS_ASYNC_WORKERS_STATUS_CHECK', False)
 
+# Dono da tarefa na rota status (#8864): as views e a verificação do Django leem estas três DESTE módulo, na hora do uso
+# (views.py:84-85, 101, 251 e 303; checks.py:19 e 21), e não as copiam em atributo de classe.
+COMMANDS_ASYNC_TASK_OWNERSHIP = getattr(settings, 'COMMANDS_ASYNC_TASK_OWNERSHIP', True)
+COMMANDS_ASYNC_OWNER_CACHE_ALIAS = getattr(settings, 'COMMANDS_ASYNC_OWNER_CACHE_ALIAS', 'default')
+COMMANDS_ASYNC_OWNER_TIMEOUT = getattr(settings, 'COMMANDS_ASYNC_OWNER_TIMEOUT', 86400)
+

@@ -61,8 +61,30 @@ in the URLconf, so a project that mounts or subclasses the view keeps the check)
   or gets the plain `403` (no permission).
 
 A script that polls this route without a session, or that only asks for JSON (without the
-`X-Requested-With` header), now has to authenticate. The check does not tie a task to the user
-who launched it: any authorized user can still read or revoke any task id they know.
+`X-Requested-With` header), now has to authenticate.
+
+### The owner of the task
+
+The route also ties a task to the user who launched it through the form: only that user can
+read or revoke it (from any of his login sessions). Anyone else, an id that was never launched,
+a record that expired and a registry that cannot be read are all answered the same `404` with
+`{"task": null}` and no task data, with any method and before anything of the task is read (a
+`403` would tell whoever probes that the id exists). The id of the task is still the Celery id.
+
+The owner is recorded in a Django cache when the form launches the task. Because of that:
+
+- **Point `COMMANDS_ASYNC_OWNER_CACHE_ALIAS` at a cache that the processes of the host share,
+  that nobody clears, and that is not a `DummyCache`.** The local-memory cache (the Django
+  default) is not shared between processes: the owner of a task launched in one process would be
+  answered `404` in another. A page cache is not a good choice either: it is a `DummyCache` when
+  the host switches its cache off, and it is cleared on every content save. A Django system check
+  (`commands_async.W001`) warns when the alias is missing from `CACHES` or is a `DummyCache`.
+- A task launched before this release, one older than the record's lifetime (24 hours, as the
+  default `result_expires` of Celery), and one whose record could not be written (the error is
+  logged with the task id) are no longer readable or revocable by their own user.
+- `COMMANDS_ASYNC_TASK_OWNERSHIP = False` switches the owner check off: any authorized user reads
+  and revokes any task, as before. This release narrows what `status` serves, so a project that
+  relied on a user following another's tasks has to switch it off.
 
 `command-async:workers` lists the names of the Celery workers that answer (`GET`). It was open
 to any authenticated user, whatever `COMMANDS_ASYNC_PERMISSION_NAME` said: since this release it
@@ -105,6 +127,22 @@ The probe asks `command-async:workers`, which needs the same permission as the f
 and the bundled JS asks again every 5 seconds (it retries after any failure).
 
 [bool] COMMANDS_ASYNC_WORKERS_STATUS_CHECK  (default: False)
+
+### Whether the status route serves a task only to the user who launched it.
+See "The owner of the task" above. It does not apply to `command-async:workers`.
+
+[bool] COMMANDS_ASYNC_TASK_OWNERSHIP  (default: True)
+
+### The cache alias (a key of `CACHES`) that keeps the owner of each launched task.
+It has to be shared by the processes of the host, not cleared and not a `DummyCache`.
+
+[str]  COMMANDS_ASYNC_OWNER_CACHE_ALIAS  (default: "default")
+
+### For how long the owner of a launched task is kept, in seconds.
+The default is the default lifetime of a Celery result; after it the user who launched the task is
+answered `404` on it, whether or not the backend still has the result.
+
+[int]  COMMANDS_ASYNC_OWNER_TIMEOUT  (default: 86400)
 
 > These settings are read **once, at import time**. Changing them at runtime (including with
 > `override_settings`) has no effect until the process restarts.

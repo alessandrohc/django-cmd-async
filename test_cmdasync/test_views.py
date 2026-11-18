@@ -20,7 +20,7 @@ from celery.app.control import Inspect
 from commands_async.views import CeleryWorkerStatus, TaskFormStatus, TaskFormView
 
 from test_cmdasync.harness import (AJAX, INDEX_URL, WORKERS_URL, async_result,
-                                   create_user, grant, queued_task, status_url)
+                                   create_user, grant, launch, queued_task, status_url)
 
 # The two throwaway commands shipped by the test app, which is what makes the
 # command listing assertions independent of the Django version under test.
@@ -81,6 +81,7 @@ class TaskFormViewPostTest(TestCase):
         self.client.force_login(self.user)
 
     def test_valid_submit_returns_the_queued_task_id_and_command_name(self):
+        """AC-8864-14 (controle): a valid submit answers the id of the queued task and the command name."""
         with mock.patch('commands_async.views.command_exec') as task:
             task.apply_async.return_value = queued_task('queued-1')
             response = self.client.post(INDEX_URL, payload(), **AJAX)
@@ -117,6 +118,7 @@ class TaskFormViewPostTest(TestCase):
         task.apply_async.assert_not_called()
 
     def test_broker_failure_returns_a_field_error_and_is_logged(self):
+        """AC-8864-15 (controle): a broker that refuses the task is answered 400 with the field error, and logged."""
         with mock.patch('commands_async.views.logger') as logger, \
                 mock.patch('commands_async.views.command_exec') as task:
             task.apply_async.side_effect = RuntimeError('broker is down')
@@ -144,6 +146,7 @@ class TaskFormViewGatingTest(TestCase):
         self.client.force_login(self.user)
 
     def test_ignored_command_submitted_by_ajax_returns_a_field_error(self):
+        """AC-8864-16 (controle): a command on the ignore list is refused by ajax with a field error, and nothing is queued."""
         with mock.patch.object(TaskFormView, 'commands_skip', [ECHO]), \
                 mock.patch('commands_async.views.command_exec') as task:
             response = self.client.post(INDEX_URL, payload(), **AJAX)
@@ -153,6 +156,7 @@ class TaskFormViewGatingTest(TestCase):
         task.apply_async.assert_not_called()
 
     def test_ignored_command_submitted_without_ajax_is_forbidden(self):
+        """AC-8864-16 (controle): the same refusal on a plain form post is the 403 page, and nothing is queued."""
         # A plain form post gets the 403 page rather than JSON it cannot use.
         with mock.patch.object(TaskFormView, 'commands_skip', [ECHO]), \
                 mock.patch('commands_async.views.command_exec') as task:
@@ -195,7 +199,8 @@ class TaskFormStatusTest(TestCase):
     """The polling endpoint the JS hits until a task is done, as an authorized user sees it.
 
     The endpoint demands a session since #8836 (see ``TaskFormStatusAccessTest``): these are the
-    contract tests it always had, now from a logged-in user.
+    contract tests it always had, now from a logged-in user. Since #8864 the task read is one the user
+    launched through the form, so it is launched here first.
     """
 
     @classmethod
@@ -204,10 +209,11 @@ class TaskFormStatusTest(TestCase):
 
     def setUp(self):
         self.client.force_login(self.user)
+        launch(self.client, 'abc')
 
     @mock.patch('commands_async.views.AsyncResult')
     def test_get_reports_the_output_of_a_finished_task(self, async_result_class):
-        """AC-8836-6 (controle): a finished task reports its id, that it is ready, not failed, and its output."""
+        """AC-8864-1 (controle): a finished task reports its id, that it is ready, not failed, and its output."""
         async_result_class.return_value = async_result(task_id='abc',
                                                        result='all done')
         response = self.client.get(status_url('abc'))
@@ -218,7 +224,7 @@ class TaskFormStatusTest(TestCase):
 
     @mock.patch('commands_async.views.AsyncResult')
     def test_get_reports_the_traceback_of_a_failed_task(self, async_result_class):
-        """AC-8836-6 (controle): a failed task reports that it failed and its traceback, never an output."""
+        """AC-8864-1 (controle): a failed task reports that it failed and its traceback, never an output."""
         async_result_class.return_value = async_result(task_id='abc', failed=True,
                                                        traceback='boom')
         data = json.loads(self.client.get(status_url('abc')).content)['task']
@@ -230,7 +236,7 @@ class TaskFormStatusTest(TestCase):
 
     @mock.patch('commands_async.views.AsyncResult')
     def test_get_reports_a_task_that_is_still_running(self, async_result_class):
-        """AC-8836-6 (controle): a task that has not finished reports that it is not ready."""
+        """AC-8864-1 (controle): a task that has not finished reports that it is not ready."""
         async_result_class.return_value = async_result(task_id='abc', ready=False,
                                                        result=None)
         data = json.loads(self.client.get(status_url('abc')).content)['task']
@@ -239,7 +245,7 @@ class TaskFormStatusTest(TestCase):
 
     @mock.patch('commands_async.views.AsyncResult')
     def test_get_reports_a_null_output_while_the_task_has_not_finished(self, async_result_class):
-        """AC-8836-6 (controle): the output is the backend's own answer, null while there is none, never a traceback."""
+        """AC-8864-1 (controle): the output is the backend's own answer, null while there is none, never a traceback."""
         async_result_class.return_value = async_result(task_id='abc', ready=False,
                                                        result=None)
         data = json.loads(self.client.get(status_url('abc')).content)['task']
@@ -248,7 +254,7 @@ class TaskFormStatusTest(TestCase):
 
     @mock.patch('commands_async.views.celery_app')
     def test_post_revokes_the_task(self, celery_app):
-        """AC-8836-7, AC-8836-11 (controle): an authorized revoke asks Celery to terminate the task and says so."""
+        """AC-8864-2, AC-8864-3 (controle): an authorized revoke asks Celery to terminate the task and says so."""
         response = self.client.post(status_url('abc'))
 
         celery_app.control.revoke.assert_called_once_with('abc', terminate=True)
@@ -306,6 +312,11 @@ class TaskFormStatusAccessTest(TestCase):
         self.celery_app = celery.start()
         self.addCleanup(celery.stop)
         self.revoke = self.celery_app.control.revoke
+        # These tests measure the login and the permission, not the owner of the task (#8864): with the
+        # owner check on, a user who reads a task he did not launch is answered 404 before the result matters.
+        ownership = mock.patch.object(app_settings, 'COMMANDS_ASYNC_TASK_OWNERSHIP', False)
+        ownership.start()
+        self.addCleanup(ownership.stop)
 
     @staticmethod
     def logged(user):
@@ -430,17 +441,48 @@ class TaskFormStatusAccessTest(TestCase):
                     self.revoke.assert_not_called()
 
     def test_a_user_with_the_named_permission_is_served(self):
-        """AC-8836-6, AC-8836-7, AC-8836-11 (controle): the holder of the named permission reads and revokes as before."""
-        with self.permission_required():
+        """AC-8864-1, AC-8864-2, AC-8864-3 (controle): the holder of the named permission reads and revokes the task he launched."""
+        with self.permission_required(), mock.patch.object(app_settings, 'COMMANDS_ASYNC_TASK_OWNERSHIP', True):
             client = self.logged(self.runner)
+            launch(client, DONE_ID)
             data = json.loads(client.get(status_url(DONE_ID)).content)['task']
             self.assertEqual(data, {'id': DONE_ID, 'ready': True, 'failed': False, 'output': OUTPUT})
             response = client.post(status_url(DONE_ID))
             self.revoke.assert_called_once_with(DONE_ID, terminate=True)
             self.assertEqual(json.loads(response.content), {'status': True})
 
+    def test_a_user_without_the_named_permission_is_forbidden_even_on_a_task_he_does_not_own(self):
+        """AC-8836-4, AC-8836-5, AC-8835-12: with the owner check on (the default), a user without the named permission is answered 403, never the owner's 404."""
+        # O `setUp` desliga o dono para medir só o gate; aqui ele volta ao padrão. A permissão tem de ser conferida ANTES do
+        # dono (`CommandGateMixin.dispatch`: `has_permission` em views.py:143, `task_denial` em :146): se a ordem se
+        # invertesse, quem não tem a permissão e não é dono receberia o 404 do dono, e o 403 dos critérios deixaria de
+        # existir na configuração padrão, sem que nenhum outro teste (todos com o dono desligado) acusasse.
+        with mock.patch.object(app_settings, 'COMMANDS_ASYNC_TASK_OWNERSHIP', True):
+            holder = self.logged(self.runner)
+            launch(holder, DONE_ID)
+            client = self.logged(self.plain)
+
+            # pré-condições: o portador é servido e revoga a própria tarefa; e, sem a permissão nomeada, o dono recusa este
+            # usuário com o 404 (é essa recusa que o 403 tem de preceder)
+            with self.permission_required():
+                self.assertReads(holder, 'holds the permission, owner check on')
+                self.assertRevokes(holder, 'holds the permission, owner check on')
+            self.assertEqual(client.get(status_url(DONE_ID)).status_code, 404,
+                             msg='precondition: with no permission named, the owner check refuses a user who did not launch the task')
+
+            with self.permission_required():
+                for method in ('get', 'post'):
+                    for label, extra in (('navigation', {}), ('xhr', AJAX)):
+                        with self.subTest(method=method, request=label):
+                            response = getattr(client, method)(status_url(DONE_ID), **extra)
+                            self.assertEqual(response.status_code, 403, msg='%s %s: must be forbidden, not not found' % (method, label))
+                            if extra:
+                                self.assertEqual(json.loads(response.content), {'task': None})
+                            self.assertNoTaskData(response, '%s %s' % (method, label))
+                self.revoke.assert_not_called()
+
     def test_every_denial_is_marked_no_store(self):
-        """AC-8836-10: every denial (login or permission, by navigation or XHR) is no-store, even off the URLconf."""
+        """AC-8864-4 (controle): every denial (login or permission, by navigation or XHR) is no-store, even off the URLconf."""
         denials = []
         for method in ('get', 'post'):
             for label, extra in (('navigation', {}), ('xhr', AJAX)):

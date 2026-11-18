@@ -5,6 +5,7 @@ Everything the app talks to outside the process -- the broker (``apply_async``),
 the result backend (``AsyncResult``) and worker inspection (``control.inspect``)
 -- is replaced here, so no test needs Redis, a worker, or a configured Celery app.
 """
+import json
 from unittest import mock
 
 from django.contrib.auth.models import Permission, User
@@ -20,6 +21,21 @@ WORKERS_URL = '/admin/command/async/workers/status/'
 
 def status_url(task_id):
     return '/admin/command/async/status/{0}'.format(task_id)
+
+
+def launch(client, task_id):
+    """Submit the form as ``client`` with the broker handing back ``task_id``; return the response.
+
+    The task is launched the way the page does it (XHR post), so what the view records about its owner is
+    recorded as in use. The precondition is checked here: the launch answers the id it was given.
+    """
+    with mock.patch('commands_async.views.command_exec') as task:
+        task.apply_async.return_value = queued_task(task_id)
+        response = client.post(INDEX_URL, {'app_command': 'test_cmdasync.cmdasync_echo', 'args': '', 'kwargs': ''},
+                               **AJAX)
+    assert response.status_code == 200, 'precondition: the launch of {0} must be accepted'.format(task_id)
+    assert json.loads(response.content)['task']['id'] == task_id, 'precondition: the launch answers the task id'
+    return response
 
 
 def create_user(username='runner', password='secret-for-tests'):

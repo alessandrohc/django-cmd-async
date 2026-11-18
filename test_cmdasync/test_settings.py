@@ -112,7 +112,9 @@ class PermissionNameTest(TestCase):
         importlib.reload(app_settings)
 
     def views_with_the_permission_named(self, permission):
-        with override_settings(COMMANDS_ASYNC_PERMISSION_NAME=permission):
+        # The owner check is off in these copies (#8864): the tests that use them measure the permission gate, and a
+        # user who reads a task he did not launch would be answered 404 before the permission mattered to the result.
+        with override_settings(COMMANDS_ASYNC_PERMISSION_NAME=permission, COMMANDS_ASYNC_TASK_OWNERSHIP=False):
             importlib.reload(app_settings)
             return views_read_afresh()
 

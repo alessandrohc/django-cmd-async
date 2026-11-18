@@ -11,6 +11,7 @@ from unittest import mock
 from django.test import TestCase
 from django.urls import resolve, reverse
 
+from commands_async import settings as app_settings
 from test_cmdasync.harness import (INDEX_URL, WORKERS_URL, async_result,
                                    create_user, status_url)
 
@@ -68,6 +69,11 @@ class RoundTripTest(TestCase):
 
     def setUp(self):
         self.client.force_login(self.user)
+        # This test measures the address and the id that reaches the view, not the owner of the task (#8864): an
+        # empty id is never anybody's, so with the owner check on the view would answer 404 before reading it.
+        ownership = mock.patch.object(app_settings, 'COMMANDS_ASYNC_TASK_OWNERSHIP', False)
+        ownership.start()
+        self.addCleanup(ownership.stop)
 
     def test_an_empty_task_id_and_one_with_a_slash_reach_the_view_as_they_came(self):
         """AC-8836-9, AC-8836-12 (controle): the built address is requested and the view receives the same id."""
