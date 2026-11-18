@@ -44,11 +44,25 @@ at `/app/command/async/`. Three routes are registered under the `command-async` 
 | Name | Path | Login required |
 | --- | --- | --- |
 | `command-async:index` | `command/async/` | yes |
-| `command-async:status` | `command/async/status/<task_id>` | no |
+| `command-async:status` | `command/async/status/<task_id>` | yes |
 | `command-async:workers` | `command/async/workers/status/` | yes |
 
-`command-async:status` is deliberately open: the browser keeps polling for the output of a
-task it already started, and it reveals nothing but that task's own result.
+`command-async:status` answers the state, output and traceback of a task, and revokes it
+(`POST`). It was open to anyone, and it answered the result of **any** task id, not only of the
+tasks launched through the page: since this release it checks the user itself (in the view, not
+in the URLconf, so a project that mounts or subclasses the view keeps the check):
+
+- the user has to be authenticated, and, when `COMMANDS_ASYNC_PERMISSION_NAME` names a
+  permission, has to hold it (the same permission the form asks for; with none named, any
+  authenticated user is served, like the form);
+- a denied request gets a response without any task data, marked `no-store`: an XHR (a request
+  that sends `X-Requested-With: XMLHttpRequest`, as the bundled JS does) gets a `403` with
+  `{"task": null}`; any other request is redirected to `COMMANDS_ASYNC_LOGIN_URL` (not logged in)
+  or gets the plain `403` (no permission).
+
+A script that polls this route without a session, or that only asks for JSON (without the
+`X-Requested-With` header), now has to authenticate. The check does not tie a task to the user
+who launched it: any authorized user can still read or revoke any task id they know.
 
 ## DJANGO settings
 

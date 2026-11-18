@@ -8,7 +8,7 @@ package: the host project reaches the page through
 from unittest import mock
 
 from django.test import TestCase
-from django.urls import reverse
+from django.urls import resolve, reverse
 
 from test_cmdasync.harness import (INDEX_URL, WORKERS_URL, async_result,
                                    create_user, status_url)
@@ -28,10 +28,59 @@ class ReverseTest(TestCase):
                          status_url('abc-123'))
 
     def test_status_reverses_with_an_empty_task_id(self):
-        # The pattern accepts an empty id on purpose -- the JS builds the URL
-        # before the task id is known and relies on it not 404ing.
+        """AC-8836-9 (controle): an empty task id still builds the status address."""
+        # The pattern accepts an empty id on purpose -- the host project relies on it
+        # not 404ing (its own tests send an empty id through this route).
         self.assertEqual(reverse('command-async:status', kwargs={'task_id': ''}),
                          status_url(''))
+
+    def test_status_reverses_with_a_task_id_that_has_a_slash(self):
+        """AC-8836-9 (controle): a task id with a slash still builds the status address, as it came."""
+        self.assertEqual(reverse('command-async:status', kwargs={'task_id': 'a/b'}),
+                         status_url('a/b'))
+
+
+class ResolveTest(TestCase):
+    """The status pattern keeps matching an empty id and one with a slash, handing the id over as it came."""
+
+    def test_status_resolves_an_empty_task_id(self):
+        """AC-8836-12 (controle): the address without an id resolves to the status route with an empty id."""
+        match = resolve(status_url(''))
+        self.assertEqual((match.namespace, match.url_name), ('command-async', 'status'))
+        self.assertEqual(match.kwargs, {'task_id': ''})
+
+    def test_status_resolves_a_task_id_with_a_slash(self):
+        """AC-8836-12 (controle): an id with a slash resolves to the status route and reaches the view whole."""
+        match = resolve(status_url('a/b'))
+        self.assertEqual((match.namespace, match.url_name), ('command-async', 'status'))
+        self.assertEqual(match.kwargs, {'task_id': 'a/b'})
+
+
+class RoundTripTest(TestCase):
+    """The address ``reverse`` builds is served by the status view, which gets the id as it came."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = create_user()
+
+    def setUp(self):
+        self.client.force_login(self.user)
+
+    def test_an_empty_task_id_and_one_with_a_slash_reach_the_view_as_they_came(self):
+        """AC-8836-9, AC-8836-12 (controle): the built address is requested and the view receives the same id."""
+        # The host project builds this URL with ids of both kinds (see ReverseTest), so the id has to arrive whole:
+        # the view reads it from kwargs['task_id'] and hands it to AsyncResult (views.py, TaskFormStatus.get).
+        for task_id in ('', 'a/b'):
+            with self.subTest(task_id=task_id):
+                with mock.patch('commands_async.views.AsyncResult') as async_result_class:
+                    async_result_class.return_value = async_result()
+                    url = reverse('command-async:status', kwargs={'task_id': task_id})
+                    response = self.client.get(url)
+
+                self.assertEqual(url, status_url(task_id))
+                self.assertEqual(response.status_code, 200, msg='the built address must be served')
+                async_result_class.assert_called_once()
+                self.assertEqual(async_result_class.call_args.kwargs['id'], task_id)
 
 
 class LoginGateTest(TestCase):
@@ -48,13 +97,15 @@ class LoginGateTest(TestCase):
                              target_status_code=200)
 
     @mock.patch('commands_async.views.AsyncResult')
-    def test_status_is_reachable_without_a_session(self, async_result_class):
-        # Deliberate: the polling endpoint is unauthenticated so the JS can keep
-        # reading a task's output after the session expires. Asserted so the
-        # asymmetry with the other two routes is a decision, not an accident.
+    def test_anonymous_status_redirects_to_the_login_url(self, async_result_class):
+        """AC-8836-1: the status route demands a session like the other two (it was open until #8836)."""
+        # The route used to stay open "so the JS can keep reading after the session expires": it exposed
+        # the output of any task to anyone. The bundled JS asks for a status only after the form post
+        # (which needs a session) returned the task id.
         async_result_class.return_value = async_result()
         response = self.client.get(status_url('abc-123'))
-        self.assertEqual(response.status_code, 200)
+        self.assertRedirects(response, '/login/?next={0}'.format(status_url('abc-123')),
+                             fetch_redirect_response=False)
 
 
 class NeverCacheTest(TestCase):

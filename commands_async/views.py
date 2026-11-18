@@ -1,8 +1,11 @@
 # coding=utf-8
 import collections
+from urllib.parse import urlsplit
 from django.core.exceptions import PermissionDenied
+from django.shortcuts import resolve_url
+from django.utils.cache import add_never_cache_headers
 from django.utils.translation import gettext as _
-from django.http import JsonResponse
+from django.http import HttpResponseForbidden, JsonResponse
 from django.views.generic import FormView, View
 from celery.result import AsyncResult
 from .forms import TaskForm
@@ -23,7 +26,39 @@ def is_ajax(request):
     return request.headers.get('x-requested-with') == 'XMLHttpRequest'
 
 
-class TaskFormView(FormView):
+def login_redirect(request):
+    """Redirects to the login page with the same ``next`` that ``login_required`` builds.
+
+    ``django.contrib.auth.views`` pulls the auth forms and models in at import time, which this module
+    does not otherwise depend on, so it is imported here.
+    """
+    from django.contrib.auth.views import redirect_to_login
+
+    path = request.build_absolute_uri()
+    login_url = resolve_url(settings.COMMANDS_ASYNC_LOGIN_URL)
+    # Same scheme and net location as the login page: ``next`` is just the path. Otherwise it is absolute.
+    login_scheme, login_netloc = urlsplit(login_url)[:2]
+    current_scheme, current_netloc = urlsplit(path)[:2]
+    if (not login_scheme or login_scheme == current_scheme) and (
+            not login_netloc or login_netloc == current_netloc):
+        path = request.get_full_path()
+    return redirect_to_login(path, login_url)
+
+
+class CommandPermissionMixin(object):
+    """The optional permission to run commands, shared by the form and the status route."""
+
+    command_permission_name = settings.COMMANDS_ASYNC_PERMISSION_NAME
+
+    def has_permission(self):
+        if bool(self.command_permission_name):
+            has_perm = self.request.user.has_perm(self.command_permission_name)
+        else:
+            has_perm = True
+        return has_perm
+
+
+class TaskFormView(CommandPermissionMixin, FormView):
     """ Task execution form """
 
     template_name = "cmdasync/index.html"
@@ -32,7 +67,6 @@ class TaskFormView(FormView):
     success_url = '.'
 
     commands_skip = settings.COMMANDS_ASYNC_COMMANDS_IGNORE
-    command_permission_name = settings.COMMANDS_ASYNC_PERMISSION_NAME
 
     def is_command_valid(self, command_name, app_name=None):
         """Whether the command is allowed by COMMANDS_ASYNC_COMMANDS_IGNORE.
@@ -49,13 +83,6 @@ class TaskFormView(FormView):
             return str(name) not in self.commands_skip
 
         return all(map(check_command_name , items))
-
-    def has_permission(self):
-        if bool(self.command_permission_name):
-            has_perm = self.request.user.has_perm(self.command_permission_name)
-        else:
-            has_perm = True
-        return has_perm
 
     def get_context_data(self, **kwargs):
         context = super(TaskFormView, self).get_context_data(**kwargs)
@@ -141,7 +168,30 @@ class CeleryWorkerStatus(View):
         return JsonResponse(data)
 
 
-class TaskFormStatus(View):
+class TaskFormStatus(CommandPermissionMixin, View):
+    """Reads and revokes a task, for an authenticated user who may run commands.
+
+    The route used to stay open, and it answered the output of any task to anyone. The gate lives here, in
+    ``dispatch``, and not in the URLconf: a host that mounts or subclasses this view keeps it. Every denial is a
+    response the view returns (never a raised ``PermissionDenied``, which Django turns into the 403 outside
+    this view) and it is marked ``no-store`` here, so it does not depend on the ``never_cache`` of ``urls.py``.
+    An XHR (what the bundled JS sends) gets a 403 in JSON, which its ``.fail`` handles; a 302 to the login page
+    would be followed and read as a status, so any other request is redirected, or answered the plain 403.
+    """
+
+    def dispatch(self, request, *args, **kwargs):
+        if not request.user.is_authenticated:
+            response = self.forbidden_json() if is_ajax(request) else login_redirect(request)
+        elif not self.has_permission():
+            response = self.forbidden_json() if is_ajax(request) else HttpResponseForbidden()
+        else:
+            return super().dispatch(request, *args, **kwargs)
+        add_never_cache_headers(response)
+        return response
+
+    @staticmethod
+    def forbidden_json():
+        return JsonResponse({'task': None}, status=403)
 
     def get(self, request, **kwargs):
         """Reports task status"""

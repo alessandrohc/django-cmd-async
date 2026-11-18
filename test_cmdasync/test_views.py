@@ -6,11 +6,16 @@ The broker and the result backend are always replaced -- see
 JavaScript consumes, since that is the actual public interface of these views.
 """
 import json
+from contextlib import contextmanager
 from unittest import mock
+from urllib.parse import quote
 
-from django.test import TestCase
+from django.conf import settings as project_settings
+from django.contrib.auth.models import AnonymousUser
+from django.test import Client, RequestFactory, TestCase
 
-from commands_async.views import TaskFormView
+from commands_async import settings as app_settings
+from commands_async.views import TaskFormStatus, TaskFormView
 
 from test_cmdasync.harness import (AJAX, INDEX_URL, WORKERS_URL, async_result,
                                    create_user, grant, queued_task, status_url)
@@ -155,12 +160,22 @@ class TaskFormViewGatingTest(TestCase):
         task.apply_async.assert_not_called()
 
     def test_submit_without_the_required_permission_returns_a_field_error(self):
+        """AC-8836-15 (controle): a user without the named permission is refused by ajax, and nothing is queued."""
         with mock.patch.object(TaskFormView, 'command_permission_name', 'auth.run_commands'), \
                 mock.patch('commands_async.views.command_exec') as task:
             response = self.client.post(INDEX_URL, payload(), **AJAX)
 
         self.assertEqual(response.status_code, 400)
         self.assertIn('app_command', json.loads(response.content)['form']['errors'])
+        task.apply_async.assert_not_called()
+
+    def test_submit_without_the_required_permission_is_forbidden_without_ajax(self):
+        """AC-8836-15 (controle): the same refusal on a plain form post is the 403 page, and nothing is queued."""
+        with mock.patch.object(TaskFormView, 'command_permission_name', 'auth.run_commands'), \
+                mock.patch('commands_async.views.command_exec') as task:
+            response = self.client.post(INDEX_URL, payload())
+
+        self.assertEqual(response.status_code, 403)
         task.apply_async.assert_not_called()
 
     def test_submit_with_the_required_permission_reaches_the_broker(self):
@@ -175,10 +190,22 @@ class TaskFormViewGatingTest(TestCase):
 
 
 class TaskFormStatusTest(TestCase):
-    """The polling endpoint the JS hits until a task is done."""
+    """The polling endpoint the JS hits until a task is done, as an authorized user sees it.
+
+    The endpoint demands a session since #8836 (see ``TaskFormStatusAccessTest``): these are the
+    contract tests it always had, now from a logged-in user.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = create_user()
+
+    def setUp(self):
+        self.client.force_login(self.user)
 
     @mock.patch('commands_async.views.AsyncResult')
     def test_get_reports_the_output_of_a_finished_task(self, async_result_class):
+        """AC-8836-6 (controle): a finished task reports its id, that it is ready, not failed, and its output."""
         async_result_class.return_value = async_result(task_id='abc',
                                                        result='all done')
         response = self.client.get(status_url('abc'))
@@ -189,6 +216,7 @@ class TaskFormStatusTest(TestCase):
 
     @mock.patch('commands_async.views.AsyncResult')
     def test_get_reports_the_traceback_of_a_failed_task(self, async_result_class):
+        """AC-8836-6 (controle): a failed task reports that it failed and its traceback, never an output."""
         async_result_class.return_value = async_result(task_id='abc', failed=True,
                                                        traceback='boom')
         data = json.loads(self.client.get(status_url('abc')).content)['task']
@@ -200,14 +228,25 @@ class TaskFormStatusTest(TestCase):
 
     @mock.patch('commands_async.views.AsyncResult')
     def test_get_reports_a_task_that_is_still_running(self, async_result_class):
+        """AC-8836-6 (controle): a task that has not finished reports that it is not ready."""
         async_result_class.return_value = async_result(task_id='abc', ready=False,
                                                        result=None)
         data = json.loads(self.client.get(status_url('abc')).content)['task']
 
         self.assertFalse(data['ready'])
 
+    @mock.patch('commands_async.views.AsyncResult')
+    def test_get_reports_a_null_output_while_the_task_has_not_finished(self, async_result_class):
+        """AC-8836-6 (controle): the output is the backend's own answer, null while there is none, never a traceback."""
+        async_result_class.return_value = async_result(task_id='abc', ready=False,
+                                                       result=None)
+        data = json.loads(self.client.get(status_url('abc')).content)['task']
+
+        self.assertEqual(data, {'id': 'abc', 'ready': False, 'failed': False, 'output': None})
+
     @mock.patch('commands_async.views.celery_app')
     def test_post_revokes_the_task(self, celery_app):
+        """AC-8836-7, AC-8836-11 (controle): an authorized revoke asks Celery to terminate the task and says so."""
         response = self.client.post(status_url('abc'))
 
         celery_app.control.revoke.assert_called_once_with('abc', terminate=True)
@@ -215,11 +254,242 @@ class TaskFormStatusTest(TestCase):
 
     @mock.patch('commands_async.views.celery_app')
     def test_post_reports_a_revoke_that_could_not_be_delivered(self, celery_app):
+        """AC-8836-8 (controle): a revoke that Celery cannot take is reported with its reason."""
         celery_app.control.revoke.side_effect = RuntimeError('no broker')
         data = json.loads(self.client.post(status_url('abc')).content)
 
         self.assertFalse(data['status'])
         self.assertEqual(data['error'], 'no broker')
+
+
+# #8836: who may read and revoke a task through the status route. A readable result sits behind every id (the
+# canary), so a denial that leaks anything shows up as the canary in its body.
+OUTPUT = 'OUTPUT-8836-canary'
+TRACEBACK = 'TRACEBACK-8836-canary'
+DONE_ID = 'done-8836'
+FAILED_ID = 'failed-8836'
+
+
+def readable_results():
+    """``AsyncResult`` stand-in: a finished task with an output and a failed one with a traceback."""
+    results = {
+        DONE_ID: async_result(task_id=DONE_ID, result=OUTPUT),
+        FAILED_ID: async_result(task_id=FAILED_ID, failed=True, traceback=TRACEBACK),
+    }
+
+    def build(id=None, app=None, **kwargs):
+        return results[id]
+
+    return build
+
+
+class TaskFormStatusAccessTest(TestCase):
+    """The status route answers only an authenticated user who holds the permission the form asks for.
+
+    XHR is the request that declares ``X-Requested-With: XMLHttpRequest`` (what the bundled JS sends); every other
+    request, a script asking for JSON included, is plain navigation and is redirected to the login page.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.plain = create_user('plain')
+        cls.runner = create_user('runner')
+        cls.permission = grant(cls.runner, 'run_commands')
+
+    def setUp(self):
+        results = mock.patch('commands_async.views.AsyncResult', side_effect=readable_results())
+        results.start()
+        self.addCleanup(results.stop)
+        celery = mock.patch('commands_async.views.celery_app')
+        self.celery_app = celery.start()
+        self.addCleanup(celery.stop)
+        self.revoke = self.celery_app.control.revoke
+
+    @staticmethod
+    def logged(user):
+        client = Client()
+        client.force_login(user)
+        return client
+
+    @contextmanager
+    def permission_required(self):
+        """The host names a permission. Before #8836 the status view had no such attribute, hence ``create=True``."""
+        with mock.patch.object(TaskFormStatus, 'command_permission_name', self.permission, create=True):
+            yield
+
+    def assertNoTaskData(self, response, label):
+        body = response.content.decode('utf-8')
+        for leak in (OUTPUT, TRACEBACK, '"ready"', '"traceback"', '"output"'):
+            self.assertNotIn(leak, body, msg='%s: the denial must not carry %s' % (label, leak))
+
+    def assertReads(self, client, label, **extra):
+        """The user reads the canary behind a finished task: what the denials below are measured against."""
+        response = client.get(status_url(DONE_ID), **extra)
+        self.assertEqual(response.status_code, 200, msg='precondition (%s): the user reads the result' % label)
+        self.assertIn(OUTPUT, response.content.decode('utf-8'), msg='precondition (%s): the canary is readable' % label)
+
+    def assertRevokes(self, client, label):
+        """The user's revoke reaches Celery, so the silence in the denials below is the gate's."""
+        client.post(status_url(DONE_ID))
+        self.revoke.assert_called_once_with(DONE_ID, terminate=True)
+        self.revoke.reset_mock()
+
+    def test_anonymous_navigation_is_sent_to_the_login_url(self):
+        """AC-8836-1: an anonymous query by plain navigation is redirected to the login page, with no task data."""
+        self.assertReads(self.logged(self.plain), 'logged in')
+        for task_id in (DONE_ID, FAILED_ID):
+            for label, extra in (('navigation', {}), ('script asking for JSON', {'HTTP_ACCEPT': 'application/json'})):
+                with self.subTest(task=task_id, request=label):
+                    response = self.client.get(status_url(task_id), **extra)
+                    self.assertRedirects(response, '/login/?next={0}'.format(status_url(task_id)),
+                                         fetch_redirect_response=False)
+                    self.assertNoTaskData(response, label)
+
+    def test_anonymous_xhr_gets_a_json_403(self):
+        """AC-8836-2: an anonymous query by XHR is answered 403 in JSON, with no task data."""
+        self.assertReads(self.logged(self.plain), 'logged in', **AJAX)
+        for task_id in (DONE_ID, FAILED_ID):
+            with self.subTest(task=task_id):
+                response = self.client.get(status_url(task_id), **AJAX)
+                self.assertEqual(response.status_code, 403, msg='an anonymous XHR must be denied, not redirected')
+                self.assertEqual(json.loads(response.content), {'task': None})
+                self.assertNoTaskData(response, 'anonymous xhr')
+
+    def test_anonymous_revoke_never_reaches_celery(self):
+        """AC-8836-3: an anonymous revoke, by navigation or XHR, is never forwarded to Celery."""
+        self.assertRevokes(self.logged(self.plain), 'logged in')
+        for label, extra in (('navigation', {}), ('xhr', AJAX)):
+            with self.subTest(request=label):
+                self.client.post(status_url(DONE_ID), **extra)
+                self.revoke.assert_not_called()
+
+    def test_anonymous_revoke_is_denied_like_the_anonymous_query(self):
+        """AC-8836-13: an anonymous revoke is redirected to the login page, or answered 403 in JSON by XHR."""
+        with self.subTest(request='navigation'):
+            response = self.client.post(status_url(DONE_ID))
+            self.assertRedirects(response, '/login/?next={0}'.format(status_url(DONE_ID)),
+                                 fetch_redirect_response=False)
+        with self.subTest(request='xhr'):
+            response = self.client.post(status_url(DONE_ID), **AJAX)
+            self.assertEqual(response.status_code, 403, msg='an anonymous XHR must be denied, not redirected')
+            self.assertEqual(json.loads(response.content), {'task': None})
+
+    def test_anonymous_denial_goes_to_the_login_url_the_package_names(self):
+        """AC-8836-1, AC-8836-13: the redirect goes to ``COMMANDS_ASYNC_LOGIN_URL``, not to the project's ``LOGIN_URL``."""
+        # The test project's LOGIN_URL is '/login/' and the package setting inherits it (commands_async/settings.py:22),
+        # so the tests above cannot tell the two apart. Here the host points the package somewhere else; the view reads
+        # the setting at call time (views.py:38), hence the patch on the settings module.
+        elsewhere = '/elsewhere/'
+        self.assertNotEqual(project_settings.LOGIN_URL, elsewhere, msg='precondition: the two login pages differ')
+        with mock.patch.object(app_settings, 'COMMANDS_ASYNC_LOGIN_URL', elsewhere):
+            for method in ('get', 'post'):
+                with self.subTest(method=method):
+                    response = getattr(self.client, method)(status_url(DONE_ID))
+                    self.assertRedirects(response, '{0}?next={1}'.format(elsewhere, status_url(DONE_ID)),
+                                         fetch_redirect_response=False)
+                    self.assertNoTaskData(response, method)
+
+    def test_a_user_without_the_named_permission_is_forbidden_to_query(self):
+        """AC-8836-4: when a permission is named, a user without it is answered 403 (JSON by XHR), no task data."""
+        with self.permission_required():
+            self.assertReads(self.logged(self.runner), 'holds the permission')
+            client = self.logged(self.plain)
+            for task_id in (DONE_ID, FAILED_ID):
+                for label, extra in (('navigation', {}), ('xhr', AJAX)):
+                    with self.subTest(task=task_id, request=label):
+                        response = client.get(status_url(task_id), **extra)
+                        self.assertEqual(response.status_code, 403, msg='%s: must be forbidden' % label)
+                        if extra:
+                            self.assertEqual(json.loads(response.content), {'task': None})
+                        self.assertNoTaskData(response, label)
+
+    def test_a_user_without_the_named_permission_is_forbidden_to_revoke(self):
+        """AC-8836-5: when a permission is named, a user without it who revokes is answered 403 (JSON by XHR)."""
+        with self.permission_required():
+            client = self.logged(self.plain)
+            for label, extra in (('navigation', {}), ('xhr', AJAX)):
+                with self.subTest(request=label):
+                    response = client.post(status_url(DONE_ID), **extra)
+                    self.assertEqual(response.status_code, 403, msg='%s: must be forbidden' % label)
+                    if extra:
+                        self.assertEqual(json.loads(response.content), {'task': None})
+
+    def test_a_user_without_the_named_permission_never_reaches_celery(self):
+        """AC-8836-14: when a permission is named, a revoke by a user without it is never forwarded to Celery."""
+        with self.permission_required():
+            self.assertRevokes(self.logged(self.runner), 'holds the permission')
+            client = self.logged(self.plain)
+            for label, extra in (('navigation', {}), ('xhr', AJAX)):
+                with self.subTest(request=label):
+                    client.post(status_url(DONE_ID), **extra)
+                    self.revoke.assert_not_called()
+
+    def test_a_user_with_the_named_permission_is_served(self):
+        """AC-8836-6, AC-8836-7, AC-8836-11 (controle): the holder of the named permission reads and revokes as before."""
+        with self.permission_required():
+            client = self.logged(self.runner)
+            data = json.loads(client.get(status_url(DONE_ID)).content)['task']
+            self.assertEqual(data, {'id': DONE_ID, 'ready': True, 'failed': False, 'output': OUTPUT})
+            response = client.post(status_url(DONE_ID))
+            self.revoke.assert_called_once_with(DONE_ID, terminate=True)
+            self.assertEqual(json.loads(response.content), {'status': True})
+
+    def test_every_denial_is_marked_no_store(self):
+        """AC-8836-10: every denial (login or permission, by navigation or XHR) is no-store, even off the URLconf."""
+        denials = []
+        for method in ('get', 'post'):
+            for label, extra in (('navigation', {}), ('xhr', AJAX)):
+                denials.append(('anonymous %s %s' % (method, label),
+                                getattr(self.client, method)(status_url(DONE_ID), **extra)))
+                with self.permission_required():
+                    denials.append(('no permission %s %s' % (method, label),
+                                    getattr(self.logged(self.plain), method)(status_url(DONE_ID), **extra)))
+                # the view mounted straight, without the never_cache of the package URLconf
+                for who, user in (('anonymous', AnonymousUser()), ('no permission', self.plain)):
+                    request = getattr(RequestFactory(), method)(status_url(DONE_ID), **extra)
+                    request.user = user
+                    with self.permission_required():
+                        response = TaskFormStatus.as_view()(request, task_id=DONE_ID)
+                    denials.append(('direct %s %s %s' % (who, method, label), response))
+        self.assertEqual(len(denials), 16, msg='precondition: every form of denial is exercised')
+        for label, response in denials:
+            with self.subTest(denial=label):
+                self.assertIn(response.status_code, (302, 403), msg='%s: must be a denial' % label)
+                self.assertIn('no-store', response.headers.get('Cache-Control', ''),
+                              msg='%s: the denial must be no-store' % label)
+
+
+class LoginRedirectTest(TestCase):
+    """What ``next`` carries when the login page is an absolute address (no criterion: robustness of the helper).
+
+    ``login_redirect`` copies what django's ``login_required`` does (views.py:39-44): ``next`` is just the path when the
+    login page is on the same site, and the absolute address of the request when it is on another one (a single
+    sign-on page), where a bare path would send the user back to the wrong site.
+    """
+
+    def setUp(self):
+        patch = mock.patch('commands_async.views.AsyncResult', side_effect=readable_results())
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def redirect_to(self, login_url):
+        with mock.patch.object(app_settings, 'COMMANDS_ASYNC_LOGIN_URL', login_url):
+            return self.client.get(status_url(DONE_ID))
+
+    def test_a_login_page_on_another_host_gets_the_absolute_address_as_next(self):
+        # the test client talks to http://testserver
+        response = self.redirect_to('https://sso.example.com/login/')
+
+        self.assertRedirects(response,
+                             'https://sso.example.com/login/?next={0}'.format(
+                                 quote('http://testserver' + status_url(DONE_ID), safe='/')),
+                             fetch_redirect_response=False)
+
+    def test_a_login_page_on_the_same_host_gets_only_the_path_as_next(self):
+        response = self.redirect_to('http://testserver/login/')
+
+        self.assertRedirects(response, 'http://testserver/login/?next={0}'.format(status_url(DONE_ID)),
+                             fetch_redirect_response=False)
 
 
 class CeleryWorkerStatusTest(TestCase):
