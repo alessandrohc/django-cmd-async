@@ -20,8 +20,9 @@
 <div class="container" id="wrap">
 {% comment %}
 Everything cmdasync-page.js needs from the server. The two flags are rendered as
-JSON booleans so jQuery.data() hands them over typed, and the message is
-translated here rather than in the .js so it stays in the catalog.
+JSON booleans so jQuery.data() hands them over typed, and the messages (the running
+text and the three failure texts) are translated here rather than in the .js so they
+stay in the catalog. #task-alert, below the form, is where the script tells a failure.
 {% endcomment %}
     <div class="card" id="task-panel"
          data-commands-list="{{ settings.COMMANDS_ASYNC_LIST|yesno:"true,false" }}"
@@ -29,7 +30,10 @@ translated here rather than in the .js so it stays in the catalog.
          data-login-url="{{ settings.COMMANDS_ASYNC_LOGIN_URL }}"
          data-redirect-field="{{ settings.COMMANDS_ASYNC_REDIRECT_FIELD_NAME }}"
          data-index-url="{% url 'command-async:index' %}"
-         data-running-text="{% trans "Running command..." %}">
+         data-running-text="{% trans "Running command..." %}"
+         data-revoke-failed-text="{% trans "The revocation request could not be sent." %}"
+         data-forbidden-text="{% trans "Access denied: your session may have expired, or you do not have permission to see this task." %}"
+         data-not-found-text="{% trans "Task not found." %}">
         <div class="card-body">
             {% block panelbody %}
             <h4>{% trans "Checking and updating environment" %}</h4>
@@ -73,6 +77,7 @@ translated here rather than in the .js so it stays in the catalog.
                     </button>
                 </div>
             </form>
+            <div id="task-alert" class="alert alert-danger d-none" role="alert"></div>
         </div>
         <div class="card-footer">
             <pre id="task-output"></pre>

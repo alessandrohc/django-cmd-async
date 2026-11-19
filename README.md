@@ -138,6 +138,9 @@ that is alive but slow is not limited by the check.
 [bool] COMMANDS_ASYNC_LIST (default: False)
 
 ### Login is a required feature, because we need a url.
+The way back to the page travels in Django's `next` parameter (`REDIRECT_FIELD_NAME`); there is
+no setting for its name.
+
 [str]  COMMANDS_ASYNC_LOGIN_URL  (default: settings.LOGIN_URL)
 
 ### List with commands that should be ignored. [runserver, shell, etc]. An error will be shown to the user when the command is in that list.
@@ -148,9 +151,6 @@ Entries match either the bare command name (`shell`) or the app-qualified one
 
 ### The user who will perform tasks must have this permission. It does not need to be configured, but if configured, the user will need to have this permission to execute commands. An error message will be shown to the user if he does not have this permission.
 [str]  COMMANDS_ASYNC_PERMISSION_NAME  (default: None)
-
-### Parameter `next` to the login url.
-[str]  COMMANDS_ASYNC_REDIRECT_FIELD_NAME (default: django.contrib.auth.REDIRECT_FIELD_NAME)
 
 ### Options handed to the Celery task, merged over the defaults `{"expires": 1800, "retries": 0}`.
 A `priority` key is accepted here and forwarded to `apply_async` instead of the task
@@ -206,6 +206,10 @@ coverage run runtests.py && coverage report   # with coverage
 ```
 
 `msgfmt` (GNU gettext) is needed for the catalog checks; without it they skip.
+
+`node` is needed for the tests of the page scripts (`test_cmdasync/test_page_script.py` runs the real
+scripts under it, with a double of jQuery and of the DOM); without it they **fail**, on purpose: a skip
+would turn them green without proving anything. The CI installs it (`actions/setup-node`).
 
 ## Visual Result
 

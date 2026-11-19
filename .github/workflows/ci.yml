@@ -48,6 +48,14 @@ jobs:
       - name: Check msgfmt is available
         run: msgfmt --version
 
+      - name: Install node
+        # test_page_script.py runs the page scripts under node and FAILS without it
+        # (a skip would turn the whole JS suite green without proving anything). The
+        # image ships a node already; this only pins the version the suite is measured on.
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.15.0'
+
       - name: Run test suite
         run: python runtests.py -v 1
 
@@ -70,6 +78,14 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends gettext
+
+      - name: Install node
+        # test_page_script.py runs the page scripts under node and FAILS without it
+        # (a skip would turn the whole JS suite green without proving anything). The
+        # image ships a node already; this only pins the version the suite is measured on.
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.15.0'
 
       - name: Run test suite with deprecations promoted to errors
         # Django announces removals as RemovedInDjangoXXWarning, which subclass

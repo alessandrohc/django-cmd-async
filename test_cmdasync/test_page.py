@@ -18,6 +18,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from django.test import SimpleTestCase, TestCase, override_settings
+from django.utils import translation
 
 from test_cmdasync.context_processors import NONCE
 from test_cmdasync.harness import INDEX_URL, create_user
@@ -187,6 +188,66 @@ class DataAttributeContractTest(TestCase):
         # The string stays a {% trans %} in the HTML -- moving it into the .js
         # would take it out of the catalog.
         self.assertIn('data-running-text="Running command..."', self.rendered())
+
+
+class TagIndex(HTMLParser):
+    """Indexa, por id, os atributos das tags da página (o HTMLParser já desfaz o escape dos valores)."""
+
+    def __init__(self):
+        super().__init__()
+        self.by_id = {}
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if attributes.get('id'):
+            self.by_id[attributes['id']] = attributes
+
+
+# As três frases da falha, exatamente como os AC-8866-1 e AC-8866-4 as dizem (a chave é o data-* do #task-panel).
+ALERT_TEXTS = {
+    'data-revoke-failed-text': 'The revocation request could not be sent.',
+    'data-forbidden-text': 'Access denied: your session may have expired, or you do not have permission to see this task.',
+    'data-not-found-text': 'Task not found.',
+}
+
+
+class AlertContractTest(TestCase):
+    """O que o script usa nos avisos de falha, publicado pela página do pacote (AC-8866-9)."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = create_user()
+
+    def setUp(self):
+        self.client.force_login(self.user)
+
+    def page(self):
+        index = TagIndex()
+        index.feed(self.client.get(INDEX_URL).content.decode('utf-8'))
+        return index.by_id
+
+    def test_the_page_has_an_alert_space_that_starts_hidden(self):
+        """AC-8866-9: a página traz o espaço do aviso, oculto enquanto não há aviso."""
+        space = self.page().get('task-alert')
+        self.assertIsNotNone(space, msg='the page has no #task-alert')
+        self.assertIn('d-none', space.get('class', '').split(), msg='the alert space must start hidden')
+
+    def test_the_page_publishes_the_failure_texts_untranslated(self):
+        """AC-8866-9: os textos da falha chegam ao script, exatamente nas frases dos critérios, quando não há tradução."""
+        panel = self.page()['task-panel']
+        for attribute, phrase in ALERT_TEXTS.items():
+            with self.subTest(attribute=attribute):
+                self.assertEqual(panel.get(attribute), phrase)
+
+    def test_the_page_publishes_the_failure_texts_translated(self):
+        """AC-8866-9: os textos da falha chegam traduzidos para o idioma do usuário quando há tradução."""
+        with translation.override('pt-br'):
+            panel = self.page()['task-panel']
+            for attribute, phrase in ALERT_TEXTS.items():
+                with self.subTest(attribute=attribute):
+                    translated = translation.gettext(phrase)
+                    self.assertNotEqual(translated, phrase, msg='the pt_BR catalog has no entry for this phrase')
+                    self.assertEqual(panel.get(attribute), translated)
 
 
 class DomSinkTest(SimpleTestCase):

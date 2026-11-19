@@ -6,7 +6,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: django-cmd-async 2.3.0\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-11-19 12:52+0000\n"
+"POT-Creation-Date: 2026-11-19 19:00+0000\n"
 "PO-Revision-Date: 2026-07-29 08:38-0300\n"
 "Last-Translator: Alessandro Hecht <alessandrohc@gmail.com>\n"
 "Language-Team: Brazilian Portuguese\n"
@@ -28,19 +28,35 @@ msgstr "Escolha uma opção"
 msgid "Run tasks"
 msgstr "Execute tarefas"
 
-#: templates/cmdasync/index.html:32
+#: templates/cmdasync/index.html:33
 msgid "Running command..."
 msgstr "Executando comando..."
 
+#: templates/cmdasync/index.html:34
+msgid "The revocation request could not be sent."
+msgstr "Não foi possível enviar o pedido de revogação."
+
 #: templates/cmdasync/index.html:35
+msgid ""
+"Access denied: your session may have expired, or you do not have permission "
+"to see this task."
+msgstr ""
+"Acesso negado: sua sessão pode ter expirado, ou você não tem permissão para "
+"ver esta tarefa."
+
+#: templates/cmdasync/index.html:36
+msgid "Task not found."
+msgstr "Tarefa não encontrada."
+
+#: templates/cmdasync/index.html:39
 msgid "Checking and updating environment"
 msgstr "Verificação e atualização de ambiente"
 
-#: templates/cmdasync/index.html:37
+#: templates/cmdasync/index.html:41
 msgid "Warning:"
 msgstr "Atenção:"
 
-#: templates/cmdasync/index.html:38
+#: templates/cmdasync/index.html:42
 msgid ""
 "It is strongly recommended that the system be used with the aid of an "
 "approved technician."
@@ -48,27 +64,27 @@ msgstr ""
 "É altamente recomendado que o sistema seja utilizado com o auxílio de um "
 "técnico homologado."
 
-#: templates/cmdasync/index.html:45
+#: templates/cmdasync/index.html:49
 msgid "COMMAND"
 msgstr "COMANDO"
 
-#: templates/cmdasync/index.html:52
+#: templates/cmdasync/index.html:56
 msgid "Execute a command"
 msgstr "Execute um comando"
 
-#: templates/cmdasync/index.html:62
+#: templates/cmdasync/index.html:66
 msgid "Execute"
 msgstr "Executar"
 
-#: templates/cmdasync/index.html:67
+#: templates/cmdasync/index.html:71
 msgid "Cancel"
 msgstr "Cancelar"
 
-#: templates/cmdasync/index.html:72
+#: templates/cmdasync/index.html:76
 msgid "Revoke"
 msgstr "Revogar"
 
-#: templates/cmdasync/index.html:80
+#: templates/cmdasync/index.html:85
 msgid "Copy"
 msgstr "Copiar"
 
@@ -89,23 +105,23 @@ msgstr "Insira argumentos"
 msgid "kwargs"
 msgstr ""
 
-#: views.py:269
+#: views.py:282
 msgid "not allowed to run this command"
 msgstr "não é permitido executar esse comando"
 
-#: views.py:282
+#: views.py:295
 #, python-format
 msgid "command %(command)s failed to execute"
 msgstr "falha ao executar o comando %(command)s"
 
-#: views.py:344
+#: views.py:357
 msgid "no Celery worker answered"
 msgstr "nenhum worker do Celery respondeu"
 
-#: views.py:344
+#: views.py:357
 msgid "could not ask the Celery workers"
 msgstr "não foi possível consultar os workers do Celery"
 
-#: views.py:404
+#: views.py:420
 msgid "the revocation request could not be sent"
 msgstr "não foi possível enviar o pedido de revogação"

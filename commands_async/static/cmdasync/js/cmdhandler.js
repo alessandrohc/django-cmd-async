@@ -55,7 +55,12 @@ cmdasyncform = {
         this.events = {
             'form-valid': [],
             'update-finish': [],
-            'updating': []
+            'updating': [],
+            // the status query was refused or never got a JSON answer; the argument says why
+            // ('login', 'forbidden' or 'not-found')
+            'update-failed': [],
+            // the revocation request failed; the argument is the text the server sent, or null
+            'revoke-failed': []
         };
         this.$form = null;
         this.task = null;
@@ -65,10 +70,14 @@ cmdasyncform = {
         if (!this.running)
             this.update = true;
         var self = this;
+        // dataType json: a page that is not JSON (the login page an expired session
+        // gets after the redirect) lands in .fail as a parsererror instead of in
+        // .done, where there is no task to read.
         var req = $.ajax({
             type: "get",
             url: "status/" + task.id,
-            cache: false
+            cache: false,
+            dataType: "json"
         });
         req.done(function (data) {
             var task = data.task;
@@ -90,8 +99,11 @@ cmdasyncform = {
                     self.running = false;
                     self.exc_event_callbacks('update-finish', self.$form);
                 } else {
-                    // new update check
-                    this.requestTimeout = setTimeout(function () {
+                    // new update check; the timer is kept on the form (not on `this`,
+                    // which inside this callback is the ajax settings) so update_abort
+                    // can cancel it
+                    self.requestTimeout = setTimeout(function () {
+                        self.requestTimeout = null;
                         self.running = true;
                         self.request(task)
                     }, 1000);
@@ -101,10 +113,28 @@ cmdasyncform = {
                 self.exc_event_callbacks('update-finish', self.$form);
             }
         });
-        req.fail(function () {
+        req.fail(function (xhr, textStatus) {
             self.running = false;
-            self.exc_event_callbacks('update-finish', self.$form);
+            try {
+                var reason = self.failure_reason(xhr, textStatus);
+                if (reason)
+                    self.exc_event_callbacks('update-failed', reason);
+            } finally {
+                // whatever the page does with the reason, the screen is released
+                self.exc_event_callbacks('update-finish', self.$form);
+            }
         });
+    },
+    failure_reason: function (xhr, textStatus) {
+        // 200 that is not JSON: the browser followed the login redirect
+        if (textStatus === 'parsererror' && xhr.status === 200)
+            return 'login';
+        if (xhr.status === 403)
+            return 'forbidden';
+        if (xhr.status === 404)
+            return 'not-found';
+        // server errors and network failures stop the follow-up without a reason
+        return null;
     },
     revoke_task : function () {
         var self = this;
@@ -119,7 +149,12 @@ cmdasyncform = {
                 }
             },
             success: function(data) {
-                if (!data.status) alert(data.error);
+                if (!data.status)
+                    self.exc_event_callbacks('revoke-failed', data.error || null);
+            },
+            // HTTP error, or a 200 that is not JSON (parsererror, because of dataType)
+            error: function() {
+                self.exc_event_callbacks('revoke-failed', null);
             }
         })
     },
@@ -128,8 +163,18 @@ cmdasyncform = {
     },
 
     update_abort: function () {
-        if (this.requestTimeout !== null)
+        if (this.requestTimeout !== null) {
+            // A new query is scheduled: end the follow-up whole. Nobody else would
+            // release the screen (the query that did it never goes out), and
+            // `running` has to be clean for the next command to be followed.
             clearTimeout(this.requestTimeout);
+            this.requestTimeout = null;
+            this.running = false;
+            this.update = true;
+            this.exc_event_callbacks('update-finish', this.$form);
+            return;
+        }
+        // A query in flight (or the form being submitted): its answer decides.
         this.update = !this.running;
     },
 

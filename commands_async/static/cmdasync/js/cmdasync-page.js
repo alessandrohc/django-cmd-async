@@ -15,7 +15,31 @@ $(document).ready(function () {
         loginUrl: $panel.data('login-url'),
         redirectField: $panel.data('redirect-field'),
         indexUrl: $panel.data('index-url'),
-        runningText: $panel.data('running-text')
+        runningText: $panel.data('running-text'),
+        // The failure messages, translated in the template. A host with a template of
+        // its own may not publish them: showAlert() then shows only what the server sent.
+        revokeFailedText: $panel.data('revoke-failed-text'),
+        forbiddenText: $panel.data('forbidden-text'),
+        notFoundText: $panel.data('not-found-text')
+    };
+
+    // The alert space (#task-alert) is where a failure is told. .text() only, so what
+    // the server sent is never parsed as markup; a missing space or text is a no-op.
+    var showAlert = function (text) {
+        if (!text)
+            return;
+        $("#task-alert").text(text).removeClass("d-none");
+    };
+    var clearAlert = function () {
+        $("#task-alert").text("").addClass("d-none");
+    };
+
+    // Same destination as the form's "need login" answer below.
+    var goToLogin = function () {
+        var url = [config.loginUrl];
+        url.push("?" + config.redirectField + "=");
+        url.push(config.indexUrl);
+        window.location = url.join("");
     };
 
     // Maps a form field to the visible input that mirrors it, for error placement.
@@ -52,6 +76,7 @@ $(document).ready(function () {
         $(this).find(".task-progress").removeClass("d-none");
         $("#task-copy").addClass("d-none");
         cmdasyncform.clear_output();
+        clearAlert();
     });
 
     if (config.commandsList) {
@@ -68,9 +93,11 @@ $(document).ready(function () {
             $("#task-app-command").find("> span.info").text(app_command);
 
             $("input#id_app_command").val(value);
-            // stop status update
-            cmdasyncform.update_abort();
+            // stop status update; the output is cleared first because aborting releases
+            // the screen at once, and the copy button follows what the output holds
             cmdasyncform.clear_output();
+            cmdasyncform.update_abort();
+            clearAlert();
         });
     } else {
         // Text input mode: copy what was typed into the hidden field on submit.
@@ -82,12 +109,14 @@ $(document).ready(function () {
     $("#btn-task-cancel").on('click', function () {
         var $btnCancel = $(this).prop('disabled', true);
         $btnCancel.find(".task-progress").removeClass("d-none");
+        clearAlert();
         cmdasyncform.update_abort();
     });
 
     $("#btn-task-revoke").on('click', function () {
         var $btnRevoke = $(this).prop('disabled', true);
         $btnRevoke.find(".task-progress").removeClass("d-none");
+        clearAlert();
         cmdasyncform.revoke_task.bind(cmdasyncform)();
     });
 
@@ -125,10 +154,7 @@ $(document).ready(function () {
             requestErrorClean();
             switch (xhr.status) {
                 case 200:  // need login
-                    var url = [config.loginUrl];
-                    url.push("?" + config.redirectField + "=");
-                    url.push(config.indexUrl);
-                    window.location = url.join("");
+                    goToLogin();
                     break;
                 case 400:
                     var $input, data = xhr.responseJSON;
@@ -157,5 +183,27 @@ $(document).ready(function () {
 
     cmdasyncform.add_event_callback("update-finish", function (form) {
         requestUpdateFinish();
+    });
+
+    // The status query got no task: the reason arrives here, and the screen is released
+    // right after by update-finish.
+    cmdasyncform.add_event_callback("update-failed", function (reason) {
+        if (reason === 'login')
+            goToLogin();
+        else if (reason === 'forbidden')
+            showAlert(config.forbiddenText);
+        else if (reason === 'not-found')
+            showAlert(config.notFoundText);
+    });
+
+    cmdasyncform.add_event_callback("revoke-failed", function (serverText) {
+        showAlert(serverText || config.revokeFailedText);
+        // While the follow-up goes on (Execute is still disabled) the user may try to
+        // revoke again; on a screen that was already released (a late failure) the
+        // button stays disabled.
+        if ($btnSubmit.prop('disabled')) {
+            var $btnRevoke = $("#btn-task-revoke").prop('disabled', false);
+            $btnRevoke.find(".task-progress").addClass("d-none");
+        }
     });
 });
