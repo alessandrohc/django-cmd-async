@@ -26,8 +26,15 @@ COMMANDS_ASYNC_REDIRECT_FIELD_NAME = REDIRECT_FIELD_NAME
 COMMANDS_ASYNC_WORKERS_STATUS_CHECK = getattr(settings, 'COMMANDS_ASYNC_WORKERS_STATUS_CHECK', False)
 
 # Dono da tarefa na rota status (#8864): as views e a verificação do Django leem estas três DESTE módulo, na hora do uso
-# (views.py:84-85, 101, 251 e 303; checks.py:19 e 21), e não as copiam em atributo de classe.
+# (`remember_task`, `owns_task`, `TaskFormView.form_valid` e `TaskFormStatus.task_denial` em views.py; `checks.py`), e não as
+# copiam em atributo de classe. Por função, e não por linha, para o comentário não envelhecer a cada edição do views.py.
 COMMANDS_ASYNC_TASK_OWNERSHIP = getattr(settings, 'COMMANDS_ASYNC_TASK_OWNERSHIP', True)
 COMMANDS_ASYNC_OWNER_CACHE_ALIAS = getattr(settings, 'COMMANDS_ASYNC_OWNER_CACHE_ALIAS', 'default')
 COMMANDS_ASYNC_OWNER_TIMEOUT = getattr(settings, 'COMMANDS_ASYNC_OWNER_TIMEOUT', 86400)
+
+# Detalhe da falha da revogação (#8879): desligada (o padrão), a resposta traz uma frase fixa e o texto da exceção vai só para o
+# log; ligada, o `error` traz o texto da exceção. O `plus_base` a liga, para o superusuário em modo avançado (AC-8630-10).
+# Lida DESTE módulo na hora do uso (`TaskFormStatus.post`), como as do dono; só governa a revogação: a rota workers responde sempre a
+# frase fixa, porque o `plus_base` não embrulha essa rota (#8878).
+COMMANDS_ASYNC_REVOKE_ERROR_DETAIL = getattr(settings, 'COMMANDS_ASYNC_REVOKE_ERROR_DETAIL', False)
 

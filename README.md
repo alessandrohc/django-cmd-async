@@ -95,6 +95,40 @@ is a `403` with `{"status": false, "workers": []}`; any other request is redirec
 request gets that answer with any method, where it used to get `405` for a method other than
 `GET`; an authorized one still gets the `405`.
 
+### Errors, the broker and the 5-second window
+
+Neither route answers the text of a Celery or broker error any more: the text of a kombu error
+carries the address of the broker. The detail goes to the log of the package, and the answer
+carries a fixed phrase, still with a `200`:
+
+- `command-async:workers`: `{"status": false, "workers": [], "message": "could not ask the Celery
+  workers"}` when the query fails, and `"message": "no Celery worker answered"` (with `status`
+  false too) when the broadcast collects nothing, which used to surface as the text of a Python
+  `TypeError`.
+- `command-async:status`, the revocation (`POST`): `{"status": false, "error": "the revocation
+  request could not be sent"}`. `COMMANDS_ASYNC_REVOKE_ERROR_DETAIL = True` puts the text of the
+  error back in `error`, for a host that shows it only to who may read it. The workers route does
+  not read that setting: it always answers the fixed phrase.
+
+The workers route keeps its answer for 5 seconds, per process: a query that arrives less than 5
+seconds after the previous one of the same process (from any user, whatever the result: the list,
+nobody answered, or a failure) is answered with the previous result without asking Celery again,
+and queries that arrive together make one broadcast. So the list can be up to 5 seconds old, a
+failure stays for up to 5 seconds after the broker is back, and `N` processes make up to `N`
+queries per window. "One broadcast" holds while the query lasts less than 5 seconds: if it lasts
+5 seconds or more (a broker that is alive but slow, which the check below does not limit), those
+that waited for it ask again, once, and that new query opens the window for the ones that follow.
+
+Both routes first check, with a short limit, that the broker accepts a connection, so that a
+broker that refuses the connection or does not answer is answered with a false `status` within 5
+seconds. Without the check the Celery configuration of a project may hold the request for minutes
+(a `broker_connection_timeout` of 300 seconds, for instance). When the owner registry lives in the
+same Redis as the broker and cannot be read, the revocation is answered the `404` of the owner
+check before the broker is touched. Only a `redis://` broker on one host was measured: a refused
+port answers in 2 seconds and an address with no route in 4. Sentinel and cluster were not
+measured (with `N` unreachable sentinels the check should cost about `N` seconds), and a broker
+that is alive but slow is not limited by the check.
+
 ## DJANGO settings
 
 ### It should show a list of commands to the user. Otherwise, a text input will be displayed.
@@ -143,6 +177,12 @@ The default is the default lifetime of a Celery result; after it the user who la
 answered `404` on it, whether or not the backend still has the result.
 
 [int]  COMMANDS_ASYNC_OWNER_TIMEOUT  (default: 86400)
+
+### Whether the failure of a revocation answers the text of the error.
+Off (the default), `error` is a fixed phrase and the text of the error goes to the log. See "Errors,
+the broker and the 5-second window" above. It does not apply to `command-async:workers`.
+
+[bool] COMMANDS_ASYNC_REVOKE_ERROR_DETAIL  (default: False)
 
 > These settings are read **once, at import time**. Changing them at runtime (including with
 > `override_settings`) has no effect until the process restarts.

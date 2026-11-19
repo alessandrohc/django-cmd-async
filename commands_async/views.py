@@ -1,6 +1,8 @@
 # coding=utf-8
 import collections
 import hashlib
+import threading
+import time
 from urllib.parse import urlsplit
 from django.core.cache import caches
 from django.core.exceptions import PermissionDenied
@@ -53,6 +55,41 @@ OWNER_KEY_PREFIX = 'cmdasync:owner:'
 #: tentativas de gravar o registro: o cache que descarta a gravação sem erro (`IGNORE_EXCEPTIONS` do Redis) só se descobre relendo.
 #: Sem pausa entre elas, de propósito: a biblioteca não segura a thread do pedido
 OWNER_SAVE_ATTEMPTS = 3
+
+#: segundos que a consulta que o processo já respondeu vale (AC-8879-5, AC-8879-6)
+WORKERS_WINDOW_SECONDS = 5
+#: o relógio da janela: o teste o troca por um relógio que ele avança
+clock = time.monotonic
+#: a consulta guardada: `at` o instante em que ela começou, `kind` o tipo do resultado (`WORKERS_LISTED`, `WORKERS_NOBODY` ou
+#: `WORKERS_FAILED`) e `names` os nomes (tupla); `at` vazio = nada guardado. Guarda o TIPO e não a frase já traduzida: a
+#: frase se traduz na resposta, e o usuário seguinte, de outro idioma, não a recebe no idioma do primeiro. Só se lê e se grava
+#: com `workers_lock` tomado. Os testes a zeram (`harness.reset_workers_window`)
+workers_window = {'at': None, 'kind': None, 'names': ()}
+workers_lock = threading.Lock()
+WORKERS_LISTED, WORKERS_NOBODY, WORKERS_FAILED = 'listed', 'nobody', 'failed'
+
+#: limites da pré-verificação do broker (AC-8879-7). O Celery do projeto espera até 300 s, em até 100 tentativas, por um broker
+#: que não responde (`plus_base/settings/publique.py:814` e `:818`) e a rota seguraria a thread do pedido esse tempo todo: aqui
+#: a conexão e a leitura do socket têm 1 s, e a verificação toda 2 s por uma tentativa a mais. Medido no #8879 com `redis://`
+#: de um host só: porta recusada 2,0 s e endereço sem rota 4,0 s; Sentinel e cluster não foram medidos. Mudar estes limites pede
+#: refazer a medição do endereço sem rota (#8879, `evidence/T-2.md`: 4,0 s com o socket em 1,0 s): o teste automático só cobre a
+#: porta recusada (~2 s) e não pegaria um endereço sem rota que passasse dos 5 s do AC-8879-7
+BROKER_PRECHECK_SOCKET_TIMEOUT = 1.0
+BROKER_PRECHECK_TIMEOUT = 2
+
+
+def broker_precheck():
+    """Confere que o broker aceita conexão, em tempo limitado; o que o kombu levantar sobe até o `except` da rota.
+
+    Os timeouts vão no pedido da conexão, e não lidos do `celery_app.conf`: o Celery mescla as `broker_transport_options` do app
+    com as passadas e o `connect_timeout` explícito vence o da configuração (`celery/app/base.py:1061-1066`). O `with` solta a
+    conexão também quando a exceção sobe.
+    """
+    with celery_app.connection_for_write(
+            transport_options={'socket_connect_timeout': BROKER_PRECHECK_SOCKET_TIMEOUT,
+                               'socket_timeout': BROKER_PRECHECK_SOCKET_TIMEOUT},
+            connect_timeout=BROKER_PRECHECK_SOCKET_TIMEOUT) as connection:
+        connection.ensure_connection(max_retries=1, timeout=BROKER_PRECHECK_TIMEOUT)
 
 
 def owner_key(user, task_id):
@@ -270,14 +307,44 @@ class CeleryWorkerStatus(CommandGateMixin, View):
         return JsonResponse({'status': False, 'workers': []}, status=403)
 
     def get(self, request, **kwargs):
-        data = {'status': True, 'workers': []}
+        """Lists the workers that answered, from the query this process made in the last ``WORKERS_WINDOW_SECONDS``.
+
+        The window is per process and holds the result of any outcome, a failure included: the broadcast waits for the
+        workers and the page asks again every few seconds, so a flood of requests would otherwise be a flood of
+        broadcasts. The lock is held through the query, and whoever waits for it reads the state again once it has it:
+        simultaneous requests make one broadcast and share its result.
+        """
+        with workers_lock:
+            started = clock()
+            if workers_window['at'] is None or not 0 <= started - workers_window['at'] < WORKERS_WINDOW_SECONDS:
+                self.ask_workers(started)
+            kind, names = workers_window['kind'], workers_window['names']
+        return JsonResponse(self.workers_data(kind, names))
+
+    @staticmethod
+    def ask_workers(started):
+        """Asks the workers and keeps the result in the window, as of ``started``. The caller holds ``workers_lock``.
+
+        The detail of a failure goes to the log, never to the user: the text of the kombu error carries the address of the
+        broker. ``active()`` answers ``None`` when no worker answers (the Celery ``Inspect`` returns whatever the broadcast
+        collected, and nothing collected is ``None``).
+        """
         try:
-            for worker in celery_app.control.inspect().active():
-                data['workers'].append(worker)
-        except Exception as err:
-            data['status'] = False
-            data['message'] = str(err)
-        return JsonResponse(data)
+            broker_precheck()
+            active = celery_app.control.inspect().active()
+            kind, names = (WORKERS_NOBODY, ()) if active is None else (WORKERS_LISTED, tuple(active))
+        except Exception:
+            logger.exception('the Celery workers could not be asked')
+            kind, names = WORKERS_FAILED, ()
+        workers_window.update(at=started, kind=kind, names=names)
+
+    @staticmethod
+    def workers_data(kind, names):
+        """The answer of a result of the window. The phrase is translated here, for the language of whoever asks now."""
+        if kind == WORKERS_LISTED:
+            return {'status': True, 'workers': list(names)}
+        message = _('no Celery worker answered') if kind == WORKERS_NOBODY else _('could not ask the Celery workers')
+        return {'status': False, 'workers': [], 'message': message}
 
 
 class TaskFormStatus(CommandGateMixin, View):
@@ -323,10 +390,19 @@ class TaskFormStatus(CommandGateMixin, View):
         return JsonResponse(data)
 
     def post(self, request, **kwargs):
+        """Revokes the task. A failure to send is answered with a fixed phrase, and its detail goes to the log.
+
+        The text of the error carries the address of the broker, so it only reaches the answer where the host
+        turns ``COMMANDS_ASYNC_REVOKE_ERROR_DETAIL`` on (read from the settings module at the time of use). The id of
+        the task is not logged: with the owner check off it is text from the client.
+        """
         task_id = kwargs.get('task_id')
         try:
+            broker_precheck()
             celery_app.control.revoke(task_id, terminate=True)
             data = {"status": True}
         except Exception as err:
-            data = {"status": False, "error": str(err)}
+            logger.exception('the revocation request could not be sent')
+            reason = str(err) if settings.COMMANDS_ASYNC_REVOKE_ERROR_DETAIL else _('the revocation request could not be sent')
+            data = {"status": False, "error": reason}
         return JsonResponse(data)

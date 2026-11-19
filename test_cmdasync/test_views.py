@@ -20,7 +20,7 @@ from celery.app.control import Inspect
 from commands_async.views import CeleryWorkerStatus, TaskFormStatus, TaskFormView
 
 from test_cmdasync.harness import (AJAX, INDEX_URL, WORKERS_URL, async_result,
-                                   create_user, grant, launch, queued_task, status_url)
+                                   create_user, grant, launch, queued_task, reset_workers_window, status_url)
 
 # The two throwaway commands shipped by the test app, which is what makes the
 # command listing assertions independent of the Django version under test.
@@ -262,12 +262,15 @@ class TaskFormStatusTest(TestCase):
 
     @mock.patch('commands_async.views.celery_app')
     def test_post_reports_a_revoke_that_could_not_be_delivered(self, celery_app):
-        """AC-8836-8 (controle): a revoke that Celery cannot take is reported with its reason."""
+        """AC-8879-2: a revoke that Celery cannot take is reported with the fixed phrase, not with its text."""
         celery_app.control.revoke.side_effect = RuntimeError('no broker')
-        data = json.loads(self.client.post(status_url('abc')).content)
+        response = self.client.post(status_url('abc'))
+        data = json.loads(response.content)
 
+        self.assertEqual(response.status_code, 200)
         self.assertFalse(data['status'])
-        self.assertEqual(data['error'], 'no broker')
+        self.assertEqual(data['error'], 'the revocation request could not be sent')
+        self.assertNotIn('no broker', response.content.decode('utf-8'), msg='the text of the error must not reach the user')
 
 
 # #8836: who may read and revoke a task through the status route. A readable result sits behind every id (the
@@ -548,10 +551,13 @@ class CeleryWorkerStatusTest(TestCase):
 
     def setUp(self):
         self.client.force_login(self.user)
+        # A janela da rota workers é estado do módulo (#8879): cada teste a pede zerada e a devolve zerada.
+        reset_workers_window()
+        self.addCleanup(reset_workers_window)
 
     @mock.patch('commands_async.views.celery_app')
     def test_get_lists_the_workers_reported_as_active(self, celery_app):
-        """AC-8835-4 (controle): a user without any named permission lists the workers that answered."""
+        """AC-8879-11 (controle): a user without any named permission lists the workers that answered."""
         celery_app.control.inspect.return_value.active.return_value = {
             'worker-1@host': [], 'worker-2@host': [],
         }
@@ -562,7 +568,7 @@ class CeleryWorkerStatusTest(TestCase):
 
     @mock.patch('commands_async.views.celery_app')
     def test_get_reports_failure_when_inspection_raises(self, celery_app):
-        """AC-8835-5 (controle): a failing inspection is answered 200, with its reason and no worker name."""
+        """AC-8879-1: a failing inspection is answered 200, with the fixed phrase (not its text) and no worker name."""
         celery_app.control.inspect.side_effect = RuntimeError('no broker')
         response = self.client.get(WORKERS_URL)
         data = json.loads(response.content)
@@ -572,7 +578,8 @@ class CeleryWorkerStatusTest(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertFalse(data['status'])
         self.assertEqual(data['workers'], [])
-        self.assertEqual(data['message'], 'no broker')
+        self.assertEqual(data['message'], 'could not ask the Celery workers')
+        self.assertNotIn('no broker', response.content.decode('utf-8'), msg='the text of the error must not reach the user')
 
     @mock.patch('commands_async.views.celery_app')
     def test_get_reports_failure_when_no_worker_answers(self, celery_app):
@@ -615,6 +622,8 @@ class CeleryWorkerStatusAccessTest(TestCase):
         self.addCleanup(celery.stop)
         self.inspect = self.celery_app.control.inspect
         self.inspect.return_value.active.return_value = {WORKER: []}
+        reset_workers_window()  # a janela da rota workers é estado do módulo (#8879)
+        self.addCleanup(reset_workers_window)
 
     @contextmanager
     def permission_required(self):
@@ -637,6 +646,7 @@ class CeleryWorkerStatusAccessTest(TestCase):
 
     def assertLists(self, who, mounting, label, **extra):
         """The user lists the canary worker and the inspection runs: what the denials are measured against."""
+        reset_workers_window()  # várias chamadas por teste: sem isto a 2ª cairia na janela de 5 s (#8879)
         self.inspect.reset_mock()
         response = self.asks(who, mounting, 'get', **extra)
         self.assertEqual(response.status_code, 200, msg='precondition (%s, %s): the user lists the workers' % (mounting, label))
@@ -700,11 +710,12 @@ class CeleryWorkerStatusAccessTest(TestCase):
                             self.assertNoWorkerData(response, label)
 
     def test_a_user_with_the_named_permission_lists_the_workers(self):
-        """AC-8835-4 (controle): the holder of the named permission lists the workers, with or without a task on them."""
+        """AC-8879-11 (controle): the holder of the named permission lists the workers, with or without a task on them."""
         self.inspect.return_value.active.return_value = {WORKER: [{'id': 'task-8835', 'name': 'busy'}], 'idle@host': []}
         with self.permission_required():
             for mounting in MOUNTINGS:
                 with self.subTest(mounting=mounting):
+                    reset_workers_window()  # cada montagem é uma consulta nova, fora da janela (#8879)
                     response = self.asks(self.runner, mounting)
                     data = json.loads(response.content)
                     self.assertEqual(response.status_code, 200)

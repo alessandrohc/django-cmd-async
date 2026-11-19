@@ -38,6 +38,18 @@ def launch(client, task_id):
     return response
 
 
+def reset_workers_window(module=None):
+    """Return the window of the workers route (#8879) to "no query kept", in ``module`` (default: ``commands_async.views``).
+
+    The window is state of the module, shared by every test of the process, so each test that asks the workers route
+    zeroes it first. ``module`` is a parameter because ``test_settings`` runs a copy of ``views.py`` under another name
+    (``views_read_afresh``), with a window of its own.
+    """
+    if module is None:
+        from commands_async import views as module
+    module.workers_window.update(at=None, kind=None, names=())
+
+
 def create_user(username='runner', password='secret-for-tests'):
     return User.objects.create_user(username=username, password=password)
 

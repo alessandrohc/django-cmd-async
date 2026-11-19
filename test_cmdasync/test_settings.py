@@ -14,7 +14,7 @@ from django.contrib.auth import REDIRECT_FIELD_NAME
 from django.test import RequestFactory, SimpleTestCase, TestCase, override_settings
 
 from commands_async import settings as app_settings
-from test_cmdasync.harness import AJAX, WORKERS_URL, async_result, create_user, grant, status_url
+from test_cmdasync.harness import AJAX, WORKERS_URL, async_result, create_user, grant, reset_workers_window, status_url
 
 
 class DefaultsTest(SimpleTestCase):
@@ -186,6 +186,8 @@ class PermissionNameTest(TestCase):
             workers = views.CeleryWorkerStatus.as_view()
             for label, extra in (('navigation', {}), ('xhr', AJAX)):
                 with self.subTest(request=label):
+                    # a cópia do módulo tem a janela da rota workers e o lock dela (#8879): zerada a cada consulta do portador
+                    reset_workers_window(views)
                     celery_app.control.inspect.reset_mock()
                     self.assertEqual(workers(request_by(runner, **extra)).status_code, 200,
                                      msg='precondition: the holder lists the workers')

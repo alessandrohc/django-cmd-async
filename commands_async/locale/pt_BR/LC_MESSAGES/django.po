@@ -6,7 +6,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: django-cmd-async 2.3.0\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-07-29 09:07-0300\n"
+"POT-Creation-Date: 2026-11-19 12:52+0000\n"
 "PO-Revision-Date: 2026-07-29 08:38-0300\n"
 "Last-Translator: Alessandro Hecht <alessandrohc@gmail.com>\n"
 "Language-Team: Brazilian Portuguese\n"
@@ -89,11 +89,23 @@ msgstr "Insira argumentos"
 msgid "kwargs"
 msgstr ""
 
-#: views.py:104
+#: views.py:269
 msgid "not allowed to run this command"
 msgstr "não é permitido executar esse comando"
 
-#: views.py:117
+#: views.py:282
 #, python-format
 msgid "command %(command)s failed to execute"
 msgstr "falha ao executar o comando %(command)s"
+
+#: views.py:344
+msgid "no Celery worker answered"
+msgstr "nenhum worker do Celery respondeu"
+
+#: views.py:344
+msgid "could not ask the Celery workers"
+msgstr "não foi possível consultar os workers do Celery"
+
+#: views.py:404
+msgid "the revocation request could not be sent"
+msgstr "não foi possível enviar o pedido de revogação"
