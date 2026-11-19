@@ -69,7 +69,9 @@ The route also ties a task to the user who launched it through the form: only th
 read or revoke it (from any of his login sessions). Anyone else, an id that was never launched,
 a record that expired and a registry that cannot be read are all answered the same `404` with
 `{"task": null}` and no task data, with any method and before anything of the task is read (a
-`403` would tell whoever probes that the id exists). The id of the task is still the Celery id.
+`403` would tell whoever probes that the id exists). An id that is not a task id at all (the empty
+one, which the route accepts on purpose) gets the same `404` with the owner check on or off and
+with any method, and nothing of Celery is asked. The id of the task is still the Celery id.
 
 The owner is recorded in a Django cache when the form launches the task. Because of that:
 
@@ -83,8 +85,9 @@ The owner is recorded in a Django cache when the form launches the task. Because
   default `result_expires` of Celery), and one whose record could not be written (the error is
   logged with the task id) are no longer readable or revocable by their own user.
 - `COMMANDS_ASYNC_TASK_OWNERSHIP = False` switches the owner check off: any authorized user reads
-  and revokes any task, as before. This release narrows what `status` serves, so a project that
-  relied on a user following another's tasks has to switch it off.
+  and revokes any task, as before, but an empty task id is still answered `404` (it used to be a
+  `500`, because the result backend refuses an empty id). This release narrows what `status`
+  serves, so a project that relied on a user following another's tasks has to switch it off.
 
 `command-async:workers` lists the names of the Celery workers that answer (`GET`). It was open
 to any authenticated user, whatever `COMMANDS_ASYNC_PERMISSION_NAME` said: since this release it

@@ -69,8 +69,9 @@ class RoundTripTest(TestCase):
 
     def setUp(self):
         self.client.force_login(self.user)
-        # This test measures the address and the id that reaches the view, not the owner of the task (#8864): an
-        # empty id is never anybody's, so with the owner check on the view would answer 404 before reading it.
+        # This test measures the address and the id that reaches the view, not the owner of the task (#8864): with the
+        # owner check on, an id nobody launched is answered 404 before it is read. The empty id is answered 404 with the
+        # check on or off (#8867): it is the one the view no longer reads.
         ownership = mock.patch.object(app_settings, 'COMMANDS_ASYNC_TASK_OWNERSHIP', False)
         ownership.start()
         self.addCleanup(ownership.stop)
@@ -80,7 +81,9 @@ class RoundTripTest(TestCase):
     def test_an_empty_task_id_and_one_with_a_slash_reach_the_view_as_they_came(self):
         """AC-8836-9, AC-8836-12 (controle): the built address is requested and the view receives the same id."""
         # The host project builds this URL with ids of both kinds (see ReverseTest), so the id has to arrive whole:
-        # the view reads it from kwargs['task_id'] and hands it to AsyncResult (views.py, TaskFormStatus.get).
+        # the view reads it from kwargs['task_id'] and hands it to AsyncResult (views.py, TaskFormStatus.get). The empty id
+        # arrives whole too (ResolveTest proves `kwargs == {'task_id': ''}`), and the view answers it 404 without reading
+        # it from the result backend (#8867): the id that reaches AsyncResult is the one with a slash.
         for task_id in ('', 'a/b'):
             with self.subTest(task_id=task_id):
                 with mock.patch('commands_async.views.AsyncResult') as async_result_class:
@@ -89,9 +92,14 @@ class RoundTripTest(TestCase):
                     response = self.client.get(url)
 
                 self.assertEqual(url, status_url(task_id))
-                self.assertEqual(response.status_code, 200, msg='the built address must be served')
-                async_result_class.assert_called_once()
-                self.assertEqual(async_result_class.call_args.kwargs['id'], task_id)
+                if task_id == '':
+                    self.assertEqual(response.status_code, 404, msg='the built address is served: the empty id is not a task')
+                    self.assertEqual(json.loads(response.content), {'task': None})
+                    async_result_class.assert_not_called()
+                else:
+                    self.assertEqual(response.status_code, 200, msg='the built address must be served')
+                    async_result_class.assert_called_once()
+                    self.assertEqual(async_result_class.call_args.kwargs['id'], task_id)
 
     @mock.patch('commands_async.views.celery_app')
     def test_the_workers_address_built_by_reverse_reaches_the_view(self, celery_app):

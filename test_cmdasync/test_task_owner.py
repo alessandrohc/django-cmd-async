@@ -220,15 +220,34 @@ class OwnerCheckTest(OwnerTestCase):
         self.revoke.assert_not_called()
 
     def test_with_the_owner_check_off_any_authorized_user_is_served(self):
-        """AC-8864-12: with the switch off, another authorized user reads and revokes the task, and the form records no owner."""
+        """AC-8867-4 (controle): with the switch off, another authorized user reads and revokes a task with an id that is not empty, and the form records no owner."""
         owner = self.logged(self.owner)
         other = self.logged(self.other)
         with self.owner_setting(OWNERSHIP, False):
             launch(owner, 'task-12')
             self.assertServed(other.get(status_url('task-12')), 'task-12', 'another user, switch off')
+            # o critério promete o id, o estado e a saída (ou o traceback): o dict inteiro, e não só o id e a saída
+            data = json.loads(other.get(status_url('task-12')).content)['task']
+            self.assertEqual(data, {'id': 'task-12', 'ready': True, 'failed': False, 'output': OUTPUT})
             response = other.post(status_url('task-12'))
             self.revoke.assert_called_once_with('task-12', terminate=True)
             self.assertEqual(json.loads(response.content), {'status': True})
+
+            # um id com barra (o regex da rota o entrega inteiro) é servido e revogado como qualquer outro
+            self.revoke.reset_mock()
+            launch(owner, 'task-12/with-slash')
+            self.assertServed(other.get(status_url('task-12/with-slash')), 'task-12/with-slash', 'an id with a slash')
+            response = other.post(status_url('task-12/with-slash'))
+            self.revoke.assert_called_once_with('task-12/with-slash', terminate=True)
+            self.assertEqual(json.loads(response.content), {'status': True})
+
+            # uma tarefa que falhou: o traceback no lugar da saída
+            self.async_result_class.side_effect = lambda id=None, app=None, **kwargs: async_result(
+                task_id=id, failed=True, traceback='Traceback (most recent call last): ... (8867)')
+            data = json.loads(other.get(status_url('task-12-failed')).content)['task']
+            self.assertEqual(data, {'id': 'task-12-failed', 'ready': True, 'failed': True,
+                                    'traceback': 'Traceback (most recent call last): ... (8867)'})
+            self.async_result_class.side_effect = self.read_result
 
         # com a chave desligada o formulário não gravou nada: ligada de novo, nem o próprio usuário acha o registro
         self.assertDenied(owner.get(status_url('task-12')), 'no record was written while the switch was off')

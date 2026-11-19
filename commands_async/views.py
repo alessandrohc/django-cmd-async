@@ -92,6 +92,17 @@ def broker_precheck():
         connection.ensure_connection(max_retries=1, timeout=BROKER_PRECHECK_TIMEOUT)
 
 
+def is_task_id(task_id):
+    """Se `task_id` pode ser o id de uma tarefa: texto não vazio.
+
+    O id vem do endereço (`^status/(?P<task_id>.*)`), que entrega o vazio de propósito (AC-8836-9, AC-8836-12), e o backend
+    de resultados do Celery recusa o id vazio com `ValueError` no primeiro `ready()` (`celery/backends/base.py:986`). É o
+    mesmo critério do `owner_key` («nunca é dono») e da `TaskFormStatus.task_denial`: um só dono para «o que é um id de
+    tarefa». O `isinstance` não sai: sem ele um `5` ou um `b'a'` passariam.
+    """
+    return isinstance(task_id, str) and bool(task_id)
+
+
 def owner_key(user, task_id):
     """Chave do registro do dono: hash do `pk` do usuário e do id da tarefa, ou `None` quando não há como ser dono.
 
@@ -100,7 +111,7 @@ def owner_key(user, task_id):
     (o anônimo) nunca é dono.
     """
     pk = getattr(user, 'pk', None)
-    if pk is None or not isinstance(task_id, str) or not task_id:
+    if pk is None or not is_task_id(task_id):
         return None
     return OWNER_KEY_PREFIX + hashlib.sha256(('%s\n%s' % (pk, task_id)).encode('utf-8')).hexdigest()
 
@@ -365,9 +376,12 @@ class TaskFormStatus(CommandGateMixin, View):
         """404 for a task that is not the user's, with any method and before anything of the task is read.
 
         The same answer for another user's task, an id that never existed, a record that expired or a registry that cannot
-        be read: a 403 would tell whoever probes that the id exists.
+        be read: a 403 would tell whoever probes that the id exists. An id that is not a task id at all (empty, which the
+        route accepts on purpose, or not text) gets the same 404 with the owner check on or off (#8867): the result
+        backend refuses it with a ``ValueError`` (a 500), and a revoke of it would broadcast an id that is nobody's.
         """
-        if not settings.COMMANDS_ASYNC_TASK_OWNERSHIP or owns_task(request.user, kwargs.get('task_id')):
+        task_id = kwargs.get('task_id')
+        if is_task_id(task_id) and (not settings.COMMANDS_ASYNC_TASK_OWNERSHIP or owns_task(request.user, task_id)):
             return None
         return JsonResponse({'task': None}, status=404)
 
