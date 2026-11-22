@@ -132,6 +132,38 @@ port answers in 2 seconds and an address with no route in 4. Sentinel and cluste
 measured (with `N` unreachable sentinels the check should cost about `N` seconds), and a broker
 that is alive but slow is not limited by the check.
 
+### The status query and the result backend
+
+When a read of the Celery result backend raises (the backend refuses the connection, does not
+answer, or fails in any other way), `command-async:status` answers `503` with `{"task": null}`,
+`no-store` like every answer of the route, and the package logs the error with its traceback; the
+message of the record leaves out the task id, which is client text when the owner check is off.
+Before, the exception reached Django, which answered a `500` page. The text of the error and the
+address of the backend never reach the answer. The route stops at the read that failed: a task
+that is not ready costs three reads per query (`ready()`, `failed()` and `result`), and none
+follows the one that failed. The bundled page stops following the task and releases the form on
+any HTTP error, as it did with the `500`.
+
+The route adds no time limit of its own: how long a read waits for a backend that does not answer
+is what the Celery of the host gives it. For Redis that is `redis_socket_timeout`
+(`CELERY_REDIS_SOCKET_TIMEOUT` with the usual namespace; the Celery default is 120 seconds),
+`redis_socket_connect_timeout` (no default: the connection waits as long as the system lets it)
+and `redis_retry_on_timeout` (one more attempt per read). Measured on a `redis://` backend on one
+host, with 2 seconds for the connection, 3 seconds for the read and `redis_retry_on_timeout` on
+(Celery 5.6.3, redis-py 8.1.0): a refused port fails at once, an address with no route in about 4
+seconds (two attempts of 2 seconds) and a Redis that accepts the connection and never answers in
+about 6 seconds (two attempts of 3 seconds). A host that leaves the Celery defaults may hold the
+thread of the server for much longer on each read, so set those options. With Sentinel the limit
+for the connections to the sentinels is `result_backend_transport_options['sentinel_kwargs']`,
+which Celery leaves empty (and then redis-py does not hand the socket options to the sentinels):
+that case was read in the code, not measured.
+
+When the owner registry lives in the same Redis as the result backend and cannot be read, the
+query is answered the `404` of the owner check before the backend is touched, as the revocation is
+(see above): the `503` is for a failure of the result backend while the owner registry answers.
+The `500` of a task whose state is `REVOKED` or `RETRY` (its result is an exception, which cannot
+be serialized) is a separate defect and does not change.
+
 ## DJANGO settings
 
 ### It should show a list of commands to the user. Otherwise, a text input will be displayed.

@@ -386,21 +386,36 @@ class TaskFormStatus(CommandGateMixin, View):
         return JsonResponse({'task': None}, status=404)
 
     def get(self, request, **kwargs):
-        """Reports task status"""
+        """Reports task status.
+
+        Only the reads of the result backend sit under the ``try`` (``ready()``, ``failed()`` and then ``traceback`` or ``result``:
+        a task that is not ready costs one read each). When one of them raises, the route stops at that read, logs the error and
+        answers 503 with ``{"task": null}``: the text of the error carries the address of the backend, so it goes to the log and
+        never to the answer, and the message of the record leaves out the task id (client text when the owner check is off).
+
+        The route adds no time limit of its own: how long a read waits for a backend that does not answer is what the Celery of
+        the host gives it (``redis_socket_timeout``, ``redis_socket_connect_timeout`` and ``redis_retry_on_timeout`` for Redis).
+        The ``JsonResponse`` stays outside the ``try`` on purpose: a result that cannot be serialized (the result of a REVOKED or
+        RETRY task is an exception) is not a failed read, and it is answered as before.
+        """
         task_id = str(kwargs.get("task_id"))
-        async_result = AsyncResult(id=task_id, app=celery_app)
-        data = {
-            'task': {
-                'id': async_result.id,
-                'ready': async_result.ready(),
+        try:
+            async_result = AsyncResult(id=task_id, app=celery_app)
+            data = {
+                'task': {
+                    'id': async_result.id,
+                    'ready': async_result.ready(),
+                }
             }
-        }
-        if async_result.failed():
-            data['task']['failed'] = True
-            data['task']['traceback'] = async_result.traceback
-        else:
-            data['task']['failed'] = False
-            data['task']['output'] = async_result.result
+            if async_result.failed():
+                data['task']['failed'] = True
+                data['task']['traceback'] = async_result.traceback
+            else:
+                data['task']['failed'] = False
+                data['task']['output'] = async_result.result
+        except Exception:
+            logger.exception('the task status could not be read')
+            return JsonResponse({'task': None}, status=503)
         return JsonResponse(data)
 
     def post(self, request, **kwargs):

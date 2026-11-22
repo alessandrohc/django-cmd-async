@@ -213,7 +213,7 @@ class TaskFormStatusTest(TestCase):
 
     @mock.patch('commands_async.views.AsyncResult')
     def test_get_reports_the_output_of_a_finished_task(self, async_result_class):
-        """AC-8864-1 (controle): a finished task reports its id, that it is ready, not failed, and its output."""
+        """AC-8945-5 (controle): a finished task reports its id, that it is ready, not failed, and its output."""
         async_result_class.return_value = async_result(task_id='abc',
                                                        result='all done')
         response = self.client.get(status_url('abc'))
@@ -224,7 +224,7 @@ class TaskFormStatusTest(TestCase):
 
     @mock.patch('commands_async.views.AsyncResult')
     def test_get_reports_the_traceback_of_a_failed_task(self, async_result_class):
-        """AC-8864-1 (controle): a failed task reports that it failed and its traceback, never an output."""
+        """AC-8945-5 (controle): a failed task reports that it failed and its traceback, never an output."""
         async_result_class.return_value = async_result(task_id='abc', failed=True,
                                                        traceback='boom')
         data = json.loads(self.client.get(status_url('abc')).content)['task']
@@ -236,7 +236,7 @@ class TaskFormStatusTest(TestCase):
 
     @mock.patch('commands_async.views.AsyncResult')
     def test_get_reports_a_task_that_is_still_running(self, async_result_class):
-        """AC-8864-1 (controle): a task that has not finished reports that it is not ready."""
+        """AC-8945-5 (controle): a task that has not finished reports that it is not ready."""
         async_result_class.return_value = async_result(task_id='abc', ready=False,
                                                        result=None)
         data = json.loads(self.client.get(status_url('abc')).content)['task']
@@ -245,7 +245,7 @@ class TaskFormStatusTest(TestCase):
 
     @mock.patch('commands_async.views.AsyncResult')
     def test_get_reports_a_null_output_while_the_task_has_not_finished(self, async_result_class):
-        """AC-8864-1 (controle): the output is the backend's own answer, null while there is none, never a traceback."""
+        """AC-8945-5 (controle): the output is the backend's own answer, null while there is none, never a traceback."""
         async_result_class.return_value = async_result(task_id='abc', ready=False,
                                                        result=None)
         data = json.loads(self.client.get(status_url('abc')).content)['task']
@@ -444,7 +444,7 @@ class TaskFormStatusAccessTest(TestCase):
                     self.revoke.assert_not_called()
 
     def test_a_user_with_the_named_permission_is_served(self):
-        """AC-8864-1, AC-8864-2, AC-8864-3 (controle): the holder of the named permission reads and revokes the task he launched."""
+        """AC-8945-5, AC-8864-2, AC-8864-3 (controle): the holder of the named permission reads and revokes the task he launched."""
         with self.permission_required(), mock.patch.object(app_settings, 'COMMANDS_ASYNC_TASK_OWNERSHIP', True):
             client = self.logged(self.runner)
             launch(client, DONE_ID)
