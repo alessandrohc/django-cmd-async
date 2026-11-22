@@ -220,7 +220,7 @@ class OwnerCheckTest(OwnerTestCase):
         self.revoke.assert_not_called()
 
     def test_with_the_owner_check_off_any_authorized_user_is_served(self):
-        """AC-8945-6, AC-8945-7 (controle): with the switch off, another authorized user reads and revokes a task with an id that is not empty, and the form records no owner."""
+        """AC-8963-4, AC-8945-7 (controle): with the switch off, another authorized user reads and revokes a task with an id that is not empty, and the form records no owner."""
         owner = self.logged(self.owner)
         other = self.logged(self.other)
         with self.owner_setting(OWNERSHIP, False):

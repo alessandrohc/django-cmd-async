@@ -154,9 +154,9 @@ answer, or fails in any other way), `command-async:status` answers `503` with `{
 `no-store` like every answer of the route, and the package logs the error with its traceback; the
 message of the record leaves out the task id, which is client text when the owner check is off.
 Before, the exception reached Django, which answered a `500` page. The text of the error and the
-address of the backend never reach the answer. The route stops at the read that failed: a task
-that is not ready costs three reads per query (`ready()`, `failed()` and `result`), and none
-follows the one that failed. The bundled page stops following the task and releases the form on
+address of the backend never reach the answer. The route stops at the read that failed: the
+state of a task is read once per query, whatever the state (the retries the client of the backend
+makes below Celery do not count), and no read follows the one that failed. The bundled page stops following the task and releases the form on
 any HTTP error, as it did with the `500`.
 
 The route adds no time limit of its own: how long a read waits for a backend that does not answer
@@ -176,8 +176,10 @@ that case was read in the code, not measured.
 When the owner registry lives in the same Redis as the result backend and cannot be read, the
 query is answered the `404` of the owner check before the backend is touched, as the revocation is
 (see above): the `503` is for a failure of the result backend while the owner registry answers.
-The `500` of a task whose state is `REVOKED` or `RETRY` (its result is an exception, which cannot
-be serialized) is a separate defect and does not change.
+A task whose state is `REVOKED` or `RETRY` has an exception as its result, which cannot be
+serialized: the route answers it `200`, with the text of the exception as `output` (an empty text when
+the exception has none, and `null` for a `RETRY` that stored no exception), `ready` true and `failed`
+false for a revoked task, and both false for a task being retried.
 
 ### The command page: Cancel, the switch of command and Revoke
 

@@ -454,8 +454,10 @@ class TaskFormStatus(CommandGateMixin, View):
 
         The route adds no time limit of its own: how long a read waits for a backend that does not answer is what the Celery of
         the host gives it (``redis_socket_timeout``, ``redis_socket_connect_timeout`` and ``redis_retry_on_timeout`` for Redis).
-        The ``JsonResponse`` stays outside the ``try`` on purpose: a result that cannot be serialized (the result of a REVOKED or
-        RETRY task is an exception) is not a failed read, and it is answered as before.
+        A result that is an exception (the one of a REVOKED or RETRY task) is answered as its text in ``output``, and ``failed`` is
+        the one of Celery (only FAILURE): the revoked task is ready, the one being retried is not (#8963). The ``JsonResponse`` stays
+        outside the ``try`` on purpose: an ``output`` that cannot be serialized for another reason is not a failed read, and it is
+        answered as before.
         """
         task_id = str(kwargs.get("task_id"))
         try:
@@ -471,7 +473,11 @@ class TaskFormStatus(CommandGateMixin, View):
                 data['task']['traceback'] = async_result.traceback
             else:
                 data['task']['failed'] = False
-                data['task']['output'] = async_result.result
+                output = async_result.result
+                # REVOKED e RETRY guardam uma exceção como resultado (`mark_as_revoked`, `mark_as_retry`), que o `JsonResponse` não serializa:
+                # sai como o texto dela (vazio quando ela não tem texto). O que não é exceção (a meta do worker, o texto, o `None` do RETRY
+                # sem exceção) sai como o backend o tem
+                data['task']['output'] = str(output) if isinstance(output, BaseException) else output
         except Exception:
             logger.exception('the task status could not be read')
             return JsonResponse({'task': None}, status=503)

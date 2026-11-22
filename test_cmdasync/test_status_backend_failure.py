@@ -287,7 +287,7 @@ class BackendRespondingTest(BackendFailureTestCase):
     """O que continua igual com o backend respondendo, provado com o backend de resultado de verdade."""
 
     def test_a_healthy_backend_serves_the_task(self):
-        """AC-8962-3, AC-8945-6 (controle): with the result backend answering, the query of a pending task is served 200 with its id, state and output, with the owner check on or off."""
+        """AC-8963-3, AC-8963-4 (controle): with the result backend answering, the query of a pending task is served 200 with its id, state and output, with the owner check on or off."""
         for owned in OWNED:
             with self.subTest(owned=owned), self.ownership(owned):
                 self.healthy()
