@@ -30,6 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SCENARIOS = Path(__file__).resolve().parent / 'js_harness' / 'scenarios.js'
 CMDHANDLER = ROOT / 'commands_async' / 'static' / 'cmdasync' / 'js' / 'cmdhandler.js'
 JQUERY_FORM = ROOT / 'commands_async' / 'static' / 'cmdasync' / 'js' / 'jquery.form.v4.4.2.min.js'
+STATIC_CMDASYNC = ROOT / 'commands_async' / 'static' / 'cmdasync'
 
 REVOKE_KINDS = ('http403', 'http404', 'http500', 'html200', 'falseWithError', 'falseNoError')
 REVOKE_PHASES = ('tracking', 'late')
@@ -460,6 +461,120 @@ class ScriptsLoadTest(ScenarioTestCase):
                 self.assertGreaterEqual(booted['updateFinishCallbacks'], 1)
                 self.assertEqual(booted['itemsBound'], items)
 
+    def test_the_page_initialises_with_the_workers_probe_on(self):
+        """AC-8954-9 (controle): os scripts, com o de workers e o setting ligados, executam com a página montada e o ready completa."""
+        found = self.scenario('boot:workers')
+        self.assertEqual(found['state']['uncaught'], [])
+        self.assertEqual(found['state']['consoleErrors'], [])
+        self.assertEqual(found['state']['workersRequests'], 1, msg='the page did not start the workers probe')
+        booted = found['boot']
+        self.assertTrue(booted['ajaxFormBound'], msg='the ready function stopped before binding the form')
+        self.assertTrue(booted['cancelBound'])
+        self.assertTrue(booted['revokeBound'])
+
+
+class WorkersProbeTest(ScenarioTestCase):
+    """A consulta de workers da tela de comandos (`celery.workers.status.js`, com o setting ligado): a recusa que o tempo não conserta
+    para a consulta, a que o tempo conserta a refaz (AC-8954-1 a -3 e -5 a -8)."""
+
+    def test_a_forbidden_probe_stops_asking(self):
+        """AC-8954-1: o 403 da consulta de workers, na 1ª consulta ou depois de consultas que falharam ou não acharam worker, para a consulta."""
+        for prior in ('first', 'network', 'nobody', 'nobody+network'):
+            name = 'workers:forbidden:{0}'.format(prior)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                before = found['beforeForbidden']
+                self.assertEqual(before['pendingWorkers'], 1, msg='precondition: the query is in flight')
+                self.assertEqual(found['afterForbidden']['liveTimers'], 0, msg='a new query was scheduled after the refusal')
+                self.assertEqual(found['later']['workersRequests'], before['workersRequests'], msg='a query went out after the refusal')
+        with self.subTest(case='control'):
+            # controle: com a falha de rede no lugar do 403, a consulta sai de novo
+            found = self.scenario('workers:retry:network')
+            self.assertEqual(found['at5000']['workersRequests'], found['afterAnswer']['workersRequests'] + 1)
+
+    def test_a_forbidden_probe_tells_why_in_the_notice(self):
+        """AC-8954-2: o 403 mostra no aviso dos workers a frase de acesso negado, como texto e no lugar do que o aviso mostrava."""
+        phrase = self.texts['workersForbiddenText']
+        for prior in ('first', 'nobody'):
+            name = 'workers:forbidden:{0}'.format(prior)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                toast = found['afterForbidden']['toast']
+                self.assertEqual(toast['body'], [phrase], msg='the notice does not carry only the phrase of the refusal')
+                self.assertEqual(toast['shown'], found['beforeForbidden']['toast']['shown'] + 1,
+                                 msg='the refusal did not open the notice')
+
+    def test_the_login_page_on_the_probe_sends_the_user_to_the_login(self):
+        """AC-8954-3: o HTML do login na consulta de workers, na 1ª consulta ou depois de falhas, leva ao login com o retorno e para a consulta."""
+        for prior in ('first', 'network', 'nobody+network'):
+            name = 'workers:login:{0}'.format(prior)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                before = found['beforeLogin']
+                self.assertEqual(before['pendingWorkers'], 1, msg='precondition: the query is in flight')
+                after = found['afterLogin']
+                self.assertEqual(after['uncaught'], [])
+                self.assertEqual(after['locations'], [self.login_target], msg='the user was not sent to the login')
+                self.assertEqual(after['liveTimers'], 0, msg='a new query was scheduled after the login page')
+                self.assertEqual(found['later']['workersRequests'], before['workersRequests'], msg='a query went out after the login page')
+
+    def test_a_host_without_the_notice_the_plugin_or_the_phrase_stops_without_an_error(self):
+        """AC-8954-5: sem o aviso, sem o plugin de toast ou sem a frase, o 403 para a consulta sem erro de script e sem abrir um aviso sem texto."""
+        for toast in ('nophrase', 'noplugin', 'none'):
+            name = 'workers:host:{0}'.format(toast)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                before = found['beforeForbidden']
+                after = found['afterForbidden']
+                self.assertEqual(before['pendingWorkers'], 1, msg='precondition: the query is in flight')
+                self.assertEqual(after['uncaught'], [], msg='the refusal raised a script error')
+                self.assertEqual(after['liveTimers'], 0, msg='a new query was scheduled after the refusal')
+                self.assertEqual(found['later']['workersRequests'], before['workersRequests'], msg='a query went out after the refusal')
+                self.assertEqual(after['toast']['shown'], 0, msg='a notice without text was opened')
+                self.assertEqual(after['toast']['body'], [])
+
+    def test_a_probe_asked_without_the_login_destination_stops_on_the_login_page(self):
+        """AC-8954-8: a consulta chamada sem o destino do login para ao receber a tela de login, sem erro de script."""
+        found = self.scenario('workers:noarg:login')
+        self.assertEqual(found['asked']['pendingWorkers'], 1, msg='precondition: the query is in flight')
+        after = found['afterAnswer']
+        self.assertEqual(after['uncaught'], [], msg='the login page raised a script error')
+        self.assertEqual(after['liveTimers'], 0, msg='a new query was scheduled after the login page')
+        self.assertEqual(found['at5000']['workersRequests'], 1, msg='a query went out after the login page')
+        self.assertEqual(after['locations'], [], msg='the page went to a login without a destination')
+
+    def test_a_probe_that_fails_for_a_reason_that_passes_asks_again_after_5_seconds(self):
+        """AC-8954-6 (controle): o `status` falso, a falha de rede e o erro de servidor refazem a consulta 5 segundos depois."""
+        for kind in ('nobody', 'network', 'http500', 'http502'):
+            name = 'workers:retry:{0}'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                asked = found['afterAnswer']['workersRequests']
+                self.assertEqual(found['at4999']['workersRequests'], asked, msg='the query was asked again before 5 seconds')
+                self.assertEqual(found['at5000']['workersRequests'], asked + 1, msg='the query was not asked again after 5 seconds')
+        with self.subTest(case='asked without an argument'):
+            found = self.scenario('workers:noarg:network')
+            self.assertEqual(found['at4999']['workersRequests'], 1)
+            self.assertEqual(found['at5000']['workersRequests'], 2)
+        with self.subTest(case='a handler without failure_reason'):
+            found = self.scenario('workers:retry:network:noreason')
+            self.assertEqual(found['afterAnswer']['uncaught'], [])
+            self.assertEqual(found['at4999']['workersRequests'], 1)
+            self.assertEqual(found['at5000']['workersRequests'], 2)
+
+    def test_the_probe_result_reaches_the_notice_as_text(self):
+        """AC-8954-7 (controle): o resultado da consulta de workers vai ao aviso como texto, e a lista não refaz a consulta."""
+        listed = self.scenario('workers:result:listed')
+        toast = listed['afterAnswer']['toast']
+        self.assertEqual(toast['body'], ['celery@w1', '<b>w2</b>'], msg='each worker name is one text of the notice')
+        self.assertEqual(toast['badge'], '2')
+        self.assertEqual(toast['shown'], 1)
+        self.assertEqual(listed['afterAnswer']['liveTimers'], 0)
+        self.assertEqual(listed['later']['workersRequests'], 1, msg='the list asked again')
+        nobody = self.scenario('workers:result:nobody')
+        self.assertEqual(nobody['afterAnswer']['toast']['body'], ['no Celery worker answered'])
+        self.assertEqual(nobody['afterAnswer']['toast']['shown'], 1)
+
 
 class HostTemplateTest(ScenarioTestCase):
     """Um host com template próprio, sem o espaço do aviso ou sem os textos (AC-8866-15)."""
@@ -559,6 +674,29 @@ class DoubleAssumptionsTest(TestCase):
         ajax = re.search(r'\.ajax\(', source)
         self.assertLess(position, validate, msg='the beforeSubmit no longer runs before the form-submit-validate event')
         self.assertLess(position, ajax.start(), msg='the beforeSubmit no longer runs before the $.ajax of the submit')
+
+    def test_the_notice_of_the_page_has_the_body_and_the_badge_the_double_assumes(self):
+        # O dublê (world.js) dá ao #popup-msg um `.toast-body` e um `.online` à mão; o script de workers escreve a frase do 403, os
+        # nomes e a mensagem no `.toast-body` e o número no `.online`. Lido na página real (#8954): se o template renomear um dos
+        # dois, o aviso sai vazio na tela e os testes de node seguem verdes.
+        self.client.force_login(self.user)
+        html = self.client.get(INDEX_URL).content.decode('utf-8')
+        start = html.index("id='popup-msg'")
+        notice = html[start:html.index('id="wrap"', start)]
+        self.assertRegex(notice, r'class="[^"]*\btoast-body\b', msg='the notice of the page lost its .toast-body')
+        self.assertRegex(notice, r'class="[^"]*\bonline\b', msg='the notice of the page lost its .online badge')
+
+    def test_the_page_loads_the_bootstrap_bundle_that_registers_the_toast_plugin(self):
+        # O script de workers só abre o aviso quando `$.fn.toast` existe (um host sem o bootstrap.bundle não o tem, e a chamada lançaria):
+        # a página do pacote tem de carregar o bundle, e o bundle vendido tem de registrar o plugin, senão o guarda engole o aviso
+        # em silêncio (#8954).
+        self.client.force_login(self.user)
+        html = self.client.get(INDEX_URL).content.decode('utf-8')
+        loaded = re.findall(r'<script[^>]*src="[^"]*(bootstrap-[0-9.]+)/js/bootstrap\.bundle\.min\.js"', html)
+        self.assertEqual(len(loaded), 1, msg='the page does not load the bootstrap bundle exactly once')
+        bundle = STATIC_CMDASYNC / loaded[0] / 'js' / 'bootstrap.bundle.min.js'
+        self.assertRegex(bundle.read_text(encoding='utf-8'), r'\.fn\.toast=[A-Za-z]+\._jQueryInterface',
+                         msg='the vendored bundle does not register the toast plugin')
 
     def test_the_double_starts_from_the_template_state_of_the_buttons(self):
         # O dublê assume Execute habilitado e Cancel e Revoke desabilitados; é o que o template entrega.

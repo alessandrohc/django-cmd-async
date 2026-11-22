@@ -250,6 +250,42 @@ class AlertContractTest(TestCase):
                     self.assertEqual(panel.get(attribute), translated)
 
 
+# A frase de acesso negado do aviso dos workers (AC-8954-4), em inglês (sem tradução) e em português (a do .po pt_BR).
+WORKERS_FORBIDDEN_PHRASE = 'Access denied: your session may have expired, or you do not have permission to see the Celery workers.'
+WORKERS_FORBIDDEN_PHRASE_PT_BR = 'Acesso negado: sua sessão pode ter expirado, ou você não tem permissão para ver os workers do Celery.'
+
+
+class WorkersNoticeContractTest(TestCase):
+    """O que o script de workers usa no aviso dos workers (o toast), publicado pela página do pacote (AC-8954-4)."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = create_user()
+
+    def setUp(self):
+        self.client.force_login(self.user)
+
+    def notice(self):
+        index = TagIndex()
+        index.feed(self.client.get(INDEX_URL).content.decode('utf-8'))
+        return index.by_id.get('popup-msg')
+
+    def test_the_page_publishes_the_workers_forbidden_phrase_untranslated(self):
+        """AC-8954-4: o aviso dos workers traz a frase de acesso negado, exatamente na frase do critério, quando não há tradução."""
+        notice = self.notice()
+        self.assertIsNotNone(notice, msg='the page has no #popup-msg')
+        self.assertEqual(notice.get('data-forbidden-text'), WORKERS_FORBIDDEN_PHRASE)
+
+    def test_the_page_publishes_the_workers_forbidden_phrase_translated(self):
+        """AC-8954-4: o aviso dos workers traz a frase de acesso negado traduzida para o idioma do usuário quando há tradução."""
+        with translation.override('pt-br'):
+            translated = translation.gettext(WORKERS_FORBIDDEN_PHRASE)
+            # a frase em português do plano, e não só «diferente do inglês»: o msgmerge casa a frase nova com a de «… to see this
+            # task.» (fuzzy) e traria «… ver esta tarefa.», que passaria no assertNotEqual
+            self.assertEqual(translated, WORKERS_FORBIDDEN_PHRASE_PT_BR, msg='the pt_BR catalog has no entry for this phrase')
+            self.assertEqual(self.notice().get('data-forbidden-text'), WORKERS_FORBIDDEN_PHRASE_PT_BR)
+
+
 class DomSinkTest(SimpleTestCase):
     """Server data must never be handed to jQuery as markup.
 

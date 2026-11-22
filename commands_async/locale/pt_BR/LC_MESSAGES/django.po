@@ -105,6 +105,14 @@ msgstr "Insira argumentos"
 msgid "kwargs"
 msgstr ""
 
+#: templates/cmdasync/toast.html:1
+msgid ""
+"Access denied: your session may have expired, or you do not have permission "
+"to see the Celery workers."
+msgstr ""
+"Acesso negado: sua sessão pode ter expirado, ou você não tem permissão para "
+"ver os workers do Celery."
+
 #: views.py:282
 msgid "not allowed to run this command"
 msgstr "não é permitido executar esse comando"

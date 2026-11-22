@@ -34,6 +34,8 @@ const TEXTS = {
     revokeFailedText: 'The revocation request could not be sent.',
     forbiddenText: 'Access denied: your session may have expired, or you do not have permission to see this task.',
     notFoundText: 'Task not found.',
+    // O que o toast.html do pacote publica em data-forbidden-text (o teste do template, AC-8954-4, confere o real).
+    workersForbiddenText: 'Access denied: your session may have expired, or you do not have permission to see the Celery workers.',
 };
 const PAGE = {
     loginUrl: '/login/',
@@ -61,13 +63,20 @@ class Node {
         this.parentNode = null;
         // o que entrou por append/prepend, na ordem: 'text' (nó de texto), 'element' ou 'string'
         this.appended = [];
+        // o texto de cada elemento que entrou por append (o `<p>` com `.text()` do aviso dos workers)
+        this.childTexts = [];
     }
 }
 
 function createWorld(options) {
-    const opts = Object.assign({commandsList: false, alertSpace: true, texts: true}, options || {});
+    // workers: false (o script de workers não é carregado), 'page' (carregado e chamado pela página, com o setting
+    // ligado) ou 'manual' (carregado, setting desligado: o teste chama `world.workersCheck()`);
+    // toast: 'full' (o aviso do pacote), 'nophrase' (sem o data-forbidden-text), 'noplugin' (sem o `$.fn.toast`, como num
+    // host sem o bootstrap.bundle) ou 'none' (sem o #popup-msg); noFailureReason: um cmdhandler.js sem o `failure_reason`.
+    const opts = Object.assign({commandsList: false, alertSpace: true, texts: true, workers: false, toast: 'full', noFailureReason: false}, options || {});
     const world = {
         opts: opts,
+        toasts: [],
         requests: [],
         locations: [],
         alerts: [],
@@ -115,7 +124,7 @@ function createWorld(options) {
 
     const panelData = {
         'commands-list': opts.commandsList,
-        'workers-status-check': false,
+        'workers-status-check': opts.workers === 'page',
         'login-url': PAGE.loginUrl,
         'redirect-field': PAGE.redirectField,
         'index-url': PAGE.indexUrl,
@@ -133,6 +142,16 @@ function createWorld(options) {
     const alertNode = opts.alertSpace
         ? add('#task-alert', new Node('alert', {classes: ['alert', 'alert-danger', 'd-none']}))
         : null;
+    // O aviso dos workers (cmdasync/toast.html): o corpo, o badge e, no template do pacote, a frase em data-forbidden-text.
+    const toastBody = new Node('toast body');
+    const toastBadge = new Node('toast badge');
+    if (opts.toast !== 'none') {
+        const toastNode = add('#popup-msg', new Node('toast', {
+            data: opts.toast === 'nophrase' ? {} : {'forbidden-text': TEXTS.workersForbiddenText},
+        }));
+        toastNode.finds['.toast-body'] = [toastBody];
+        toastNode.finds['.online'] = [toastBadge];
+    }
     add('#task-args', new Node('args'));
     add('#task-kwargs', new Node('kwargs'));
     add('#id_args', new Node('hidden args'));
@@ -225,6 +244,7 @@ function createWorld(options) {
             this.nodes.forEach(function (node) {
                 node.textValue = String(value);
                 node.appended = [];
+                node.childTexts = [];
             });
             return this;
         }
@@ -232,6 +252,7 @@ function createWorld(options) {
             this.nodes.forEach(function (node) {
                 node.textValue = '';
                 node.appended = [];
+                node.childTexts = [];
             });
             return this;
         }
@@ -241,7 +262,10 @@ function createWorld(options) {
                     node.textValue += child.text;
                     node.appended.push('text');
                 } else if (child && child.isJQ) {
-                    child.nodes.forEach(function (inner) { inner.parentNode = node; });
+                    child.nodes.forEach(function (inner) {
+                        inner.parentNode = node;
+                        node.childTexts.push(inner.textValue);
+                    });
                     node.appended.push('element');
                 } else {
                     // uma string chegaria ao jQuery como marcador (HTML): é o que o DomSinkTest proíbe
@@ -283,6 +307,15 @@ function createWorld(options) {
         }
     }
 
+    // O plugin de toast do Bootstrap 4 (`$.fn.toast`) só existe quando o bootstrap.bundle é carregado, e num conjunto vazio
+    // é no-op (a interface do plugin usa `this.each`); o toast 'noplugin' é o host sem ele: `$toast.toast` é `undefined`.
+    if (opts.toast !== 'noplugin') {
+        JQ.prototype.toast = function (arg) {
+            if (this.nodes.length) world.toasts.push(String(arg));
+            return this;
+        };
+    }
+
     function $(arg) {
         if (typeof arg === 'function') {
             world.readyQueue.push(arg);
@@ -302,6 +335,11 @@ function createWorld(options) {
         }
         return new JQ([]);
     }
+
+    $.each = function (list, fn) {
+        list.forEach(function (item, index) { fn(index, item); });
+        return list;
+    };
 
     $.ajax = function (options) {
         const settings = Object.assign({}, options); // o jQuery chama os callbacks com esta cópia
@@ -389,6 +427,20 @@ function createWorld(options) {
         if (!pending.length) throw new Error('harness: no revoke request in flight');
         world.respond(pending[0], response);
     };
+    // As consultas de workers (`workers/status/`): os filtros `/^status\//` acima não as veem.
+    function pendingWorkers() {
+        return world.requests.filter(function (request) {
+            return !request.responded && /^workers\/status\//.test(request.url) && request.type === 'GET';
+        });
+    }
+    world.workersRequests = function () {
+        return world.requests.filter(function (request) { return /^workers\/status\//.test(request.url); });
+    };
+    world.answerWorkers = function (response) {
+        const pending = pendingWorkers();
+        if (!pending.length) throw new Error('harness: no workers request in flight');
+        world.respond(pending[0], response);
+    };
 
     // ---------------------------------------------------------------- relógio
     function setTimeoutStub(fn, ms) {
@@ -447,10 +499,18 @@ function createWorld(options) {
         }
     };
 
-    ['cmdhandler.js', 'cmdasync-page.js'].forEach(function (name) {
+    // a ordem do index.html: o handler, o script de workers (só com o setting ligado) e, por último, o da página
+    ['cmdhandler.js'].concat(opts.workers ? ['celery.workers.status.js'] : [], ['cmdasync-page.js']).forEach(function (name) {
         vm.runInContext(fs.readFileSync(path.join(JS_DIR, name), 'utf8'), context, {filename: name});
     });
     world.cmdasyncform = context.cmdasyncform;
+    // um cmdhandler.js sem o `failure_reason` (um estático sobrescrito, ou o cache do navegador na troca de versão)
+    if (opts.noFailureReason) delete world.cmdasyncform.failure_reason;
+    // a chamada do script de workers à mão, com ou sem argumento (a página sempre passa `{onLogin}`)
+    world.workersCheck = function (options) {
+        if (typeof context.workers_check_status !== 'function') throw new Error('harness: the workers script is not loaded');
+        return arguments.length ? context.workers_check_status(options) : context.workers_check_status();
+    };
     world.flush();
 
     // ---------------------------------------------------------------- ações do usuário
@@ -500,6 +560,10 @@ function createWorld(options) {
             statusRequests: world.statusRequests().length,
             pendingStatus: pendingOf('GET').length,
             revokeRequests: world.revokeRequests().length,
+            workersRequests: world.workersRequests().length,
+            pendingWorkers: pendingWorkers().length,
+            // o aviso dos workers: o texto de cada <p> do corpo, o badge e quantas vezes o `toast("show")` foi chamado
+            toast: {body: toastBody.childTexts.slice(), badge: toastBadge.textValue, shown: world.toasts.length},
         };
     };
     world.boot = function () {

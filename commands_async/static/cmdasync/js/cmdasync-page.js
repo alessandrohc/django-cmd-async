@@ -50,7 +50,7 @@ $(document).ready(function () {
     };
 
     if (config.workersStatusCheck) {
-        workers_check_status();
+        workers_check_status({onLogin: goToLogin});
     }
 
     cmdasyncform.init("#task-output");

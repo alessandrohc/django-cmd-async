@@ -390,6 +390,88 @@ function boot(commandsList) {
     return {state: world.state(), boot: world.boot()};
 }
 
+// ---------------------------------------------------------------- a consulta de workers (celery.workers.status.js, #8954)
+const WORKERS_FORBIDDEN = jsonResponse(403, {status: false, workers: []});
+const WORKERS_NOBODY = jsonResponse(200, {status: false, workers: [], message: 'no Celery worker answered'});
+const WORKERS_LISTED = jsonResponse(200, {status: true, workers: ['celery@w1', '<b>w2</b>']});
+const WORKERS_FAILURES = {
+    nobody: WORKERS_NOBODY,
+    network: {status: 0, body: ''},
+    http500: {status: 500, body: '<html>boom</html>'},
+    http502: {status: 502, body: '<html>Bad Gateway</html>'},
+};
+
+// As falhas que a consulta recebe antes da recusa: a sessão pode cair no meio do acompanhamento.
+function workersPrior(world, prior) {
+    (prior === 'first' ? [] : prior.split('+')).forEach(function (kind) {
+        world.answerWorkers(WORKERS_FAILURES[kind]);
+        world.advance(5000); // a consulta refeita sai
+    });
+}
+
+// AC-8954-1 e -2: o 403, na 1ª consulta ou depois de consultas que falharam ou não acharam worker.
+function workersForbidden(prior, options) {
+    const world = createWorld(Object.assign({workers: 'page'}, options || {}));
+    workersPrior(world, prior);
+    const result = {beforeForbidden: world.state()};
+    world.answerWorkers(WORKERS_FORBIDDEN);
+    result.afterForbidden = world.state();
+    world.advance(30000);
+    result.later = world.state();
+    return result;
+}
+
+// AC-8954-3 e -8: o 200 que não é JSON (a tela de login), na 1ª consulta ou depois de uma falha.
+function workersLogin(prior) {
+    const world = createWorld({workers: 'page'});
+    workersPrior(world, prior);
+    const result = {beforeLogin: world.state()};
+    world.answerWorkers(LOGIN_PAGE);
+    result.afterLogin = world.state();
+    world.advance(30000);
+    result.later = world.state();
+    return result;
+}
+
+// AC-8954-8 e o controle do AC-8954-6: a consulta chamada sem argumento (o setting desligado: a página não a abre).
+function workersWithoutArgument(response) {
+    const world = createWorld({workers: 'manual'});
+    const result = {before: world.state()};
+    world.workersCheck();
+    result.asked = world.state();
+    world.answerWorkers(response);
+    result.afterAnswer = world.state();
+    world.advance(4999);
+    result.at4999 = world.state();
+    world.advance(1);
+    result.at5000 = world.state();
+    return result;
+}
+
+// AC-8954-6: a falha que refaz a consulta 5 s depois; `how`: a página, a chamada sem argumento ou o handler sem `failure_reason`.
+function workersRetry(kind, how) {
+    const options = how === 'page' ? {workers: 'page'} : (how === 'noarg' ? {workers: 'manual'} : {workers: 'page', noFailureReason: true});
+    const world = createWorld(options);
+    if (how === 'noarg') world.workersCheck();
+    world.answerWorkers(WORKERS_FAILURES[kind]);
+    const result = {afterAnswer: world.state()};
+    world.advance(4999);
+    result.at4999 = world.state();
+    world.advance(1);
+    result.at5000 = world.state();
+    return result;
+}
+
+// AC-8954-7: o resultado no aviso (a lista como texto, ou a `message` do `status` falso).
+function workersResult(kind) {
+    const world = createWorld({workers: 'page'});
+    world.answerWorkers(kind === 'listed' ? WORKERS_LISTED : WORKERS_NOBODY);
+    const result = {afterAnswer: world.state()};
+    world.advance(30000);
+    result.later = world.state();
+    return result;
+}
+
 const scenarios = {};
 function register(name, fn) {
     try {
@@ -465,6 +547,32 @@ register('done:traceback', function () { return done('traceback'); });
 register('form:login200', formLogin);
 register('boot:list', function () { return boot(true); });
 register('boot:text', function () { return boot(false); });
+
+// AC-8954-1, -2 (o 403) e -3 (a tela de login): na 1ª consulta e depois de falhas
+['first', 'network', 'nobody', 'nobody+network'].forEach(function (prior) {
+    register('workers:forbidden:' + prior, function () { return workersForbidden(prior); });
+    register('workers:login:' + prior, function () { return workersLogin(prior); });
+});
+// AC-8954-5: o host sem a frase, sem o plugin de toast e sem o #popup-msg
+['nophrase', 'noplugin', 'none'].forEach(function (toast) {
+    register('workers:host:' + toast, function () { return workersForbidden('first', {toast: toast}); });
+});
+// AC-8954-8 (o login sem destino) e o controle do AC-8954-6 (a chamada sem argumento)
+register('workers:noarg:login', function () { return workersWithoutArgument(LOGIN_PAGE); });
+register('workers:noarg:network', function () { return workersWithoutArgument(WORKERS_FAILURES.network); });
+// AC-8954-6: refaz em 5 s
+Object.keys(WORKERS_FAILURES).forEach(function (kind) {
+    register('workers:retry:' + kind, function () { return workersRetry(kind, 'page'); });
+});
+register('workers:retry:network:noreason', function () { return workersRetry('network', 'noreason'); });
+// AC-8954-7: o resultado no aviso
+register('workers:result:listed', function () { return workersResult('listed'); });
+register('workers:result:nobody', function () { return workersResult('nobody'); });
+// AC-8954-9: a tela com a consulta de workers ligada
+register('boot:workers', function () {
+    const world = createWorld({workers: 'page'});
+    return {state: world.state(), boot: world.boot()};
+});
 
 const initial = createWorld().state();
 process.stdout.write(JSON.stringify({

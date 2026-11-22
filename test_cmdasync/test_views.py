@@ -573,8 +573,9 @@ class CeleryWorkerStatusTest(TestCase):
         response = self.client.get(WORKERS_URL)
         data = json.loads(response.content)
 
-        # 200, not an error status: the bundled JS shows the message of a false status from ``.done`` and sends any
-        # error status to ``.fail``, which only asks again (static/cmdasync/js/celery.workers.status.js:13-29).
+        # 200, not an error status: the bundled JS shows the message of a false status from ``.done`` (and asks again
+        # in 5 s) and sends any error status to ``.fail``, which asks again only for a failure that passes by itself
+        # (a 403 or the login page stops it: static/cmdasync/js/celery.workers.status.js:19-55).
         self.assertEqual(response.status_code, 200)
         self.assertFalse(data['status'])
         self.assertEqual(data['workers'], [])

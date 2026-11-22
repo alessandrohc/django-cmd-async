@@ -188,6 +188,28 @@ that enabled its Revoke button early ends the click like any failed revocation. 
 goes through `ajax()` keeps the old behaviour of the interruption: it is ignored until the second
 query.
 
+### The workers probe of the page
+
+With `COMMANDS_ASYNC_WORKERS_STATUS_CHECK = True` the page asks `command-async:workers` when it
+opens (`celery.workers.status.js`) and shows the notice with the names of the workers, or with the
+message of a false `status`. What the probe does with a failure depends on why it failed:
+
+- **`403`** (the gate of the route denied the XHR: no session, or no permission): the probe stops, no
+  new query goes out, and the notice opens with "Access denied: your session may have expired, or you
+  do not have permission to see the Celery workers." in the place of what it showed. The template of
+  the notice publishes the phrase (`data-forbidden-text` of `toast.html`), so it is in the catalog of
+  the package and translated (pt_BR).
+- **The login page** (an answer that is not JSON, which the browser reaches when a layer outside the
+  route redirects): the probe stops and the page takes the user to the login.
+- **A false `status`** (nobody answered, the broker failed), **a network failure or a server error**:
+  the probe asks again after 5 seconds, as before.
+
+A host with a page of its own calls `workers_check_status({onLogin: <function>})`: that function is
+what runs on the login page (the bundled page passes its `goToLogin`), and without it the probe just
+stops. A notice without `data-forbidden-text`, or a page without the Bootstrap toast plugin (the
+`bootstrap.bundle`), stops on the `403` with no notice and no script error. A host with an older
+`cmdhandler.js` (without `failure_reason`) keeps asking again after any failure.
+
 ## DJANGO settings
 
 ### It should show a list of commands to the user. Otherwise, a text input will be displayed.
@@ -217,7 +239,7 @@ decorator.
 ### Whether the page should probe the workers and warn when none is up.
 The probe asks `command-async:workers`, which needs the same permission as the form: when
 `COMMANDS_ASYNC_PERMISSION_NAME` names one, a user without it who opens the page gets a `403`,
-and the bundled JS asks again every 5 seconds (it retries after any failure).
+and the bundled JS stops asking and tells why (see "The workers probe of the page" above).
 
 [bool] COMMANDS_ASYNC_WORKERS_STATUS_CHECK  (default: False)
 
