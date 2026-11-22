@@ -29,9 +29,10 @@ from test_cmdasync.harness import INDEX_URL, create_user
 ROOT = Path(__file__).resolve().parent.parent
 SCENARIOS = Path(__file__).resolve().parent / 'js_harness' / 'scenarios.js'
 CMDHANDLER = ROOT / 'commands_async' / 'static' / 'cmdasync' / 'js' / 'cmdhandler.js'
+JQUERY_FORM = ROOT / 'commands_async' / 'static' / 'cmdasync' / 'js' / 'jquery.form.v4.4.2.min.js'
 
 REVOKE_KINDS = ('http403', 'http404', 'http500', 'html200', 'falseWithError', 'falseNoError')
-REVOKE_PHASES = ('tracking', 'window', 'late')
+REVOKE_PHASES = ('tracking', 'late')
 
 
 @functools.lru_cache(maxsize=1)
@@ -101,16 +102,15 @@ class RevocationFailureTest(ScenarioTestCase):
     def test_a_failed_revocation_gives_the_revoke_button_back_while_tracking(self):
         """AC-8866-2: com o Execute desabilitado, a falha deixa o Revoke habilitado e sem indicador; com o Execute habilitado, desabilitado."""
         for kind in REVOKE_KINDS:
-            for phase in ('tracking', 'window'):
-                name = 'revoke:{0}:full:{1}'.format(kind, phase)
-                with self.subTest(scenario=name):
-                    found = self.scenario(name)
-                    # o botão esperava o servidor desabilitado, com o indicador: é o que a falha desfaz
-                    self.assertTrue(found['clicked']['revoke']['disabled'])
-                    self.assertTrue(found['clicked']['revoke']['progressVisible'])
-                    self.assertTrue(found['after']['execute']['disabled'], msg='precondition: the screen is still tracking')
-                    self.assertFalse(found['after']['revoke']['disabled'], msg='the revoke button stayed disabled')
-                    self.assertFalse(found['after']['revoke']['progressVisible'], msg='the revoke button kept its progress indicator')
+            name = 'revoke:{0}:full:tracking'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                # o botão esperava o servidor desabilitado, com o indicador: é o que a falha desfaz
+                self.assertTrue(found['clicked']['revoke']['disabled'])
+                self.assertTrue(found['clicked']['revoke']['progressVisible'])
+                self.assertTrue(found['after']['execute']['disabled'], msg='precondition: the screen is still tracking')
+                self.assertFalse(found['after']['revoke']['disabled'], msg='the revoke button stayed disabled')
+                self.assertFalse(found['after']['revoke']['progressVisible'], msg='the revoke button kept its progress indicator')
             name = 'revoke:{0}:full:late'.format(kind)
             with self.subTest(scenario=name):
                 found = self.scenario(name)
@@ -191,7 +191,7 @@ class CallbackFailureTest(ScenarioTestCase):
 
 
 class AbortTest(ScenarioTestCase):
-    """Interromper o acompanhamento: o Cancel e a troca de comando na lista (AC-8866-6 e -16)."""
+    """Interromper o acompanhamento: o Cancel e a troca de comando na lista (AC-8866-6 e -16, AC-8955-1 e -2)."""
 
     def test_an_interrupted_follow_up_ends_whole(self):
         """AC-8866-6: com uma consulta agendada, o Cancel e a troca de comando encerram o acompanhamento por inteiro."""
@@ -224,11 +224,49 @@ class AbortTest(ScenarioTestCase):
         self.assertEqual(found['before']['liveTimers'], 1)
         self.assertEqual(found['after']['statusRequests'], found['before']['statusRequests'] + 1)
 
-    def test_an_abort_without_a_scheduled_query_does_not_release_the_screen(self):
-        # Robustez (sem ID): o Cancel durante o envio do formulário ou da 1ª consulta em voo é ignorado (F3).
-        for phase in ('first-inflight', 'submitting'):
-            with self.subTest(phase=phase):
-                self.assertTrue(self.scenario('abort:cancel:{0}'.format(phase))['after']['execute']['disabled'])
+    def test_an_interruption_during_the_submit_ends_the_follow_up_whole(self):
+        """AC-8955-1: o Cancel e a troca de comando durante o envio do formulário liberam a tela quando a resposta chega, sem consulta nem saída, e o comando seguinte é acompanhado até o fim."""
+        for trigger in ('cancel', 'switch'):
+            with self.subTest(trigger=trigger):
+                found = self.scenario('submit:{0}'.format(trigger))
+                self.assertEqual(found['before']['statusRequests'], 0, msg='precondition: the form is still in flight')
+                answered = found['afterAnswer']
+                self.assertEqual(answered['statusRequests'], 0, msg='a status query went out after the interruption')
+                self.assertEqual(answered['pendingStatus'], 0)
+                self.assertAtRest(answered, msg='the screen was not released when the answer of the form arrived')
+                self.assertEqual(answered['output'], '', msg='an output was shown after the interruption')
+                self.assertEqual(found['afterAdvance']['statusRequests'], 0, msg='a status query went out later')
+                second = found['second']
+                self.assertEqual(second['output'], 'SECOND OUTPUT', msg='the next command was not followed to its end')
+                self.assertAtRest(second)
+        with self.subTest(trigger='none'):
+            # controle: sem a interrupção o mesmo envio consulta o estado
+            found = self.scenario('submit:none')
+            self.assertEqual(found['afterAnswer']['statusRequests'], 1)
+            self.assertEqual(found['afterAnswer']['pendingStatus'], 1)
+
+    def test_an_interruption_with_the_first_query_in_flight_releases_the_screen_when_it_answers(self):
+        """AC-8955-2: o Cancel e a troca de comando com a 1ª consulta em voo liberam a tela quando a resposta chega, sem a saída da tarefa nem outra consulta, e o comando seguinte é acompanhado até o fim."""
+        for trigger in ('cancel', 'switch'):
+            for answer in ('notready', 'ready'):
+                name = 'first:{0}:{1}'.format(trigger, answer)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.assertEqual(found['afterAbort']['pendingStatus'], 1, msg='precondition: the first query is in flight')
+                    self.assertEqual(found['afterAbort']['statusRequests'], 1)
+                    answered = found['afterAnswer']
+                    self.assertAtRest(answered, msg='the screen was not released when the first query answered')
+                    self.assertNotIn('TASK OUTPUT', answered['output'], msg='the task output was shown after the interruption')
+                    self.assertEqual(answered['liveTimers'], 0, msg='a new query was scheduled')
+                    self.assertEqual(found['afterAdvance']['statusRequests'], 1, msg='another query went out')
+                    second = found['second']
+                    self.assertEqual(second['output'], 'SECOND OUTPUT', msg='the next command was not followed to its end')
+                    self.assertAtRest(second)
+        with self.subTest(case='control'):
+            # controle: sem a interrupção, a resposta «não pronta» agenda a 2ª consulta e ela sai
+            found = self.scenario('abort:none:1')
+            self.assertEqual(found['before']['liveTimers'], 1)
+            self.assertEqual(found['after']['statusRequests'], found['before']['statusRequests'] + 1)
 
     def test_an_interrupted_follow_up_releases_the_screen_when_the_query_in_flight_answers(self):
         """AC-8866-16 (controle): com a consulta em voo (da 2ª em diante), a tela é liberada quando a resposta chega, sem a saída da tarefa."""
@@ -241,6 +279,118 @@ class AbortTest(ScenarioTestCase):
                     answered = found['afterAnswer']
                     self.assertAtRest(answered)
                     self.assertNotIn('TASK OUTPUT', answered['output'], msg='the task output was shown after the interruption')
+
+
+class RevokeWindowTest(ScenarioTestCase):
+    """O Revoke entre o envio do formulário e a resposta do servidor (AC-8955-3, -4 e -5)."""
+
+    def test_the_revoke_button_waits_for_the_server_to_answer_the_form(self):
+        """AC-8955-3: do envio até a resposta com a tarefa o Revoke está desabilitado (mesmo se um pedido por script falhar); com a resposta, habilitado."""
+        for run in ('first', 'second'):
+            with self.subTest(run=run):
+                found = self.scenario('revoke-window:{0}'.format(run))
+                window = found['inWindow']
+                self.assertTrue(window['execute']['disabled'], msg='precondition: the form is in flight')
+                self.assertTrue(window['revoke']['disabled'], msg='the revoke button is enabled before the server answered the form')
+                self.assertFalse(found['clicked'], msg='a click reached the disabled revoke button')
+                self.assertEqual(found['afterClick']['revokeRequests'], 0)
+                # um pedido de revogação por script na janela (a guarda e o aviso) deixa o botão como está
+                scripted = found['afterScript']
+                self.assertTrue(scripted['revoke']['disabled'], msg='a script request enabled the revoke button before the answer')
+                self.assertFalse(scripted['revoke']['progressVisible'])
+                answered = found['afterAnswer']
+                self.assertTrue(answered['execute']['disabled'], msg='precondition: the follow-up goes on')
+                self.assertFalse(answered['revoke']['disabled'], msg='the revoke button stayed disabled after the server answered the form')
+                self.assertFalse(answered['revoke']['progressVisible'])
+
+    def test_a_late_failure_of_the_previous_revocation_does_not_enable_the_button_in_the_submit_window(self):
+        """AC-8955-3: a falha tardia da revogação de uma execução anterior, na janela do envio seguinte, mostra o aviso e deixa o Revoke desabilitado."""
+        found = self.scenario('revoke-window:late-failure')
+        self.assertAtRest(found['released'], msg='precondition: the screen was released by the conclusion')
+        window = found['inWindow']
+        self.assertTrue(window['execute']['disabled'], msg='precondition: a new form is in flight')
+        self.assertTrue(window['revoke']['disabled'], msg='precondition: no task was accepted yet, the revoke button is disabled')
+        after = found['afterFailure']
+        self.assertAlertShows(after, self.texts['revokeFailedText'])
+        self.assertTrue(after['revoke']['disabled'], msg='the late failure enabled the revoke button in the submit window')
+        self.assertFalse(after['revoke']['progressVisible'])
+
+    def test_the_revoke_click_after_the_answer_asks_for_the_task_of_that_execution(self):
+        """AC-8955-4 (controle): o clique no Revoke depois da resposta pede a revogação da tarefa dessa execução, e não a de uma anterior."""
+        found = self.scenario('revoke:after-answer')
+        self.assertFalse(found['afterAnswer']['revoke']['disabled'], msg='precondition: the revoke button is enabled after the answer')
+        self.assertTrue(found['clicked'])
+        self.assertEqual(found['revokeUrls'], ['status/t2'])
+
+    def test_a_script_revocation_without_an_accepted_task_is_a_failed_revocation(self):
+        """AC-8955-5: a revogação pedida por script sem tarefa aceita na execução em curso não envia pedido nenhum, não lança erro e mostra o aviso de falha."""
+        for kind in ('before-any-submit', 'first-window', 'second-window', 'refused'):
+            name = 'script-revoke:{0}:full'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertIsNone(found['threw'], msg='the script request raised an error')
+                after = found['after']
+                self.assertEqual(found['revokeUrls'], [], msg='a revocation request was sent')
+                self.assertEqual(after['revokeRequests'], 0)
+                self.assertEqual(after['uncaught'], [])
+                self.assertAlertShows(after, self.texts['revokeFailedText'], msg=name)
+                self.assertEqual(after['browserAlerts'], [], msg='a browser alert() window was used')
+        with self.subTest(scenario='script-revoke:first-window:nospace'):
+            # um host sem o espaço do aviso (AC-8866-15): nenhum erro e nenhum texto
+            found = self.scenario('script-revoke:first-window:nospace')
+            self.assertIsNone(found['threw'], msg='the script request raised an error')
+            self.assertEqual(found['revokeUrls'], [])
+            self.assertEqual(found['after']['uncaught'], [])
+            self.assertAlertEmpty(found['after'])
+
+
+class FollowUpRobustnessTest(ScenarioTestCase):
+    """Robustez (sem ID): os caminhos do desenho que os critérios não provam sozinhos."""
+
+    def test_a_duplicate_submit_the_page_refuses_leaves_the_follow_up_alone(self):
+        # Robustez (sem ID): o beforeSubmit que o ajax() entrega ao ajaxForm repassa a recusa da página e não reinicia o estado.
+        found = self.scenario('robust:duplicate:after-cancel')
+        self.assertIs(found['duplicateProceeded'], False, msg='the page no longer refuses a second submit, or the wrapper swallowed the refusal')
+        self.assertAtRest(found['afterAnswer'], msg='the second submit undid the interruption already asked')
+        self.assertEqual(found['afterAnswer']['statusRequests'], 0)
+        found = self.scenario('robust:duplicate:following')
+        self.assertIs(found['duplicateProceeded'], False)
+        self.assertEqual(found['revokeUrls'], ['status/t1'], msg='the second submit reset the task of the follow-up in course')
+
+    def test_a_refused_form_after_an_interruption_leaves_the_next_command_followed(self):
+        # Robustez (sem ID): o envio recusado (400) depois de uma interrupção deixa o estado do acompanhamento sujo até o próximo envio.
+        found = self.scenario('robust:refused-after-interrupt')
+        self.assertAtRest(found['afterRefusal'], msg='precondition: the refused form released the screen')
+        second = found['second']
+        self.assertEqual(second['output'], 'SECOND OUTPUT', msg='the command after the refused form was not followed to its end')
+        self.assertAtRest(second)
+
+    def test_a_host_that_fires_form_valid_without_the_handler_submit_is_followed_as_before(self):
+        # Robustez (sem ID): sem o begin() (running falso), o form-valid chama o request(), que reinicia o update.
+        found = self.scenario('robust:host-without-begin')
+        self.assertAtRest(found['released'], msg='precondition: the interruption in the submit released the screen')
+        self.assertEqual(found['released']['statusRequests'], 0, msg='precondition: no query went out')
+        self.assertEqual(found['afterDirect']['statusRequests'], 1, msg='the first query did not go out')
+        answered = found['afterAnswer']
+        self.assertEqual(answered['output'], 'HOST OUTPUT', msg='the answer of the first query was not shown')
+        self.assertAtRest(answered)
+
+    def test_the_screen_released_by_an_interruption_still_revokes_the_last_task(self):
+        # Robustez (sem ID): a fronteira do AC-8955-5: a tela liberada (não o envio em curso) pede a última tarefa, sem aviso.
+        found = self.scenario('robust:released-boundary')
+        self.assertAtRest(found['released'], msg='precondition: the interruption released the screen')
+        self.assertIsNone(found['threw'])
+        self.assertEqual(found['revokeUrls'], ['status/t1'], msg='the last task was not asked to be revoked')
+        self.assertAlertEmpty(found['after'])
+
+    def test_ajax_without_a_before_submit_of_the_host_still_begins_the_follow_up(self):
+        # Robustez (sem ID): o embrulho do beforeSubmit não pode chamar uma página que não existe.
+        found = self.scenario('robust:ajax-without-before-submit')
+        self.assertEqual(found['beforeSubmitType'], 'function', msg='ajax() did not give the form a beforeSubmit')
+        self.assertNotIn('threw', found, msg='the beforeSubmit raised: {0}'.format(found.get('threw')))
+        self.assertEqual(found['returnedType'], 'undefined')
+        # o envio começou (begin): a interrupção pedida antes da resposta encerra sem consulta
+        self.assertEqual(found['afterFormValid']['statusRequests'], 0, msg='the interruption did not stop the first query')
 
 
 class AlertClearingTest(ScenarioTestCase):
@@ -395,6 +545,20 @@ class DoubleAssumptionsTest(TestCase):
         for call in calls:
             with self.subTest(call=call[:60]):
                 self.assertRegex(call, r'dataType\s*:\s*[\'"]json[\'"]', msg='this $.ajax does not ask for dataType json')
+
+    def test_jquery_form_asks_before_submit_before_the_ajax_and_aborts_on_false(self):
+        # O dublê (world.js, executeStart) chama o beforeSubmit à mão e segue o envio se ele não devolver false, e não executa o
+        # jquery.form: é essa ordem que o begin() do ajax() usa (o begin() roda no beforeSubmit, antes do $.ajax do envio, e uma
+        # página que o recusa não começa nada). Lida na fonte entregue (jquery.form.v4.4.2.min.js, ajaxSubmit); se a versão
+        # do jquery.form mudar, este teste obriga a conferir a ordem de novo.
+        source = JQUERY_FORM.read_text(encoding='utf-8')
+        calls = list(re.finditer(r't\.beforeSubmit&&!1===t\.beforeSubmit\([^)]*\)\)return', source))
+        self.assertEqual(len(calls), 1, msg='the beforeSubmit that aborts the submit on false was not found, or is found twice')
+        position = calls[0].start()
+        validate = source.index('form-submit-validate')
+        ajax = re.search(r'\.ajax\(', source)
+        self.assertLess(position, validate, msg='the beforeSubmit no longer runs before the form-submit-validate event')
+        self.assertLess(position, ajax.start(), msg='the beforeSubmit no longer runs before the $.ajax of the submit')
 
     def test_the_double_starts_from_the_template_state_of_the_buttons(self):
         # O dublê assume Execute habilitado e Cancel e Revoke desabilitados; é o que o template entrega.

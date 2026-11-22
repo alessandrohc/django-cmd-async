@@ -61,14 +61,7 @@ function trackWaits(world, waits) {
 function revokeFailure(kind, template, phase) {
     const world = createWorld(TEMPLATES[template]);
     const result = {};
-    if (phase === 'window') {
-        // a janela entre o clique em Execute e o form-valid (precisa de uma execução anterior: self.task)
-        world.execute('t1');
-        world.answerStatus(ready('first'));
-        world.executeStart();
-    } else {
-        trackWaits(world, 1);
-    }
+    trackWaits(world, 1);
     result.before = world.state();
     world.click('#btn-task-revoke');
     result.clicked = world.state(); // o botão Revoke desabilitado, com o indicador, à espera do servidor
@@ -160,13 +153,200 @@ function noAbortControl(waits) {
     return result;
 }
 
-function cancelWithoutTimer(phase) {
-    const world = createWorld();
-    if (phase === 'first-inflight') world.execute('t1'); // a 1ª consulta está em voo
-    else world.executeStart(); // o envio do formulário em curso
+function clickTrigger(world, trigger) {
+    if (trigger === 'cancel') world.click('#btn-task-cancel');
+    else world.switchCommand(0);
+}
+
+// A resposta de um comando seguinte, para provar que ele é acompanhado até o fim.
+function followNext(world, result) {
+    world.execute('t2');
+    world.answerStatus(ready('SECOND OUTPUT'), 'last');
+    result.second = world.state();
+}
+
+// AC-8955-1: interromper (Cancel ou troca de comando) com o formulário em voo, antes da resposta do servidor.
+// `interrupt` false é o controle: sem a interrupção o mesmo envio consulta.
+function abortDuringSubmit(trigger, interrupt) {
+    const world = createWorld({commandsList: trigger === 'switch'});
+    world.executeStart(); // o formulário está em voo
     const result = {before: world.state()};
-    world.click('#btn-task-cancel');
+    if (interrupt) clickTrigger(world, trigger);
+    result.afterAbort = world.state();
+    world.formValid('t1'); // o servidor aceitou a tarefa
+    result.afterAnswer = world.state();
+    world.advance(5000);
+    result.afterAdvance = world.state();
+    if (interrupt) followNext(world, result);
+    return result;
+}
+
+// AC-8955-2: interromper com a 1ª consulta de estado em voo; `answer` é a resposta que ela recebe.
+function abortFirstInFlight(trigger, answer) {
+    const world = createWorld({commandsList: trigger === 'switch'});
+    world.execute('t1'); // a 1ª consulta está em voo
+    const result = {before: world.state()};
+    clickTrigger(world, trigger);
+    result.afterAbort = world.state();
+    world.answerStatus(answer === 'ready' ? ready('TASK OUTPUT') : NOT_READY);
+    result.afterAnswer = world.state();
+    world.advance(5000);
+    result.afterAdvance = world.state();
+    followNext(world, result);
+    return result;
+}
+
+function revokeUrls(world) {
+    return world.revokeRequests().map(function (request) { return request.url; });
+}
+
+// Chama o revoke_task() como um script faria (a página só o chama pelo botão, desabilitado na janela do envio).
+function scriptRevoke(world) {
+    try {
+        world.cmdasyncform.revoke_task();
+        return null;
+    } catch (error) {
+        return String(error);
+    }
+}
+
+// AC-8955-3: o Revoke na janela do envio (a 1ª execução e a 2ª, depois de uma tarefa pronta) e depois da resposta.
+function revokeWindow(run) {
+    const world = createWorld();
+    if (run === 'second') {
+        world.execute('t1');
+        world.answerStatus(ready('first'));
+    }
+    world.executeStart();
+    const result = {inWindow: world.state()};
+    result.clicked = world.click('#btn-task-revoke'); // false: o botão está desabilitado
+    result.afterClick = world.state();
+    result.scriptThrew = scriptRevoke(world); // a guarda e o aviso
+    result.afterScript = world.state();
+    world.formValid(run === 'second' ? 't2' : 't1');
+    result.afterAnswer = world.state();
+    return result;
+}
+
+// AC-8955-3: a falha tardia da revogação da execução anterior chega na janela do envio seguinte.
+function revokeLateFailureInWindow() {
+    const world = createWorld();
+    trackWaits(world, 1);
+    world.click('#btn-task-revoke'); // o POST fica em voo
+    world.advance(1000);
+    world.answerStatus(ready('done')); // a tela é liberada pela conclusão
+    const result = {released: world.state()};
+    world.executeStart(); // novo envio: o Execute desabilitado, nenhuma tarefa aceita
+    result.inWindow = world.state();
+    world.answerRevoke(REVOKE_FAILURES.http500); // a falha da execução anterior chega agora
+    result.afterFailure = world.state();
+    return result;
+}
+
+// AC-8955-4: o clique no Revoke depois da resposta pede a tarefa dessa execução, e não a anterior.
+function revokeAfterAnswer() {
+    const world = createWorld();
+    world.execute('t1');
+    world.answerStatus(ready('first'));
+    world.execute('t2');
+    const result = {afterAnswer: world.state()};
+    result.clicked = world.click('#btn-task-revoke');
+    result.afterClick = world.state();
+    result.revokeUrls = revokeUrls(world);
+    return result;
+}
+
+// AC-8955-5: o revoke_task() por script sem tarefa aceita na execução em curso.
+function scriptRevokeWithoutTask(kind, template) {
+    const world = createWorld(TEMPLATES[template]);
+    if (kind === 'second-window' || kind === 'refused') {
+        world.execute('t1');
+        world.answerStatus(ready('first')); // t1 terminou
+    }
+    if (kind !== 'before-any-submit') world.executeStart();
+    if (kind === 'refused') world.formError({status: 400, responseJSON: {form: {errors: {}}}}); // o servidor recusou
+    const result = {before: world.state()};
+    result.threw = scriptRevoke(world);
     result.after = world.state();
+    result.revokeUrls = revokeUrls(world);
+    return result;
+}
+
+// Robustez (sem ID): o envio duplicado que a página recusa (o Execute está desabilitado) não mexe no acompanhamento.
+function duplicateSubmit(window) {
+    const world = createWorld();
+    const result = {};
+    if (window === 'after-cancel') {
+        world.executeStart();
+        world.click('#btn-task-cancel');
+        result.duplicateProceeded = world.executeStart(); // false: a página o recusa
+        world.formValid('t1');
+        result.afterAnswer = world.state();
+    } else {
+        world.execute('t1');
+        world.answerStatus(NOT_READY);
+        result.duplicateProceeded = world.executeStart();
+        result.click = world.click('#btn-task-revoke');
+        result.revokeUrls = revokeUrls(world);
+        result.afterClick = world.state();
+    }
+    return result;
+}
+
+// Robustez (sem ID): interrompe no envio, o servidor recusa (400), troca de comando, e o comando seguinte é acompanhado.
+function refusedAfterInterrupt() {
+    const world = createWorld({commandsList: true});
+    world.executeStart();
+    world.switchCommand(0);
+    world.formError({status: 400, responseJSON: {form: {errors: {}}}});
+    const result = {afterRefusal: world.state()};
+    world.switchCommand(0); // a tela ociosa
+    followNext(world, result);
+    return result;
+}
+
+// Robustez (sem ID): um host que dispara o form-valid sem o ajax() do handler (sem begin()), depois de uma interrupção.
+function hostWithoutBegin() {
+    const world = createWorld();
+    world.executeStart();
+    world.click('#btn-task-cancel');
+    world.formValid('t1'); // a tela liberada pela interrupção: running e update falsos
+    const result = {released: world.state()};
+    world.cmdasyncform.on_form_valid({task: {id: 't2', command: {name: 'cmdasync_echo'}}});
+    result.afterDirect = world.state();
+    world.answerStatus(ready('HOST OUTPUT'), 'last');
+    result.afterAnswer = world.state();
+    return result;
+}
+
+// Robustez (sem ID): a tela liberada por uma interrupção no envio segue pedindo a última tarefa (a fronteira do AC-8955-5).
+function releasedBoundary() {
+    const world = createWorld();
+    world.executeStart();
+    world.click('#btn-task-cancel');
+    world.formValid('t1');
+    const result = {released: world.state()};
+    result.threw = scriptRevoke(world);
+    result.after = world.state();
+    result.revokeUrls = revokeUrls(world);
+    return result;
+}
+
+// Robustez (sem ID): o ajax() chamado com um objeto sem beforeSubmit.
+function ajaxWithoutBeforeSubmit() {
+    const world = createWorld();
+    const options = world.cmdasyncform.ajax('form#taskform', {});
+    const result = {beforeSubmitType: typeof options.beforeSubmit};
+    if (typeof options.beforeSubmit === 'function') {
+        try {
+            result.returnedType = typeof options.beforeSubmit([], null, options);
+        } catch (error) {
+            result.threw = String(error);
+        }
+    }
+    world.cmdasyncform.update_abort(); // o envio está em curso (o begin() rodou)
+    world.cmdasyncform.on_form_valid({task: {id: 't9', command: {name: 'cmdasync_echo'}}});
+    result.afterFormValid = world.state();
     return result;
 }
 
@@ -223,9 +403,7 @@ Object.keys(REVOKE_FAILURES).forEach(function (kind) {
     Object.keys(TEMPLATES).forEach(function (template) {
         register('revoke:' + kind + ':' + template + ':tracking', function () { return revokeFailure(kind, template, 'tracking'); });
     });
-    ['late', 'window'].forEach(function (phase) {
-        register('revoke:' + kind + ':full:' + phase, function () { return revokeFailure(kind, 'full', phase); });
-    });
+    register('revoke:' + kind + ':full:late', function () { return revokeFailure(kind, 'full', 'late'); });
 });
 register('revoke:accepted', revokeAccepted);
 
@@ -248,9 +426,35 @@ register('status:html200:midway', function () { return statusFailureMidway('html
     });
 });
 register('abort:none:2', function () { return noAbortControl(2); });
-['first-inflight', 'submitting'].forEach(function (phase) {
-    register('abort:cancel:' + phase, function () { return cancelWithoutTimer(phase); });
+register('abort:none:1', function () { return noAbortControl(1); });
+
+// AC-8955-1 e -2
+['cancel', 'switch'].forEach(function (trigger) {
+    register('submit:' + trigger, function () { return abortDuringSubmit(trigger, true); });
+    ['notready', 'ready'].forEach(function (answer) {
+        register('first:' + trigger + ':' + answer, function () { return abortFirstInFlight(trigger, answer); });
+    });
 });
+register('submit:none', function () { return abortDuringSubmit('cancel', false); });
+
+// AC-8955-3, -4 e -5
+['first', 'second'].forEach(function (run) {
+    register('revoke-window:' + run, function () { return revokeWindow(run); });
+});
+register('revoke-window:late-failure', revokeLateFailureInWindow);
+register('revoke:after-answer', revokeAfterAnswer);
+['before-any-submit', 'first-window', 'second-window', 'refused'].forEach(function (kind) {
+    register('script-revoke:' + kind + ':full', function () { return scriptRevokeWithoutTask(kind, 'full'); });
+});
+register('script-revoke:first-window:nospace', function () { return scriptRevokeWithoutTask('first-window', 'nospace'); });
+
+// Robustez (sem ID)
+register('robust:duplicate:after-cancel', function () { return duplicateSubmit('after-cancel'); });
+register('robust:duplicate:following', function () { return duplicateSubmit('following'); });
+register('robust:refused-after-interrupt', refusedAfterInterrupt);
+register('robust:host-without-begin', hostWithoutBegin);
+register('robust:released-boundary', releasedBoundary);
+register('robust:ajax-without-before-submit', ajaxWithoutBeforeSubmit);
 
 ['submit', 'cancel', 'switch', 'revoke', 'none'].forEach(function (trigger) {
     register('clear:' + trigger, function () { return clearAlert(trigger); });

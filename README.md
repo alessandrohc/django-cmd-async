@@ -164,6 +164,30 @@ query is answered the `404` of the owner check before the backend is touched, as
 The `500` of a task whose state is `REVOKED` or `RETRY` (its result is an exception, which cannot
 be serialized) is a separate defect and does not change.
 
+### The command page: Cancel, the switch of command and Revoke
+
+The bundled page follows a task from the moment the form is sent, not only from the second status
+query. **Cancel** (and, when the page shows the list of commands, the **switch of command**) ends
+that follow-up wherever it is: while the form is being sent, with the first status query in flight,
+or between two queries. The screen is released when the answer in flight arrives, or at once when a
+new query was only scheduled, and no status query goes out after it. **The task keeps running**:
+stopping it is Revoke, to be used before Cancel, because the page disables Revoke when it releases
+the screen. Before, Cancel and the switch were ignored until the second query: the follow-up went
+on to the end, with Cancel disabled and its indicator lit.
+
+**Revoke** stays disabled from the submit until the server answers the form with the task, and then
+asks for the revocation of **that** task. It used to be enabled at the submit: a click before the
+answer raised a script error on the first run, and on the next runs revoked the task of the previous
+run.
+
+A host with a page of its own that uses `cmdhandler.js` gets the same through
+`cmdasyncform.ajax()`, which wraps the `beforeSubmit` of the page and calls the new `begin()`
+(the follow-up is on, no task is known yet) unless the page refused the submit by returning `false`.
+`revoke_task()` with no task accepted in the run sends nothing and fires `revoke-failed`, so a page
+that enabled its Revoke button early ends the click like any failed revocation. A host that never
+goes through `ajax()` keeps the old behaviour of the interruption: it is ignored until the second
+query.
+
 ## DJANGO settings
 
 ### It should show a list of commands to the user. Otherwise, a text input will be displayed.

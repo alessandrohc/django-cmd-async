@@ -66,6 +66,14 @@ cmdasyncform = {
         this.task = null;
         this.requestTimeout = null;
     },
+    // The follow-up starts when the form is sent, not at the first poll: from here Cancel and the
+    // command switch have something to end (update_abort reads `running`), and no task is known yet.
+    // `task` is cleared so that the task of an earlier run is never the one revoked in this run.
+    begin: function () {
+        this.running = true;
+        this.update = true;
+        this.task = null;
+    },
     request: function(task) {
         if (!this.running)
             this.update = true;
@@ -138,6 +146,13 @@ cmdasyncform = {
     },
     revoke_task : function () {
         var self = this;
+        // No task was accepted by the server in this run (the form is still being sent, or was
+        // refused): there is nothing to revoke. It is told as a failed revocation, so a page that
+        // enabled its button early ends the click like any other failure.
+        if (!self.task) {
+            self.exc_event_callbacks('revoke-failed', null);
+            return;
+        }
         var csrftoken = this.getCookie("csrftoken");
         $.ajax({
             type: "POST",
@@ -184,6 +199,14 @@ cmdasyncform = {
 
     on_form_valid : function (data) {
         this.task = data.task;
+        if (this.running && !this.update) {
+            // The follow-up was interrupted while the form was being sent: end it here. No query
+            // goes out; the task keeps running (Revoke is what stops it). `running` is part of the
+            // test so that a host that never went through ajax() (no begin()) follows as before.
+            this.running = false;
+            this.exc_event_callbacks('update-finish', this.$form);
+            return;
+        }
         this.request(this.task);
     },
 
@@ -201,6 +224,17 @@ cmdasyncform = {
 
         if (this.events['form-valid'].indexOf(this.on_form_valid) === -1)
             this.add_event_callback("form-valid", this.on_form_valid.bind(this));
+
+        // The follow-up begins with the submit. The page's own beforeSubmit may refuse the submit
+        // (it returns false, e.g. a second click while one runs): then nothing begins and the
+        // follow-up in course is left alone, exactly as jquery.form aborts the submit.
+        var pageBeforeSubmit = options.beforeSubmit;
+        options.beforeSubmit = function () {
+            var proceed = pageBeforeSubmit ? pageBeforeSubmit.apply(this, arguments) : undefined;
+            if (proceed !== false)
+                self.begin();
+            return proceed;
+        };
 
         options.success = function(responseText, statusText, xhr, $form) {
             self.exc_event_callbacks('form-valid', responseText, statusText, xhr, $form);

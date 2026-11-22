@@ -147,8 +147,9 @@ $(document).ready(function () {
             if ($btnSubmit.attr('disabled'))
                 return false;
             $btnSubmit.prop('disabled', true);
+            // Cancel can end the follow-up from the submit on. Revoke waits for the form-valid:
+            // until the server answers there is no task to revoke.
             $form.find("#btn-task-cancel").prop('disabled', false);
-            $form.find("#btn-task-revoke").prop('disabled', false);
         },
         error: function (xhr) {
             requestErrorClean();
@@ -179,6 +180,12 @@ $(document).ready(function () {
 
     cmdasyncform.add_event_callback("form-valid", function (responseText, statusText, xhr, $form) {
         requestErrorClean();
+        // The server accepted the task: Revoke has something to stop. The handler's own form-valid
+        // callback runs before this one (ajax() registers it first); when the follow-up was
+        // interrupted during the submit it has already released the screen, Execute is enabled
+        // and Revoke stays disabled.
+        if ($btnSubmit.prop('disabled'))
+            $("#btn-task-revoke").prop('disabled', false);
     });
 
     cmdasyncform.add_event_callback("update-finish", function (form) {
@@ -200,8 +207,9 @@ $(document).ready(function () {
         showAlert(serverText || config.revokeFailedText);
         // While the follow-up goes on (Execute is still disabled) the user may try to
         // revoke again; on a screen that was already released (a late failure) the
-        // button stays disabled.
-        if ($btnSubmit.prop('disabled')) {
+        // button stays disabled. Without a task (the form of a new run is still being sent, so
+        // a late failure of the earlier run's revocation lands here) it stays disabled too.
+        if ($btnSubmit.prop('disabled') && cmdasyncform.task) {
             var $btnRevoke = $("#btn-task-revoke").prop('disabled', false);
             $btnRevoke.find(".task-progress").addClass("d-none");
         }
