@@ -370,7 +370,7 @@ class TaskFormStatusAccessTest(TestCase):
                     self.assertNoTaskData(response, label)
 
     def test_anonymous_xhr_gets_a_json_403(self):
-        """AC-8836-2, AC-8835-12 (controle): an anonymous query by XHR is answered 403 in JSON, with no task data."""
+        """AC-8836-2, AC-8928-1 (controle): an anonymous query by XHR is answered 403 in JSON, with no task data."""
         self.assertReads(self.logged(self.plain), 'logged in', **AJAX)
         for task_id in (DONE_ID, FAILED_ID):
             with self.subTest(task=task_id):
@@ -388,7 +388,7 @@ class TaskFormStatusAccessTest(TestCase):
                 self.revoke.assert_not_called()
 
     def test_anonymous_revoke_is_denied_like_the_anonymous_query(self):
-        """AC-8836-13, AC-8835-12 (controle): an anonymous revoke is redirected to the login page, or answered 403 in JSON by XHR."""
+        """AC-8836-13, AC-8928-1 (controle): an anonymous revoke is redirected to the login page, or answered 403 in JSON by XHR."""
         with self.subTest(request='navigation'):
             response = self.client.post(status_url(DONE_ID))
             self.assertRedirects(response, '/login/?next={0}'.format(status_url(DONE_ID)),
@@ -414,7 +414,7 @@ class TaskFormStatusAccessTest(TestCase):
                     self.assertNoTaskData(response, method)
 
     def test_a_user_without_the_named_permission_is_forbidden_to_query(self):
-        """AC-8836-4, AC-8835-12 (controle): when a permission is named, a user without it is answered 403 (JSON by XHR), no task data."""
+        """AC-8836-4, AC-8928-1 (controle): when a permission is named, a user without it is answered 403 (JSON by XHR), no task data."""
         with self.permission_required():
             self.assertReads(self.logged(self.runner), 'holds the permission')
             client = self.logged(self.plain)
@@ -428,7 +428,7 @@ class TaskFormStatusAccessTest(TestCase):
                         self.assertNoTaskData(response, label)
 
     def test_a_user_without_the_named_permission_is_forbidden_to_revoke(self):
-        """AC-8836-5, AC-8835-12 (controle): when a permission is named, a user without it who revokes is answered 403 (JSON by XHR)."""
+        """AC-8836-5, AC-8928-1 (controle): when a permission is named, a user without it who revokes is answered 403 (JSON by XHR)."""
         with self.permission_required():
             client = self.logged(self.plain)
             for label, extra in (('navigation', {}), ('xhr', AJAX)):
@@ -460,7 +460,7 @@ class TaskFormStatusAccessTest(TestCase):
             self.assertEqual(json.loads(response.content), {'status': True})
 
     def test_a_user_without_the_named_permission_is_forbidden_even_on_a_task_he_does_not_own(self):
-        """AC-8836-4, AC-8836-5, AC-8835-12: with the owner check on (the default), a user without the named permission is answered 403, never the owner's 404."""
+        """AC-8836-4, AC-8836-5, AC-8928-1 (controle): with the owner check on (the default), a user without the named permission is answered 403, never the owner's 404."""
         # O `setUp` desliga o dono para medir só o gate; aqui ele volta ao padrão. A permissão tem de ser conferida ANTES do
         # dono (`CommandGateMixin.dispatch`: `has_permission` em views.py:143, `task_denial` em :146): se a ordem se
         # invertesse, quem não tem a permissão e não é dono receberia o 404 do dono, e o 403 dos critérios deixaria de
@@ -488,6 +488,23 @@ class TaskFormStatusAccessTest(TestCase):
                                 self.assertEqual(json.loads(response.content), {'task': None})
                             self.assertNoTaskData(response, '%s %s' % (method, label))
                 self.revoke.assert_not_called()
+
+    def test_every_http_method_is_denied_at_the_gate_by_xhr(self):
+        """AC-8928-1 (controle): by XHR, the denial for lack of login or of the named permission is a 403 with any method (JSON with `task` null, but for HEAD)."""
+        # O gate vem antes do método (views.py:204-217): PUT, PATCH, DELETE, OPTIONS e TRACE não chegam ao 405 da view.
+        methods = tuple(View.http_method_names)
+        self.assertIn('put', methods, msg='precondition: the sweep includes the methods the view does not handle')
+        with self.permission_required():
+            self.assertReads(self.logged(self.runner), 'the holder of the permission', **AJAX)
+            for who, client in (('anonymous', self.client), ('no permission', self.logged(self.plain))):
+                for method in methods:
+                    with self.subTest(who=who, method=method):
+                        response = getattr(client, method)(status_url(DONE_ID), **AJAX)
+                        self.assertEqual(response.status_code, 403, msg='%s %s: must be denied at the gate, not answered 405' % (who, method))
+                        if method != 'head':  # o cliente de teste descarta o corpo da resposta ao HEAD
+                            self.assertEqual(json.loads(response.content), {'task': None})
+                            self.assertNoTaskData(response, '%s %s' % (who, method))
+        self.revoke.assert_not_called()
 
     def test_every_denial_is_marked_no_store(self):
         """AC-8864-4 (controle): every denial (login or permission, by navigation or XHR) is no-store, even off the URLconf."""

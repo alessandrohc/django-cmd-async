@@ -26,6 +26,7 @@ from unittest import mock
 
 from celery import Celery
 from celery.result import AsyncResult as RealAsyncResult
+from django.conf import settings as project_settings
 from django.contrib.auth.models import AnonymousUser
 from django.core.cache import caches
 from django.test import Client, RequestFactory, SimpleTestCase, TestCase
@@ -241,7 +242,7 @@ class EmptyIdKeptTest(EmptyIdTestCase):
                         self.assertEqual(self.touched(), [], msg='%s %s: nothing of Celery may be asked' % (method, label))
 
     def test_the_gate_denies_an_empty_id_as_it_denies_any_id(self):
-        """AC-8867-6 (controle): the login and the permission come before the empty id: anonymous and no-permission users are denied as with any id."""
+        """AC-8928-2 (controle): the login and the permission come before the empty id: anonymous and no-permission users are denied as with any id."""
         anonymous = Client(raise_request_exception=False)
         plain = self.logged(self.plain)
         with self.permission_required():
@@ -267,6 +268,21 @@ class EmptyIdKeptTest(EmptyIdTestCase):
                             self.assertEqual(response.status_code, 403, msg='no permission, XHR: forbidden')
                             if method != 'head':
                                 self.assertEqual(json.loads(response.content), NOT_FOUND)
+
+    def test_the_empty_id_sends_the_anonymous_to_the_login_url_the_package_names(self):
+        """AC-8928-2 (controle): the anonymous navigation to the empty id goes to ``COMMANDS_ASYNC_LOGIN_URL``, not to the project's ``LOGIN_URL``."""
+        # O LOGIN_URL do projeto de teste é '/login/' e a configuração do pacote o herda, então o teste do id vazio acima não
+        # distingue os dois (test_views.py:403-405). Aqui o host aponta o pacote para outro lugar; a view lê a configuração na chamada.
+        elsewhere = '/elsewhere/'
+        self.assertNotEqual(project_settings.LOGIN_URL, elsewhere, msg='precondition: the two login pages differ')
+        anonymous = Client(raise_request_exception=False)
+        with mock.patch.object(app_settings, 'COMMANDS_ASYNC_LOGIN_URL', elsewhere):
+            for owned in (True, False):
+                with self.ownership(owned):
+                    for method in METHODS:
+                        with self.subTest(ownership=owned, method=method):
+                            response = self.call(anonymous, method)
+                            self.assertRedirects(response, '%s?next=%s' % (elsewhere, EMPTY_URL), fetch_redirect_response=False)
 
     def test_with_the_owner_check_on_a_view_mounted_without_a_task_id_is_answered_not_found(self):
         """AC-8867-8 (controle): with the owner check on, the view mounted off the package URLconf, called without a task id, answers 404 with `task` null."""
