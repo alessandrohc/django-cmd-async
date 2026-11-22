@@ -344,9 +344,10 @@ class OwnerFormTest(OwnerTestCase):
                 self.assertIn(task_id, '\n'.join(logs.output), msg='%s: the error must name the task' % alias)
 
     def test_a_refused_task_records_no_owner(self):
-        """AC-8864-15 (controle): a broker that refuses the task is answered 400 and leaves nothing in the registry."""
+        """AC-8944-6 (controle): a broker that refuses the task is answered 400 and leaves nothing in the registry."""
         owner = self.logged(self.owner)
-        with mock.patch('commands_async.views.command_exec') as task:
+        with mock.patch('commands_async.views.precheck_before_launch'), \
+                mock.patch('commands_async.views.command_exec') as task:
             task.apply_async.side_effect = RuntimeError('broker is down')
             response = owner.post(INDEX_URL, {'app_command': 'test_cmdasync.cmdasync_echo', 'args': '', 'kwargs': ''}, **AJAX)
 

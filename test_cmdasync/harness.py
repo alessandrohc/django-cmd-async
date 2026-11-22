@@ -28,8 +28,12 @@ def launch(client, task_id):
 
     The task is launched the way the page does it (XHR post), so what the view records about its owner is
     recorded as in use. The precondition is checked here: the launch answers the id it was given.
+
+    A conferência do broker antes do disparo (``precheck_before_launch``, #8944) é trocada: o ``celery_app`` do teste é o
+    padrão, ou um ``MagicMock`` que o AC-8864-7 exige intocado, e nenhum disparo daqui toca um broker.
     """
-    with mock.patch('commands_async.views.command_exec') as task:
+    with mock.patch('commands_async.views.precheck_before_launch'), \
+            mock.patch('commands_async.views.command_exec') as task:
         task.apply_async.return_value = queued_task(task_id)
         response = client.post(INDEX_URL, {'app_command': 'test_cmdasync.cmdasync_echo', 'args': '', 'kwargs': ''},
                                **AJAX)

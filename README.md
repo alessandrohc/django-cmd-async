@@ -132,6 +132,21 @@ port answers in 2 seconds and an address with no route in 4. Sentinel and cluste
 measured (with `N` unreachable sentinels the check should cost about `N` seconds), and a broker
 that is alive but slow is not limited by the check.
 
+The execution form makes the same check right before it queues the command. It comes after the
+refusal of an ignored command or of a user without the permission, which never touch the broker.
+Without it the form waits for the broker as long as opening the connection takes: with an address
+that does not answer, more than 100 seconds were measured, while Celery gives up on a refused port
+in about 1.3 seconds. With the check the form answers the usual `400` (`command <name> failed to
+execute`) in about 2 seconds for a refused port and about 4 for an address with no route (the
+slowest of 6 rounds took 4.35 seconds), with no task, and the text of the error and the address of
+the broker only reach the log of the package. A host that runs Celery in synchronous mode
+(`task_always_eager`) skips the check, because the task runs in the process with no broker. A host
+that wraps `shared_task` to swallow connection errors (as the `plus` project does) used to see this
+failure in its own log; the exception now reaches the log of this package, with the traceback. The
+same limits apply: only a `redis://` broker on one host was measured, and a test that submits the
+form without replacing `commands_async.views.precheck_before_launch` opens one connection to the
+broker of its environment.
+
 ### The status query and the result backend
 
 When a read of the Celery result backend raises (the backend refuses the connection, does not

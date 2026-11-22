@@ -79,6 +79,10 @@ class TaskFormViewPostTest(TestCase):
 
     def setUp(self):
         self.client.force_login(self.user)
+        # a conferência do broker antes do disparo (#8944) é trocada: o `celery_app` destes testes é o padrão e nenhum toca um broker
+        precheck = mock.patch('commands_async.views.precheck_before_launch')
+        precheck.start()
+        self.addCleanup(precheck.stop)
 
     def test_valid_submit_returns_the_queued_task_id_and_command_name(self):
         """AC-8864-14 (controle): a valid submit answers the id of the queued task and the command name."""
@@ -118,7 +122,7 @@ class TaskFormViewPostTest(TestCase):
         task.apply_async.assert_not_called()
 
     def test_broker_failure_returns_a_field_error_and_is_logged(self):
-        """AC-8864-15 (controle): a broker that refuses the task is answered 400 with the field error, and logged."""
+        """AC-8944-6 (controle): a broker that refuses the task is answered 400 with the field error, and logged."""
         with mock.patch('commands_async.views.logger') as logger, \
                 mock.patch('commands_async.views.command_exec') as task:
             task.apply_async.side_effect = RuntimeError('broker is down')
@@ -187,6 +191,7 @@ class TaskFormViewGatingTest(TestCase):
     def test_submit_with_the_required_permission_reaches_the_broker(self):
         permission = grant(self.user, 'run_commands')
         with mock.patch.object(TaskFormView, 'command_permission_name', permission), \
+                mock.patch('commands_async.views.precheck_before_launch'), \
                 mock.patch('commands_async.views.command_exec') as task:
             task.apply_async.return_value = queued_task()
             response = self.client.post(INDEX_URL, payload(), **AJAX)

@@ -68,7 +68,7 @@ workers_window = {'at': None, 'kind': None, 'names': ()}
 workers_lock = threading.Lock()
 WORKERS_LISTED, WORKERS_NOBODY, WORKERS_FAILED = 'listed', 'nobody', 'failed'
 
-#: limites da pré-verificação do broker (AC-8879-7). O Celery do projeto espera até 300 s, em até 100 tentativas, por um broker
+#: limites da pré-verificação do broker (AC-8879-7; o formulário de execução a usa também: AC-8944-1 e AC-8944-5). O Celery do projeto espera até 300 s, em até 100 tentativas, por um broker
 #: que não responde (`plus_base/settings/publique.py:814` e `:818`) e a rota seguraria a thread do pedido esse tempo todo: aqui
 #: a conexão e a leitura do socket têm 1 s, e a verificação toda 2 s por uma tentativa a mais. Medido no #8879 com `redis://`
 #: de um host só: porta recusada 2,0 s e endereço sem rota 4,0 s; Sentinel e cluster não foram medidos. Mudar estes limites pede
@@ -79,7 +79,7 @@ BROKER_PRECHECK_TIMEOUT = 2
 
 
 def broker_precheck():
-    """Confere que o broker aceita conexão, em tempo limitado; o que o kombu levantar sobe até o `except` da rota.
+    """Confere que o broker aceita conexão, em tempo limitado; o que o kombu levantar sobe até o `except` da rota ou do formulário.
 
     Os timeouts vão no pedido da conexão, e não lidos do `celery_app.conf`: o Celery mescla as `broker_transport_options` do app
     com as passadas e o `connect_timeout` explícito vence o da configuração (`celery/app/base.py:1061-1066`). O `with` solta a
@@ -90,6 +90,22 @@ def broker_precheck():
                                'socket_timeout': BROKER_PRECHECK_SOCKET_TIMEOUT},
             connect_timeout=BROKER_PRECHECK_SOCKET_TIMEOUT) as connection:
         connection.ensure_connection(max_retries=1, timeout=BROKER_PRECHECK_TIMEOUT)
+
+
+def precheck_before_launch():
+    """Confere o broker antes do disparo do formulário de execução (#8944), a não ser que o Celery rode em modo síncrono.
+
+    Em modo síncrono (`task_always_eager`) o `apply_async` roda a tarefa no próprio processo, sem broker: a pré-verificação o
+    faria falhar onde hoje funciona (medido: 0,08 s com o broker morto, contra 2,0 s e uma falha da pré-verificação). Fora
+    dele, o `apply_async` espera o que a abertura da conexão deixar (mais de 100 s com o endereço sem rota; o `retry_policy`
+    de publicação do Celery só limita as tentativas depois de aberta) e a pré-verificação responde em ~2 s com a conexão
+    recusada e em ~4 s sem rota. O que ela levantar sobe até o `except` do formulário, que responde a mesma 400 de sempre.
+
+    É uma função do módulo, e não a leitura da flag dentro do `form_valid`, para os testes a trocarem sem tocar o `celery_app`
+    que um deles põe em `MagicMock` (a leitura da flag ali ficaria registrada nas chamadas do dublê).
+    """
+    if not celery_app.conf.task_always_eager:
+        broker_precheck()
 
 
 def is_task_id(task_id):
@@ -282,6 +298,8 @@ class TaskFormView(CommandPermissionMixin, FormView):
                     'form': {'errors': {'app_command': [_("not allowed to run this command")]}}
                 }, status=400)
         try:
+            # confere o broker antes do disparo: o `apply_async` espera sem limite por um broker sem rota (#8944)
+            precheck_before_launch()
             task = command_exec.apply_async(args=(app_command,) + command_args,
                                             kwargs=command_kwargs,
                                             priority=settings.COMMANDS_ASYNC_TASK_PRIORITY)

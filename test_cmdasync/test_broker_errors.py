@@ -24,8 +24,9 @@ from kombu.exceptions import OperationalError
 
 from commands_async import settings as app_settings
 from commands_async import views
-from commands_async.views import CeleryWorkerStatus
-from test_cmdasync.harness import WORKERS_URL, create_user, launch, reset_workers_window, status_url
+from commands_async.views import CeleryWorkerStatus, TaskFormView
+from test_cmdasync.harness import (AJAX, INDEX_URL, WORKERS_URL, create_user, launch, queued_task, reset_workers_window,
+                                   status_url)
 
 # O erro de teste leva um canário de host e porta, como o texto do kombu (medido: "Error 111 connecting to <host>:<porta>.").
 CANARY = 'broker-canary-8879.internal:6379'
@@ -442,3 +443,158 @@ class WorkersWindowTest(BrokerTestCase):
         self.assertEqual(len({body for _, body in answers}), 1, msg='every query gets the same result')
         self.assertEqual(json.loads(answers[0][1])['workers'], [WORKER])
         self.assertEqual(self.inspect.call_count, 1, msg='the workers must be asked once for %d simultaneous queries' % count)
+
+
+# O formulário de execução (#8944). O comando é o `cmdasync_echo` do app de teste; o endereço do app real é uma porta local recusada.
+ECHO = 'cmdasync_echo'
+COMMAND = {'app_command': 'test_cmdasync.cmdasync_echo', 'args': '', 'kwargs': ''}
+FORM_TASK = 'form-task-8944'
+FORM_FAILED = 'command cmdasync_echo failed to execute'
+FORM_FAILED_PT_BR = 'falha ao executar o comando cmdasync_echo'
+NOT_ALLOWED = 'not allowed to run this command'
+REFUSED_BROKER = 'redis://127.0.0.1:1/0'
+REFUSED_ADDRESS = '127.0.0.1'
+
+
+class FormBrokerTestCase(BrokerTestCase):
+    """O formulário de execução diante do broker (#8944): o `celery_app` é um app REAL de Celery (ou um dublê, nos testes de
+    recusa), o `command_exec` é trocado por um dublê que devolve a tarefa e a `precheck_before_launch` é a função REAL (quem a
+    troca são o `launch` do harness e os testes de `test_views` e `test_task_owner`, que não medem o broker)."""
+
+    LIMIT = 5.0       # o critério: «em até 5 segundos»
+    GUARD = 12.0      # o teste não espera mais que isso: sem a pré-verificação a resposta não vem, e o teste tem de falhar, não travar
+
+    def use_app(self, broker, eager=False):
+        """Troca o `celery_app` do pacote por um app real com a configuração do projeto (`plus_base/settings/publique.py:814-818`:
+        espera de 300 s, 100 tentativas e as `broker_transport_options` sem timeout de socket)."""
+        app = Celery('form-broker-8944', broker=broker, set_as_current=False)
+        app.conf.update(broker_connection_timeout=300.0, broker_connection_max_retries=100, broker_connection_retry=True,
+                        broker_transport_options={'priority_steps': [0, 3, 6, 9], 'health_check_interval': 30},
+                        task_always_eager=eager)
+        self.addCleanup(app.close)
+        real = mock.patch('commands_async.views.celery_app', app)
+        real.start()
+        self.addCleanup(real.stop)
+        return app
+
+    def submit(self, label):
+        """Submete o formulário por XHR, como o dono, com o `command_exec` trocado; devolve a resposta, o tempo e o dublê."""
+        client = self.logged(self.owner)
+        with mock.patch('commands_async.views.command_exec') as task:
+            task.apply_async.return_value = queued_task(FORM_TASK)
+            started = time.monotonic()
+            try:
+                with time_limit(self.GUARD):
+                    response = client.post(INDEX_URL, COMMAND, **AJAX)
+            except Hung:
+                self.fail('%s: no answer after %.0f s with the broker down (the limit is %.0f s)'
+                          % (label, self.GUARD, self.LIMIT))
+        return response, time.monotonic() - started, task
+
+
+class FormBrokerDownTest(FormBrokerTestCase):
+    """O broker que recusa a conexão: o formulário responde a falha em até 5 s, sem disparar a tarefa."""
+
+    def test_a_refused_connection_is_answered_400_within_the_limit_and_nothing_is_dispatched(self):
+        """AC-8944-1: with the Redis broker refusing the connection, the form answers 400 with the error on the command field, dispatches nothing, within 5 seconds."""
+        self.use_app(REFUSED_BROKER)
+        response, elapsed, task = self.submit('refused connection')
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('app_command', json.loads(response.content)['form']['errors'])
+        task.apply_async.assert_not_called()
+        self.assertLessEqual(elapsed, self.LIMIT, msg='answered after %.1f s' % elapsed)
+
+    def test_a_broker_that_accepts_the_connection_still_gets_the_task(self):
+        """AC-8944-1 (controle): the real pre-check passes against a broker that accepts the connection, and the form answers the task."""
+        self.use_app('memory://')
+        response, elapsed, task = self.submit('accepting broker')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.content)['task']['id'], FORM_TASK)
+        task.apply_async.assert_called_once()
+
+    def test_the_failure_answer_is_the_fixed_phrase_without_the_task_the_error_or_the_address(self):
+        """AC-8944-2: the broker failure is answered with only the fixed phrase (in English, and translated when there is a translation), with no task id, no error text and no broker address."""
+        self.use_app(REFUSED_BROKER)
+        for label, language, phrase in (('english', 'en', FORM_FAILED), ('pt_BR', 'pt-br', FORM_FAILED_PT_BR)):
+            with self.subTest(language=label):
+                translation.activate(language)
+                response, _, _ = self.submit(label)
+                body = response.content.decode('utf-8')
+
+                self.assertEqual(response.status_code, 400, msg='precondition: the broker failure is answered 400')
+                self.assertEqual(json.loads(body), {'form': {'errors': {'app_command': [phrase]}}})
+                self.assertNotIn('"task"', body, msg='the answer of a failure must not carry a task id')
+                self.assertNotIn(REFUSED_ADDRESS, body, msg='the address of the broker must not reach the user')
+                self.assertNotIn('Connection refused', body, msg='the text of the error must not reach the user')
+
+    def test_the_failure_leaves_the_error_in_the_log_with_the_detail_of_the_exception(self):
+        """AC-8944-7: the broker failure of the form is logged by the package with the detail of the exception."""
+        self.use_app(REFUSED_BROKER)
+        with self.assertLogs(views.logger, level='ERROR') as logs:
+            response, _, _ = self.submit('log')
+        text = '\n'.join(logs.output)
+
+        self.assertEqual(response.status_code, 400, msg='precondition: the broker failure is answered 400')
+        self.assertIn('failed to execute ' + ECHO, text)
+        self.assertIn(REFUSED_ADDRESS, text, msg='the detail of the exception must be in the log of the package')
+        self.assertIn('OperationalError', text)
+
+    def test_the_synchronous_mode_dispatches_without_opening_a_connection_to_the_broker(self):
+        """AC-8944-3 (controle): with Celery in synchronous mode the form dispatches the command although the broker is down."""
+        self.use_app(REFUSED_BROKER, eager=True)
+        response, elapsed, task = self.submit('synchronous mode')
+
+        self.assertEqual(response.status_code, 200,
+                         msg='the broker must not be checked in synchronous mode (the dead broker would answer 400)')
+        self.assertEqual(json.loads(response.content)['task']['id'], FORM_TASK)
+        task.apply_async.assert_called_once()
+        self.assertLessEqual(elapsed, self.LIMIT, msg='answered after %.1f s' % elapsed)
+
+
+class FormRefusalTest(FormBrokerTestCase):
+    """As recusas do formulário (comando ignorado e usuário sem a permissão) vêm antes de qualquer conexão com o broker."""
+
+    def setUp(self):
+        super().setUp()
+        # O dublê do app fica FORA do modo síncrono: a função real lê a flag e chamaria a pré-verificação; com o `MagicMock`
+        # «verdadeiro» ela a dispensaria e o teste ficaria cego à ordem (a pré-verificação antes da recusa passaria).
+        self.celery_app.conf.task_always_eager = False
+        precheck = mock.patch('commands_async.views.broker_precheck')
+        self.precheck = precheck.start()
+        self.addCleanup(precheck.stop)
+
+    @staticmethod
+    def refusals():
+        return (('a command on the ignore list', lambda: mock.patch.object(TaskFormView, 'commands_skip', [ECHO])),
+                ('a user without the permission',
+                 lambda: mock.patch.object(TaskFormView, 'command_permission_name', 'auth.run_commands')))
+
+    def test_a_refusal_opens_no_connection_to_the_broker(self):
+        """AC-8944-4: a command on the ignore list, or a user without the named permission, is refused without opening a connection to the broker, by XHR and without XHR."""
+        client = self.logged(self.owner)
+        with mock.patch('commands_async.views.command_exec') as task:
+            task.apply_async.return_value = queued_task(FORM_TASK)
+            allowed = client.post(INDEX_URL, COMMAND, **AJAX)
+        self.assertEqual(allowed.status_code, 200, msg='precondition: a permitted submit is dispatched')
+        self.precheck.assert_called_once_with()   # precondição: com o modo síncrono desligado, a pré-verificação do disparo roda
+        self.precheck.reset_mock()
+        self.celery_app.reset_mock()
+
+        for label, patcher in self.refusals():
+            for by_xhr in (True, False):
+                with self.subTest(refusal=label, xhr=by_xhr):
+                    with patcher(), mock.patch('commands_async.views.command_exec') as task:
+                        response = client.post(INDEX_URL, COMMAND, **(AJAX if by_xhr else {}))
+
+                    self.precheck.assert_not_called()
+                    self.celery_app.connection_for_write.assert_not_called()
+                    # nenhuma outra API do app (`connection_for_read`, `control`…) pode ser usada para abrir conexão
+                    self.assertEqual(self.celery_app.mock_calls, [], msg='a refusal must not touch the Celery app')
+                    task.apply_async.assert_not_called()
+                    if by_xhr:
+                        self.assertEqual(response.status_code, 400)
+                        self.assertEqual(json.loads(response.content)['form']['errors']['app_command'], [NOT_ALLOWED])
+                    else:
+                        self.assertEqual(response.status_code, 403)
