@@ -11,10 +11,10 @@ o que o `redis-py` levantaria): a cadeia do Celery acima dela (`AsyncResult` -> 
 verdade, e o `AsyncResult` não é dublado. O pacote não depende do `redis` (`pyproject.toml`: `celery>=5.5`): nenhum teste importa
 `redis` nem abre conexão, e a falha é de tipos do Python que um backend levanta (conexão recusada, tempo esgotado, exceção qualquer).
 
-Uma tarefa em PENDING (id que o backend não conhece) custa 3 leituras da chave por consulta (`ready()`, `failed()` e `result`): o
-Celery só guarda em cache o resultado pronto (`celery/result.py:433-445`). Por isso a leitura que falha é a 1ª, a 2ª ou a 3ª, e os
-testes usam ids que nunca foram gravados. O estado do `cache+memory://` é global no processo (`celery/backends/cache.py:25`): cada
-teste usa ids próprios e eles só leem dele.
+A consulta lê o estado da tarefa uma vez só (#8962; antes eram até 3 leituras da chave por consulta, `ready()`, `failed()` e `result`, porque
+o Celery só guarda em cache o resultado pronto, `celery/result.py:433-445`): a leitura que falha é a 1ª e a única. O número de leituras
+por estado é do `test_status_single_read.py`. Os testes usam ids que nunca foram gravados (PENDING). O estado do `cache+memory://` é
+global no processo (`celery/backends/cache.py:25`): cada teste usa ids próprios e eles só leem dele.
 
 A posse (`COMMANDS_ASYNC_TASK_OWNERSHIP`) é trocada no módulo `commands_async.settings`, que a view lê na hora do uso (o ponto de
 substituição do #8864). O cliente de teste não levanta a exceção da view (`raise_request_exception=False`): o 500 que o servidor
@@ -45,8 +45,8 @@ ERRORS = (
     ('timeout', lambda: TimeoutError('Timeout reading from %s' % BACKEND_ADDRESS)),
     ('any other error', lambda: RuntimeError('backend exploded at %s' % BACKEND_ADDRESS)),
 )
-#: a leitura que falha, entre as 3 de uma tarefa em PENDING
-READS = (1, 2, 3)
+#: a leitura que falha: a consulta faz uma só (#8962); com as 3 de antes, a 2ª e a 3ª também eram testadas
+READS = (1,)
 METHODS = ('get', 'head')
 OWNED = (True, False)
 
@@ -158,12 +158,11 @@ class BackendFailureTestCase(TestCase):
             tasks.logger.removeHandler(handler)
             tasks.logger.propagate = propagate
 
-    def assertServedWithThreeReads(self, response, task_id, label):
-        """O controle positivo: com o backend respondendo, a tarefa em PENDING é servida, e custa as 3 leituras que o plano supõe."""
+    def assertServedPending(self, response, task_id, label):
+        """O controle positivo: com o backend respondendo, a tarefa em PENDING é servida (o número de leituras é do `test_status_single_read.py`)."""
         self.assertEqual(response.status_code, 200, msg='%s: a healthy backend must be served' % label)
         self.assertEqual(json.loads(response.content),
                          {'task': {'id': task_id, 'ready': False, 'failed': False, 'output': None}}, msg=label)
-        self.assertEqual(len(self.reads), 3, msg='%s: a pending task costs three reads of the backend' % label)
 
 
 class BackendFailureAnswerTest(BackendFailureTestCase):
@@ -176,7 +175,7 @@ class BackendFailureAnswerTest(BackendFailureTestCase):
                 with self.ownership(owned):
                     self.healthy()
                     response, task_id = self.query(owned, 'get', 'precondition')
-                    self.assertServedWithThreeReads(response, task_id, 'precondition (owned=%s)' % owned)
+                    self.assertServedPending(response, task_id, 'precondition (owned=%s)' % owned)
                     for method in METHODS:
                         for read in READS:
                             for kind, make_error in ERRORS:
@@ -221,7 +220,7 @@ class BackendFailureAnswerTest(BackendFailureTestCase):
             with self.ownership(owned), self.package_log():
                 self.healthy()
                 response, task_id = self.query(owned, 'get', 'precondition')
-                self.assertServedWithThreeReads(response, task_id, 'precondition (owned=%s)' % owned)
+                self.assertServedPending(response, task_id, 'precondition (owned=%s)' % owned)
                 for method in METHODS:
                     for read in READS:
                         for kind, make_error in ERRORS:
@@ -260,13 +259,13 @@ class BackendFailureAnswerTest(BackendFailureTestCase):
                 with self.ownership(owned):
                     self.healthy()
                     response, task_id = self.query(owned, 'get', 'holder-precondition')
-                    self.assertServedWithThreeReads(response, task_id, 'precondition: the holder of the named permission is served (owned=%s)' % owned)
+                    self.assertServedPending(response, task_id, 'precondition: the holder of the named permission is served (owned=%s)' % owned)
                     self.assertEqual(plain.get(status_url(self.task_id('holder-plain'))).status_code, 403,
                                      msg='precondition: the named permission is in force (the user without it is forbidden)')
-                    # a 2ª leitura falha: a 1ª respondeu e a 3ª não pode sair (o que separa a parada na falha de uma leitura que segue)
+                    # a leitura falha (a única da consulta): nenhuma leitura pode sair depois dela
                     kind, make_error = ERRORS[1]
-                    with self.subTest(owned=owned, read=2, error=kind):
-                        self.fails_on(2, make_error)
+                    with self.subTest(owned=owned, read=1, error=kind):
+                        self.fails_on(1, make_error)
                         records[:] = []
                         response, task_id = self.query(owned, 'get', 'holder-failing')
                         self.assertEqual(response.status_code, 503, msg='a failing read must be answered 503 for the holder of the permission too')
@@ -276,9 +275,9 @@ class BackendFailureAnswerTest(BackendFailureTestCase):
                         errors = [record for record in records if record.levelno >= logging.ERROR]
                         self.assertEqual(len(errors), 1, msg='the failure must be logged once, as an error')
                         self.assertNotIn(task_id, errors[0].getMessage(), msg='the message of the record must not carry the task id')
-                        self.assertEqual(len(self.reads), 2, msg='the reads must stop at the one that failed')
-                    with self.subTest(owned=owned, read=2, error=kind, route='direct'):
-                        self.fails_on(2, make_error)
+                        self.assertEqual(len(self.reads), 1, msg='the reads must stop at the one that failed')
+                    with self.subTest(owned=owned, read=1, error=kind, route='direct'):
+                        self.fails_on(1, make_error)
                         response = self.direct(owned, 'holder-direct')
                         self.assertEqual(response.status_code, 503, msg='precondition: the failing read is answered 503')
                         self.assertIn('no-store', response.headers.get('Cache-Control', ''), msg='the 503 must be no-store, off the URLconf')
@@ -288,12 +287,12 @@ class BackendRespondingTest(BackendFailureTestCase):
     """O que continua igual com o backend respondendo, provado com o backend de resultado de verdade."""
 
     def test_a_healthy_backend_serves_the_task(self):
-        """AC-8945-5, AC-8945-6 (controle): with the result backend answering, the query of a pending task is served 200 with its id, state and output, with the owner check on or off."""
+        """AC-8962-3, AC-8945-6 (controle): with the result backend answering, the query of a pending task is served 200 with its id, state and output, with the owner check on or off."""
         for owned in OWNED:
             with self.subTest(owned=owned), self.ownership(owned):
                 self.healthy()
                 response, task_id = self.query(owned, 'get', 'healthy')
-                self.assertServedWithThreeReads(response, task_id, 'owned=%s' % owned)
+                self.assertServedPending(response, task_id, 'owned=%s' % owned)
                 self.assertIn('no-store', response.headers.get('Cache-Control', ''), msg='a served answer is no-store')
 
 

@@ -376,6 +376,46 @@ class CeleryWorkerStatus(CommandGateMixin, View):
         return {'status': False, 'workers': [], 'message': message}
 
 
+class _ResultSnapshot:
+    """O backend de resultado de UMA consulta: lê a meta da tarefa uma vez e responde com ela as leituras seguintes (#8962).
+
+    O `AsyncResult` do Celery só guarda em cache o resultado pronto (`celery/result.py:433-445`): o `ready()`, o `failed()`, o
+    `result` e o `traceback` de uma tarefa pendente, iniciada ou em nova tentativa pediam, cada um, a chave ao backend (3 leituras
+    por consulta), e a tarefa podia mudar de estado entre elas. Os quatro passam por `backend.get_task_meta` (`_get_task_meta`,
+    `result.py:442-445`); este objeto, passado no lugar do backend, faz a consulta ler uma vez e montar a resposta de um estado só,
+    com o mesmo código de antes.
+
+    O backend do app só é resolvido na primeira vez que alguém o pede, e isso acontece dentro do `try` da rota: um backend que não
+    monta continua dando 503, e o app e o `AsyncResult` que os testes do host trocam por dublês nunca o tocam. A meta só é guardada
+    depois de a leitura voltar: a que levanta não fica guardada. O resto (`READY_STATES`, `meta_from_decoded`, ...) é do backend do app.
+    """
+
+    def __init__(self, app):
+        self._app = app
+        self._backend = None
+        self._metas = {}
+
+    def _resolve(self):
+        if self._backend is None:
+            self._backend = self._app.backend
+        return self._backend
+
+    def get_task_meta(self, task_id, *args, **kwargs):
+        if task_id not in self._metas:
+            self._metas[task_id] = self._resolve().get_task_meta(task_id, *args, **kwargs)
+        return self._metas[task_id]
+
+    def remove_pending_result(self, result):
+        """O `__del__` do `AsyncResult` o chama (`celery/result.py:416-419`) e, com o backend que não monta, repassar pelo `__getattr__`
+        reabriria `celery_app.backend` e levantaria de novo (um «erro ignorado» no stderr a cada consulta): só repassa se o backend
+        já foi resolvido, que é a mesma chamada ao mesmo backend de antes."""
+        if self._backend is not None:
+            self._backend.remove_pending_result(result)
+
+    def __getattr__(self, name):
+        return getattr(self._resolve(), name)
+
+
 class TaskFormStatus(CommandGateMixin, View):
     """Reads and revokes a task, for an authenticated user who may run commands.
 
@@ -406,9 +446,10 @@ class TaskFormStatus(CommandGateMixin, View):
     def get(self, request, **kwargs):
         """Reports task status.
 
-        Only the reads of the result backend sit under the ``try`` (``ready()``, ``failed()`` and then ``traceback`` or ``result``:
-        a task that is not ready costs one read each). When one of them raises, the route stops at that read, logs the error and
-        answers 503 with ``{"task": null}``: the text of the error carries the address of the backend, so it goes to the log and
+        Only the reads of the result backend sit under the ``try`` (``ready()``, ``failed()`` and then ``traceback`` or ``result``).
+        They are served by at most one read of the state per query (``_ResultSnapshot``; the retries the backend client makes below
+        Celery do not count), so the body describes one state and a task that is not ready costs one read, not one per field. When
+        that read raises, the route stops at it, logs the error and answers 503 with ``{"task": null}``: the text of the error carries the address of the backend, so it goes to the log and
         never to the answer, and the message of the record leaves out the task id (client text when the owner check is off).
 
         The route adds no time limit of its own: how long a read waits for a backend that does not answer is what the Celery of
@@ -418,7 +459,7 @@ class TaskFormStatus(CommandGateMixin, View):
         """
         task_id = str(kwargs.get("task_id"))
         try:
-            async_result = AsyncResult(id=task_id, app=celery_app)
+            async_result = AsyncResult(id=task_id, app=celery_app, backend=_ResultSnapshot(celery_app))
             data = {
                 'task': {
                     'id': async_result.id,
