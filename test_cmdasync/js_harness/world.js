@@ -23,7 +23,17 @@
  *   - `attr('disabled')` reflete `prop('disabled')`; `.text(undefined)` não faz nada (o getter-setter
  *     do jQuery trata o `undefined` como "nenhum valor"); botão desabilitado não recebe clique;
  *   - o jQuery é no-op em conjunto vazio: um seletor que não existe na página devolve um conjunto
- *     vazio, sem erro.
+ *     vazio, sem erro;
+ *   - `.on(evento, fn)` registra o evento pelo texto exato: `'input'` e `'change'` são dois `.on`. A lista de eventos do jQuery
+ *     (`.on('input change', fn)`) NÃO é modelada, e o script da página usa uma chamada por evento (#9019);
+ *   - anexar um elemento que já está anexado o MOVE do pai antigo para o novo (a regra do DOM: `appendChild`; o `append` do jQuery
+ *     entregue chama `appendChild`), e `.remove()` tira o elemento do pai (jquery-3.7.1.min.js: `remove` chama a função que faz
+ *     `parentNode.removeChild`); `$('.invalid-feedback')` acha os elementos criados em execução e ainda anexados (#9019);
+ *   - `.val(x)` só grava o valor: nunca dispara `input` nem `change` (#9019); o que o script grava num campo por `.val(x)` fica em
+ *     `scriptWrites` de cada nó (o `world.type` atribui direto, como o navegador ao digitar, e não entra): é o registro de que o
+ *     espelho do texto não regrava o campo em que se digita (regravá-lo durante uma composição de IME a quebra) (#9019);
+ *   - `markupSinks` lista o que o script entregou ao jQuery como MARCAÇÃO: `.html()`, `append` e `prepend` de string e `$('<…>')`
+ *     com texto dentro (o `$('<div class="invalid-feedback"></div>')` vazio não leva dado e não conta) (#9019).
  */
 const fs = require('fs');
 const path = require('path');
@@ -66,14 +76,36 @@ class Node {
         this.classes = new Set(init.classes || []);
         this.textValue = init.text || '';
         this.valueStr = init.val || '';
+        // os valores que o SCRIPT gravou no campo por `.val(x)`, na ordem (o `world.type` não entra: é o usuário) (#9019)
+        this.scriptWrites = [];
         this.handlers = {};
         this.finds = {};
         this.parentNode = null;
         // o que entrou por append/prepend, na ordem: 'text' (nó de texto), 'element' ou 'string'
         this.appended = [];
-        // o texto de cada elemento que entrou por append (o `<p>` com `.text()` do aviso dos workers)
-        this.childTexts = [];
+        // os elementos que entraram por append, na ordem, cada um com a CÓPIA do texto do momento (o `<p>` com `.text()` do aviso dos
+        // workers; a mensagem de erro de um campo): é o que um `remove()` ou um novo `append` do mesmo elemento tira daqui (#9019)
+        this.childEntries = [];
     }
+
+    // o texto de cada elemento anexado, na ordem: o que o teste lê
+    get childTexts() {
+        return this.childEntries.map(function (entry) { return entry.text; });
+    }
+}
+
+// Tira o elemento do pai (o `removeChild` do DOM): o pai deixa de tê-lo e ele deixa de ter pai.
+function detach(node) {
+    const parent = node.parentNode;
+    if (!parent) return;
+    parent.childEntries = parent.childEntries.filter(function (entry) { return entry.node !== node; });
+    node.parentNode = null;
+}
+
+// O `.text(valor)` e o `.empty()` do jQuery descartam os filhos do elemento.
+function dropChildren(node) {
+    node.childEntries.forEach(function (entry) { entry.node.parentNode = null; });
+    node.childEntries = [];
 }
 
 function createWorld(options) {
@@ -85,11 +117,15 @@ function createWorld(options) {
     // texto prova que a página escreve o que o template publicou, e não o literal em inglês: a tradução, AC-8967-3);
     // failureTexts: quais dos dois textos de falha do #8961 o painel traz ('both' por padrão, 'none', 'server' ou 'network';
     // `texts: false` tira também os três antigos); queryTimeout: o valor que um script do host atribui a
-    // `cmdasyncform.query_timeout` na carga, depois do cmdhandler.js e antes do DOM ready (AC-8961-5).
+    // `cmdasyncform.query_timeout` na carga, depois do cmdhandler.js e antes do DOM ready (AC-8961-5); argsVariants: quais variantes
+    // dos campos de argumentos a página tem (#9019): 'both' (o template do pacote: a larga, `#task-args` e `#task-kwargs`, e a estreita,
+    // `#task-args-md` e `#task-kwargs-md`), 'wide' ou 'narrow' (um host de template próprio com uma variante só).
     const opts = Object.assign({commandsList: false, alertSpace: true, texts: true, workers: false, toast: 'full', noFailureReason: false,
-        failureTexts: 'both', queryTimeout: undefined}, options || {});
+        failureTexts: 'both', queryTimeout: undefined, argsVariants: 'both'}, options || {});
+    if (['both', 'wide', 'narrow'].indexOf(opts.argsVariants) < 0) throw new Error('harness: unknown argsVariants ' + opts.argsVariants);
     const world = {
         opts: opts,
+        markupSinks: [],
         toasts: [],
         requests: [],
         locations: [],
@@ -113,6 +149,8 @@ function createWorld(options) {
 
     // ---------------------------------------------------------------- DOM por seletor
     const registry = {};
+    // os elementos que o script cria em execução (`$('<div …>')` e `.clone()`): o `$('.invalid-feedback')` os acha enquanto anexados
+    const createdNodes = [];
     function add(selector, node) {
         (registry[selector] = registry[selector] || []).push(node);
         return node;
@@ -169,15 +207,26 @@ function createWorld(options) {
         toastNode.finds['.online'] = [toastBadge];
     }
     // Os campos do formulário e o nó pai de cada um: o erro de campo do 400 vai ao lado do campo (`$input.parent().append(...)`,
-    // cmdasync-page.js:164-169), então o pai é estável para o teste ler o que foi posto (`fieldErrors` no estado). O dublê tem um nó
-    // por seletor: representa a variante larga dos argumentos (os `id` se repetem nas duas variantes do template, follow-up F4).
+    // cmdasync-page.js:185-203), então o pai é estável para o teste ler o que foi posto (`fieldErrors` no estado). O dublê tem um nó
+    // por seletor. As duas variantes dos argumentos (#9019) têm cada uma o seu nó, o seu pai e o seu estado: a larga é a de sempre
+    // (`fieldParents`, `fieldErrors`, `invalidFields`) e a estreita leva `Narrow` no nome (`narrowParents`, `fieldErrorsNarrow`...);
+    // `argsVariants` omite uma delas (o host de uma variante só).
     const fieldParents = {app_command: new Node('app command parent'), args: new Node('args parent'), kwargs: new Node('kwargs parent')};
-    const argsField = add('#task-args', new Node('args'));
-    const kwargsField = add('#task-kwargs', new Node('kwargs'));
-    argsField.parentNode = fieldParents.args;
-    kwargsField.parentNode = fieldParents.kwargs;
-    add('#id_args', new Node('hidden args'));
-    add('#id_kwargs', new Node('hidden kwargs'));
+    const narrowParents = {args: new Node('args parent (narrow)'), kwargs: new Node('kwargs parent (narrow)')};
+    const wideFields = opts.argsVariants === 'narrow' ? null
+        : {args: add('#task-args', new Node('args')), kwargs: add('#task-kwargs', new Node('kwargs'))};
+    const narrowFields = opts.argsVariants === 'wide' ? null
+        : {args: add('#task-args-md', new Node('args (narrow)')), kwargs: add('#task-kwargs-md', new Node('kwargs (narrow)'))};
+    if (wideFields) {
+        wideFields.args.parentNode = fieldParents.args;
+        wideFields.kwargs.parentNode = fieldParents.kwargs;
+    }
+    if (narrowFields) {
+        narrowFields.args.parentNode = narrowParents.args;
+        narrowFields.kwargs.parentNode = narrowParents.kwargs;
+    }
+    // os campos ocultos do formulário (`forms.py`: `HiddenInput`): o que o `change` preenche é o que vai com o comando
+    const hiddenFields = {args: add('#id_args', new Node('hidden args')), kwargs: add('#id_kwargs', new Node('hidden kwargs'))};
     add('input#id_app_command', new Node('hidden command'));
     add('#form-app_name', new Node('app name'));
     const appCommand = add('#task-app-command', new Node('app command'));
@@ -243,7 +292,10 @@ function createWorld(options) {
         }
         val(value) {
             if (arguments.length === 0) return this.nodes.length ? this.nodes[0].valueStr : undefined;
-            this.nodes.forEach(function (node) { node.valueStr = String(value); });
+            this.nodes.forEach(function (node) {
+                node.valueStr = String(value);
+                node.scriptWrites.push(String(value));
+            });
             return this;
         }
         data(key) {
@@ -267,7 +319,7 @@ function createWorld(options) {
             this.nodes.forEach(function (node) {
                 node.textValue = String(value);
                 node.appended = [];
-                node.childTexts = [];
+                dropChildren(node);
             });
             return this;
         }
@@ -275,10 +327,12 @@ function createWorld(options) {
             this.nodes.forEach(function (node) {
                 node.textValue = '';
                 node.appended = [];
-                node.childTexts = [];
+                dropChildren(node);
             });
             return this;
         }
+        // Com um conjunto de VÁRIOS pais, o jQuery clona o elemento para todos menos o último; o dublê não o modela (o script anexa
+        // a um pai por vez, e a mensagem de cada campo tem o seu `.clone()`).
         append(child) {
             this.nodes.forEach(function (node) {
                 if (child && child.isTextNode) {
@@ -286,13 +340,15 @@ function createWorld(options) {
                     node.appended.push('text');
                 } else if (child && child.isJQ) {
                     child.nodes.forEach(function (inner) {
+                        detach(inner); // anexar um elemento já anexado o MOVE: ele sai do pai antigo (a regra do DOM)
                         inner.parentNode = node;
-                        node.childTexts.push(inner.textValue);
+                        node.childEntries.push({node: inner, text: inner.textValue});
                     });
                     node.appended.push('element');
                 } else {
                     // uma string chegaria ao jQuery como marcador (HTML): é o que o DomSinkTest proíbe
                     node.appended.push('string');
+                    world.markupSinks.push({sink: 'append(string)', value: String(child)});
                 }
             });
             return this;
@@ -304,11 +360,18 @@ function createWorld(options) {
                     node.appended.unshift('text');
                 } else {
                     node.appended.unshift(child && child.isJQ ? 'element' : 'string');
+                    if (!(child && child.isJQ)) world.markupSinks.push({sink: 'prepend(string)', value: String(child)});
                 }
             });
             return this;
         }
         remove() {
+            this.nodes.forEach(detach);
+            return this;
+        }
+        // O `.html()` entrega ao jQuery o que ele LÊ COMO MARCAÇÃO: o dublê não o executa, só o registra (a página não o usa).
+        html(value) {
+            world.markupSinks.push({sink: 'html', value: value === undefined ? null : String(value)});
             return this;
         }
         parent() {
@@ -318,6 +381,7 @@ function createWorld(options) {
             return new JQ(this.nodes.map(function (node) {
                 const copy = new Node(node.label + ' (clone)');
                 node.classes.forEach(function (name) { copy.classes.add(name); });
+                createdNodes.push(copy);
                 return copy;
             }));
         }
@@ -349,10 +413,17 @@ function createWorld(options) {
         if (arg && arg.isJQ) return arg;
         if (typeof arg === 'string') {
             if (arg.trim().charAt(0) === '<') {
+                // marcação SEM texto dentro (o `<div class="invalid-feedback"></div>`) não leva dado; com texto, o dado entrou como marcação
+                if (arg.replace(/<[^>]*>/g, '') !== '') world.markupSinks.push({sink: '$(markup)', value: arg});
                 const created = new Node(arg);
                 const klass = /class="([^"]*)"/.exec(arg);
                 if (klass) klass[1].split(/\s+/).filter(Boolean).forEach(function (name) { created.classes.add(name); });
+                createdNodes.push(created);
                 return new JQ([created]);
+            }
+            // a mensagem de erro de um campo: os elementos criados em execução com essa classe que ainda estão anexados
+            if (arg === '.invalid-feedback') {
+                return new JQ(createdNodes.filter(function (node) { return node.parentNode && node.classes.has('invalid-feedback'); }));
             }
             return new JQ((registry[arg] || []).slice());
         }
@@ -561,6 +632,19 @@ function createWorld(options) {
         });
         return true;
     };
+    // O usuário muda o texto de um campo (#9019): o valor novo entra no campo e, em seguida, o navegador dispara cada evento da lista
+    // (`input` a cada tecla ou ao colar; `change` ao sair do campo), com `this` = o campo. O padrão são os dois, na ordem do navegador.
+    world.type = function (selector, text, events, index) {
+        const node = (registry[selector] || [])[index || 0];
+        if (!node) throw new Error('harness: no element for ' + selector);
+        node.valueStr = String(text);
+        (events || ['input', 'change']).forEach(function (event) {
+            (node.handlers[event] || []).slice().forEach(function (handler) {
+                runGuarded(event + ' ' + selector, handler, [{}], node);
+            });
+        });
+        return true;
+    };
     world.executeStart = function () {
         world.click('#btn-task-submit');
         const proceed = runGuarded('beforeSubmit', world.ajaxForm.beforeSubmit, [[], $('form#taskform'), world.ajaxForm], null);
@@ -615,9 +699,33 @@ function createWorld(options) {
             },
             invalidFields: {
                 app_command: appCommand.classes.has('is-invalid'),
-                args: argsField.classes.has('is-invalid'),
-                kwargs: kwargsField.classes.has('is-invalid'),
+                args: wideFields ? wideFields.args.classes.has('is-invalid') : false,
+                kwargs: wideFields ? wideFields.kwargs.classes.has('is-invalid') : false,
             },
+            // #9019: a variante estreita dos argumentos (null quando a página não a tem) e o que os campos guardam
+            fieldErrorsNarrow: narrowFields ? {args: narrowParents.args.childTexts, kwargs: narrowParents.kwargs.childTexts} : null,
+            invalidFieldsNarrow: narrowFields
+                ? {args: narrowFields.args.classes.has('is-invalid'), kwargs: narrowFields.kwargs.classes.has('is-invalid')} : null,
+            argumentFields: {
+                wide: wideFields ? {args: wideFields.args.valueStr, kwargs: wideFields.kwargs.valueStr} : null,
+                narrow: narrowFields ? {args: narrowFields.args.valueStr, kwargs: narrowFields.kwargs.valueStr} : null,
+            },
+            hiddenFields: {args: hiddenFields.args.valueStr, kwargs: hiddenFields.kwargs.valueStr},
+            // o que o SCRIPT gravou em cada campo de argumentos por `.val(x)`, na ordem (null: a página não tem a variante)
+            argumentWrites: {
+                wide: wideFields ? {args: wideFields.args.scriptWrites.slice(), kwargs: wideFields.kwargs.scriptWrites.slice()} : null,
+                narrow: narrowFields ? {args: narrowFields.args.scriptWrites.slice(), kwargs: narrowFields.kwargs.scriptWrites.slice()} : null,
+            },
+            // o que entrou em cada pai por `append` ('element', 'text' ou 'string'), e o que o script entregou como marcação
+            fieldAppended: {
+                app_command: fieldParents.app_command.appended.slice(),
+                args: fieldParents.args.appended.slice(),
+                kwargs: fieldParents.kwargs.appended.slice(),
+                argsNarrow: narrowParents.args.appended.slice(),
+                kwargsNarrow: narrowParents.kwargs.appended.slice(),
+            },
+            markupSinks: world.markupSinks.slice(),
+            feedbackAttached: createdNodes.filter(function (node) { return node.parentNode && node.classes.has('invalid-feedback'); }).length,
             workersRequests: world.workersRequests().length,
             pendingWorkers: pendingWorkers().length,
             // o aviso dos workers: o texto de cada <p> do corpo, o badge e quantas vezes o `toast("show")` foi chamado

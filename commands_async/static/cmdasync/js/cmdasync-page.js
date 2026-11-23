@@ -46,11 +46,14 @@ $(document).ready(function () {
         window.location = url.join("");
     };
 
-    // Maps a form field to the visible input that mirrors it, for error placement.
+    // Maps a form field to the ids of the visible inputs that mirror it, for error placement. The arguments have one input per
+    // layout and only one of them is visible at a time: the wide one keeps the ids that a host with a single variant already
+    // uses, and the narrow one (response-form-task-args-md.html) takes the -md suffix, so no id is repeated in the page. An id the
+    // page does not have (a host with its own template and a single variant) is an empty set in jQuery: it does nothing.
     var rel_inputs = {
-        'args': 'task-args',
-        'kwargs': 'task-kwargs',
-        'app_command': 'task-app-command'
+        'args': ['task-args', 'task-args-md'],
+        'kwargs': ['task-kwargs', 'task-kwargs-md'],
+        'app_command': ['task-app-command']
     };
 
     if (config.workersStatusCheck) {
@@ -63,9 +66,27 @@ $(document).ready(function () {
         cmdasyncform.copyToClipboard("#task-output");
     });
 
-    // The visible inputs feed the hidden fields the form actually submits.
-    $("#task-args").on('change', function () { $("#id_args").val($(this).val()); });
-    $("#task-kwargs").on('change', function () { $("#id_kwargs").val($(this).val()); });
+    // The visible inputs feed the hidden fields the form actually submits. Each argument has an input per layout, so what is typed
+    // in one also goes to the input of the other layout: the one that shows after the width changes holds what will be sent. The
+    // text goes on every change (`input`: each key, paste or erase; `change`: what `input` misses, like the browser autofill),
+    // empty included, and each event is its own .on() call (the node harness registers an event by its exact text). The mirror
+    // uses .val() only, which fires no event, so the two inputs never call each other; it goes to the OTHER inputs, never back
+    // to the one being typed in (writing to it during an IME composition breaks the composition).
+    var bindArgument = function (ids, hiddenSelector) {
+        ids.forEach(function (id) {
+            var passText = function () {
+                var text = $(this).val();
+                $(hiddenSelector).val(text);
+                ids.forEach(function (otherId) {
+                    if (otherId !== id)
+                        $("#" + otherId).val(text);
+                });
+            };
+            $("#" + id).on('input', passText).on('change', passText);
+        });
+    };
+    bindArgument(rel_inputs.args, "#id_args");
+    bindArgument(rel_inputs.kwargs, "#id_kwargs");
 
     // Hide the copy button while the command field has focus.
     $("#task-app-command").on('focusin', function () {
@@ -127,7 +148,9 @@ $(document).ready(function () {
     var requestErrorClean = function () {
         $(".invalid-feedback").remove();
         for (var name in rel_inputs) {
-            $("#" + rel_inputs[name]).removeClass("is-invalid");
+            rel_inputs[name].forEach(function (id) {
+                $("#" + id).removeClass("is-invalid");
+            });
         }
     };
 
@@ -162,15 +185,21 @@ $(document).ready(function () {
                     goToLogin();
                     break;
                 case 400:
-                    var $input, data = xhr.responseJSON;
+                    var data = xhr.responseJSON;
                     var $feedback = $('<div class="invalid-feedback"></div>');
                     for (var name in data.form.errors) {
-                        $input = $("#" + rel_inputs[name]);
-                        $input.addClass("is-invalid");
-                        // .text(): a validation message echoes back what the user
-                        // typed (ast.literal_eval puts the input in its error), so
-                        // it must never be parsed as markup.
-                        $input.parent().append($feedback.clone().text(data.form.errors[name][0]));
+                        // a field outside the map shows nothing (and is no loop over undefined)
+                        var ids = Object.prototype.hasOwnProperty.call(rel_inputs, name) ? rel_inputs[name] : [];
+                        ids.forEach(function (id) {
+                            var $input = $("#" + id);
+                            $input.addClass("is-invalid");
+                            // .text(): a validation message echoes back what the user
+                            // typed (ast.literal_eval puts the input in its error), so
+                            // it must never be parsed as markup. One .clone() per input:
+                            // appending the same element to two parents MOVES it, and
+                            // it would stay in the last one only.
+                            $input.parent().append($feedback.clone().text(data.form.errors[name][0]));
+                        });
                     }
                     break;
                 case 0:  // no answer: the network failed

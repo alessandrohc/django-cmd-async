@@ -1003,6 +1003,109 @@ register('workers:timeout:later', workersTimeoutLater);
     register('timeout:out-of-scope:' + how, function () { return outOfScope(how); });
 });
 
+// ---------------------------------------------------------------- #9019: os campos de argumentos nas duas variantes
+// A variante larga mantém os ids de sempre; a estreita leva o sufixo `-md` (os do `response-form-task-args-md.html`).
+const ARGS_SELECTORS = {
+    wide: {args: '#task-args', kwargs: '#task-kwargs'},
+    narrow: {args: '#task-args-md', kwargs: '#task-kwargs-md'},
+};
+const TYPED_TEXT = '"a", "b"';
+// O que o servidor ecoa na mensagem de erro de um campo (o `ast.literal_eval` devolve o que o usuário digitou): marcação, de propósito.
+const ECHOED_TEXT = '<b>typed</b>';
+const REFUSALS = {
+    args: {args: ['bad args']},
+    kwargs: {kwargs: ['bad kwargs']},
+    command: {app_command: ['bad command']},
+    all: FIELD_ERRORS_400,
+    // o campo do comando recusado de novo, com outra mensagem (a segunda resposta de uma sequência)
+    second: {app_command: ['second bad command']},
+    echo: {app_command: [ECHOED_TEXT], args: [ECHOED_TEXT], kwargs: [ECHOED_TEXT]},
+    // campos que a tela não mapeia: um nome qualquer, e dois que existem em todo objeto (`constructor`, `__proto__`: o `JSON.parse` os
+    // cria como chaves PRÓPRIAS, como o corpo de um 400 de verdade; um literal `{__proto__: …}` mudaria o protótipo). O campo conhecido
+    // (`args`) vem DEPOIS deles: um erro de script no laço o esconderia.
+    unknown: JSON.parse('{"ghost": ["no such field"], "constructor": ["inherited name"], "__proto__": ["proto name"], "args": ["bad args"]}'),
+};
+function refusal(kind) {
+    return {status: 400, responseJSON: {form: {errors: REFUSALS[kind]}}};
+}
+
+// AC-9019-3 e -4: o usuário muda o texto de um campo (um evento por vez) e o apaga depois; o que o campo do formulário e o campo da
+// outra variante guardam, num mundo com as duas variantes ou com uma só (o host).
+function argsTyping(variants, variant, field, event) {
+    const world = createWorld({argsVariants: variants});
+    const selector = ARGS_SELECTORS[variant][field];
+    world.type(selector, TYPED_TEXT, [event]);
+    const result = {afterText: world.state()};
+    world.type(selector, '', [event]);
+    result.afterEmpty = world.state();
+    return result;
+}
+
+// AC-9019-2 e -10: o 400 com os erros do formulário, num mundo com as duas variantes ou com uma só.
+function argsRefusal(variants, kind) {
+    const world = createWorld({argsVariants: variants});
+    world.executeStart();
+    world.formError(refusal(kind));
+    return {after: world.state()};
+}
+
+// AC-9019-5 e -9: a recusa e, depois, a resposta seguinte (aceita, falha de rede ou outra recusa): o que sobra na tela.
+function errorsThenAnswer(first, second) {
+    const world = createWorld();
+    world.executeStart();
+    world.formError(refusal(first));
+    const result = {afterFirst: world.state()};
+    world.executeStart();
+    if (second === 'accepted') world.formValid('t1');
+    else if (second === 'network') world.formError({status: 0});
+    else world.formError(refusal(second));
+    result.afterSecond = world.state();
+    return result;
+}
+
+// AC-9019-8: a página de um host que traz só uma das variantes: digitar, a recusa e a resposta aceita.
+function hostFlow(variant) {
+    const world = createWorld({argsVariants: variant});
+    ['args', 'kwargs'].forEach(function (field) {
+        ['input', 'change'].forEach(function (event) { world.type(ARGS_SELECTORS[variant][field], TYPED_TEXT, [event]); });
+    });
+    const result = {afterTyping: world.state()};
+    world.executeStart();
+    world.formError(refusal('all'));
+    result.afterRefusal = world.state();
+    world.executeStart();
+    world.formValid('t1');
+    result.afterAccepted = world.state();
+    return result;
+}
+
+// AC-9019-3 e -4: um mundo por variante, argumento e evento, com as duas variantes e com a variante só
+['wide', 'narrow'].forEach(function (variant) {
+    ['args', 'kwargs'].forEach(function (field) {
+        ['input', 'change'].forEach(function (event) {
+            const suffix = variant + ':' + field + ':' + event;
+            register('args:type:both:' + suffix, function () { return argsTyping('both', variant, field, event); });
+            register('args:type:solo-' + suffix, function () { return argsTyping(variant, variant, field, event); });
+        });
+    });
+});
+// AC-9019-2 e -10: o 400 com as duas variantes (o erro de cada campo, o de todos, o texto ecoado) e com uma variante só
+['args', 'kwargs', 'command', 'all', 'echo', 'unknown'].forEach(function (kind) {
+    register('errors:400:both:' + kind, function () { return argsRefusal('both', kind); });
+});
+['wide', 'narrow'].forEach(function (variant) {
+    register('errors:400:solo-' + variant + ':all', function () { return argsRefusal(variant, 'all'); });
+});
+// AC-9019-5 e -9: a recusa seguida de resposta aceita, de falha de rede e de outra recusa
+[['all', 'accepted'], ['all', 'network'], ['all', 'second'], ['command', 'accepted'], ['command', 'network'], ['command', 'args']]
+    .forEach(function (pair) {
+        register('errors:clean:' + pair[0] + ':' + pair[1], function () { return errorsThenAnswer(pair[0], pair[1]); });
+    });
+// AC-9019-8: o host de uma variante só
+['wide', 'narrow'].forEach(function (variant) {
+    register('host:' + variant, function () { return hostFlow(variant); });
+});
+
 const initial = createWorld().state();
 process.stdout.write(JSON.stringify({
     constants: {
@@ -1010,6 +1113,11 @@ process.stdout.write(JSON.stringify({
         page: PAGE,
         serverErrorText: SERVER_ERROR_TEXT,
         fieldErrors400: FIELD_ERRORS_400,
+        argsSelectors: ARGS_SELECTORS,
+        typedText: TYPED_TEXT,
+        echoedText: ECHOED_TEXT,
+        refusals: REFUSALS,
+        hiddenSelectors: {args: '#id_args', kwargs: '#id_kwargs'},
         initialButtons: {
             execute: initial.execute.disabled,
             cancel: initial.cancel.disabled,

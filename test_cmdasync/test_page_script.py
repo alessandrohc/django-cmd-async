@@ -362,7 +362,7 @@ class FormFailureTest(ScenarioTestCase):
                 self.assertTrue(row['alert']['hidden'])
 
     def test_a_submit_refused_with_the_form_errors_shows_each_error_next_to_its_field(self):
-        """AC-8961-9 (controle): o 400 com os erros do formulário em JSON mostra o erro de cada campo (o do comando e os dos argumentos) ao lado do campo."""
+        """AC-9019-1 (controle): o 400 com os erros do formulário em JSON mostra o erro de cada campo (o do comando e os dos argumentos) ao lado do campo."""
         after = self.scenario('form:http400:full')['after']
         errors = self.constants['fieldErrors400']
         self.assertEqual(after['uncaught'], [])
@@ -1227,7 +1227,7 @@ class DoubleAssumptionsTest(TestCase):
                          msg='the vendored jQuery no longer resolves a 204 as success (nocontent)')
 
     def test_the_wide_variant_of_the_arguments_shows_above_768_px(self):
-        """AC-8961-9 (controle): a variante larga dos argumentos (a que o dublê de node representa) aparece acima de 768 px, e a estreita só até 768 px."""
+        """AC-9019-7 (controle): a regra entregue esconde a variante larga dos argumentos até 768 px e a estreita acima de 768 px, e cada template traz a classe da sua variante."""
         css = (STATIC_CMDASYNC / 'styles.css').read_text(encoding='utf-8')
         narrow = re.search(r'@media screen and \(max-width:\s*768px\)\s*\{(.*?)\n\}', css, flags=re.S)
         wide = re.search(r'@media screen and \(min-width:\s*769px\)\s*\{(.*?)\n\}', css, flags=re.S)

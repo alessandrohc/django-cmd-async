@@ -367,6 +367,7 @@ class DomSinkTest(SimpleTestCase):
     """
 
     def test_no_page_script_writes_html(self):
+        """AC-9019-10 (controle): nenhum script da página entrega dado do servidor ao jQuery como marcação por `.html(`: a mensagem de erro de um campo entra por `.text()`."""
         for name in PAGE_SCRIPTS:
             with self.subTest(script=name):
                 source = (STATIC / name).read_text(encoding='utf-8')
@@ -380,6 +381,7 @@ class DomSinkTest(SimpleTestCase):
         self.assertNotIn('append(task.traceback)', source)
 
     def test_no_page_script_builds_markup_by_concatenation(self):
+        """AC-9019-10 (controle): nenhum script da página monta marcação concatenando um valor (a mensagem de erro de um campo, por exemplo)."""
         # '<p class="...">' + value + '</p>' is the pattern that put worker names
         # and error messages into the DOM as HTML.
         pattern = re.compile(r"""['"]\s*<[a-z]+[^'"]*['"]\s*\+""", re.IGNORECASE)
