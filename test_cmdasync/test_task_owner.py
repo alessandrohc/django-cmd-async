@@ -283,7 +283,7 @@ class OwnerCheckTest(OwnerTestCase):
         self.revoke.assert_not_called()
 
     def test_the_owner_is_answered_405_for_the_methods_the_view_does_not_handle(self):
-        """AC-8864-18 (controle): the user who launched the task is still answered 405 for PUT, PATCH and DELETE."""
+        """AC-8990-1 (controle): the user who launched the task is still answered 405 for PUT, PATCH and DELETE."""
         owner = self.launched_by_owner('task-18')
 
         for method in ('put', 'patch', 'delete'):
