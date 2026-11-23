@@ -90,8 +90,11 @@ cmdasyncform = {
         req.done(function (data) {
             var task = data.task;
             var $output = self.$output;
-            self.exc_event_callbacks('updating', self.$form);
             if (self.update) {
+                // `updating` only while the follow-up goes on: the page writes the running text in
+                // the panel on it, and after an interruption that text would be left in the
+                // released screen (with the Copy button over it)
+                self.exc_event_callbacks('updating', self.$form);
                 if (task.ready) {
                     $output.empty();
                     if (!task.failed) {
@@ -117,12 +120,20 @@ cmdasyncform = {
                     }, 1000);
                 }
             } else {
+                // interrupted: the screen is released with an empty panel, before `update-finish`
+                // (the page shows the Copy button by what the panel holds when it is released)
+                $output.empty();
                 self.running = false;
                 self.exc_event_callbacks('update-finish', self.$form);
             }
         });
         req.fail(function (xhr, textStatus) {
             self.running = false;
+            // interrupted while this query was in flight: the panel is emptied as in .done, before
+            // the callbacks (one that raises must not skip it). A failure with the follow-up going
+            // on leaves the panel as it is.
+            if (!self.update)
+                self.$output.empty();
             try {
                 var reason = self.failure_reason(xhr, textStatus);
                 if (reason)
@@ -186,6 +197,9 @@ cmdasyncform = {
             this.requestTimeout = null;
             this.running = false;
             this.update = true;
+            // the panel still holds the running text of the last query: empty it before the screen
+            // is released
+            this.$output.empty();
             this.exc_event_callbacks('update-finish', this.$form);
             return;
         }

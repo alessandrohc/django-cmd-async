@@ -72,7 +72,9 @@ function createWorld(options) {
     // workers: false (o script de workers não é carregado), 'page' (carregado e chamado pela página, com o setting
     // ligado) ou 'manual' (carregado, setting desligado: o teste chama `world.workersCheck()`);
     // toast: 'full' (o aviso do pacote), 'nophrase' (sem o data-forbidden-text), 'noplugin' (sem o `$.fn.toast`, como num
-    // host sem o bootstrap.bundle) ou 'none' (sem o #popup-msg); noFailureReason: um cmdhandler.js sem o `failure_reason`.
+    // host sem o bootstrap.bundle) ou 'none' (sem o #popup-msg); noFailureReason: um cmdhandler.js sem o `failure_reason`;
+    // runningText: o texto de execução que o template publica em data-running-text (padrão TEXTS.runningText; um outro
+    // texto prova que a página escreve o que o template publicou, e não o literal em inglês: a tradução, AC-8967-3).
     const opts = Object.assign({commandsList: false, alertSpace: true, texts: true, workers: false, toast: 'full', noFailureReason: false}, options || {});
     const world = {
         opts: opts,
@@ -128,7 +130,7 @@ function createWorld(options) {
         'login-url': PAGE.loginUrl,
         'redirect-field': PAGE.redirectField,
         'index-url': PAGE.indexUrl,
-        'running-text': TEXTS.runningText,
+        'running-text': opts.runningText || TEXTS.runningText,
     };
     if (opts.texts) {
         panelData['revoke-failed-text'] = TEXTS.revokeFailedText;

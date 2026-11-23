@@ -212,7 +212,7 @@ ALERT_TEXTS = {
 
 
 class AlertContractTest(TestCase):
-    """O que o script usa nos avisos de falha, publicado pela página do pacote (AC-8866-9)."""
+    """O que o script usa nos avisos de falha e no texto de execução, publicado pela página do pacote (AC-8866-9, AC-8967-3)."""
 
     @classmethod
     def setUpTestData(cls):
@@ -238,6 +238,16 @@ class AlertContractTest(TestCase):
         for attribute, phrase in ALERT_TEXTS.items():
             with self.subTest(attribute=attribute):
                 self.assertEqual(panel.get(attribute), phrase)
+
+    def test_the_page_publishes_the_running_text_translated(self):
+        """AC-8967-3: o texto de execução chega ao script como o template o publica: «Running command...» sem tradução, e traduzido quando há tradução."""
+        phrase = 'Running command...'
+        self.assertEqual(self.page()['task-panel'].get('data-running-text'), phrase)
+        with translation.override('pt-br'):
+            panel = self.page()['task-panel']
+            translated = translation.gettext(phrase)
+            self.assertNotEqual(translated, phrase, msg='the pt_BR catalog has no entry for this phrase')
+            self.assertEqual(panel.get('data-running-text'), translated)
 
     def test_the_page_publishes_the_failure_texts_translated(self):
         """AC-8866-9: os textos da falha chegam traduzidos para o idioma do usuário quando há tradução."""

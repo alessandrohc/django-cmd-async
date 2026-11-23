@@ -187,7 +187,9 @@ The bundled page follows a task from the moment the form is sent, not only from 
 query. **Cancel** (and, when the page shows the list of commands, the **switch of command**) ends
 that follow-up wherever it is: while the form is being sent, with the first status query in flight,
 or between two queries. The screen is released when the answer in flight arrives, or at once when a
-new query was only scheduled, and no status query goes out after it. **The task keeps running**:
+new query was only scheduled, and no status query goes out after it. The released screen has an
+empty output panel and no Copy button: the running text of the last query is not left in it.
+**The task keeps running**:
 stopping it is Revoke, to be used before Cancel, because the page disables Revoke when it releases
 the screen. Before, Cancel and the switch were ignored until the second query: the follow-up went
 on to the end, with Cancel disabled and its indicator lit.
@@ -203,7 +205,9 @@ A host with a page of its own that uses `cmdhandler.js` gets the same through
 `revoke_task()` with no task accepted in the run sends nothing and fires `revoke-failed`, so a page
 that enabled its Revoke button early ends the click like any failed revocation. A host that never
 goes through `ajax()` keeps the old behaviour of the interruption: it is ignored until the second
-query.
+query. The `updating` event is fired for the answer of each status query while the follow-up goes
+on, and **not** for the answer of an interrupted follow-up (the handler empties the output panel
+and releases the screen instead).
 
 ### The workers probe of the page
 

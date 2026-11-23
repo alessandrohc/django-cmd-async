@@ -122,8 +122,40 @@ function statusFailureMidway(kind) {
     return result;
 }
 
-function abort(trigger, waits, flight) {
+// Os tipos de falha da consulta que chegam ao `.fail` do handler (AC-8967-1).
+const FAILURE_KINDS = ['html200', 'http403', 'http404', 'http500', 'network'];
+
+// Conta os avisos do evento `updating` (AC-8967-4 e -5) com um ouvinte de host registrado DEPOIS do da página;
+// toda `world.state()` passa a trazer `updatingCalls`, a contagem até aquele momento.
+function countUpdating(world) {
+    let calls = 0;
+    world.cmdasyncform.add_event_callback('updating', function () { calls += 1; });
+    const state = world.state;
+    world.state = function () {
+        return Object.assign(state(), {updatingCalls: calls});
+    };
+}
+
+// Um ouvinte de host de `update-failed` que lança: a ordem do `empty()` do `.fail` em relação a ele (AC-8967-1).
+function hostFailsOnUpdateFailed(world) {
+    world.cmdasyncform.add_event_callback('update-failed', function () {
+        throw new Error('host callback raised');
+    });
+}
+
+// A resposta da consulta de estado: 'ready' (pronta, com a saída), 'notready' ou um tipo de STATUS_FAILURES.
+function answerAs(world, answer) {
+    if (answer === 'ready') world.answerStatus(ready('TASK OUTPUT'));
+    else if (answer === 'notready') world.answerStatus(NOT_READY);
+    else if (STATUS_FAILURES[answer]) world.answerStatus(STATUS_FAILURES[answer]);
+    else throw new Error('harness: unknown answer ' + answer);
+}
+
+// `answer` só vale com a consulta em voo (padrão 'ready', como antes); `hostFails` registra o ouvinte que lança.
+function abort(trigger, waits, flight, answer, hostFails) {
     const world = createWorld({commandsList: trigger === 'switch'});
+    countUpdating(world);
+    if (hostFails) hostFailsOnUpdateFailed(world);
     trackWaits(world, waits);
     if (flight) world.advance(1000); // a consulta saiu e a resposta ainda não veio
     const result = {before: world.state()};
@@ -131,7 +163,7 @@ function abort(trigger, waits, flight) {
     else world.switchCommand(0);
     result.afterAbort = world.state();
     if (flight) {
-        world.answerStatus(ready('TASK OUTPUT'));
+        answerAs(world, answer || 'ready');
         result.afterAnswer = world.state();
     } else {
         world.advance(5000);
@@ -144,12 +176,27 @@ function abort(trigger, waits, flight) {
     return result;
 }
 
-function noAbortControl(waits) {
-    const world = createWorld();
+// `runningText` (opcional): o texto de execução que o template publica, como uma tradução (AC-8967-3).
+function noAbortControl(waits, runningText) {
+    const world = createWorld(runningText ? {runningText: runningText} : undefined);
+    countUpdating(world);
     trackWaits(world, waits);
     const result = {before: world.state()};
     world.advance(1000);
     result.after = world.state();
+    return result;
+}
+
+// AC-8967-4 (controle): sem interrupção, uma resposta «não pronta» e depois a pronta; cada uma avisa o `updating` uma vez.
+function followReady() {
+    const world = createWorld();
+    countUpdating(world);
+    world.execute('t1');
+    world.answerStatus(NOT_READY);
+    const result = {afterNotReady: world.state()};
+    world.advance(1000);
+    world.answerStatus(ready('TASK OUTPUT'));
+    result.afterReady = world.state();
     return result;
 }
 
@@ -181,14 +228,16 @@ function abortDuringSubmit(trigger, interrupt) {
     return result;
 }
 
-// AC-8955-2: interromper com a 1ª consulta de estado em voo; `answer` é a resposta que ela recebe.
+// AC-8955-2: interromper com a 1ª consulta de estado em voo; `answer` é a resposta que ela recebe
+// ('ready', 'notready' ou um tipo de falha de STATUS_FAILURES, AC-8967-1).
 function abortFirstInFlight(trigger, answer) {
     const world = createWorld({commandsList: trigger === 'switch'});
+    countUpdating(world);
     world.execute('t1'); // a 1ª consulta está em voo
     const result = {before: world.state()};
     clickTrigger(world, trigger);
     result.afterAbort = world.state();
-    world.answerStatus(answer === 'ready' ? ready('TASK OUTPUT') : NOT_READY);
+    answerAs(world, answer);
     result.afterAnswer = world.state();
     world.advance(5000);
     result.afterAdvance = world.state();
@@ -509,6 +558,25 @@ register('status:html200:midway', function () { return statusFailureMidway('html
 });
 register('abort:none:2', function () { return noAbortControl(2); });
 register('abort:none:1', function () { return noAbortControl(1); });
+// AC-8967-3: o template publica o texto de execução traduzido; é ele que fica no painel enquanto o acompanhamento segue
+register('abort:none:1:translated', function () { return noAbortControl(1, 'Executando comando...'); });
+
+// AC-8967-1: a consulta em voo que termina depois da interrupção por resposta «não pronta» ou por falha
+['cancel', 'switch'].forEach(function (trigger) {
+    [2, 3].forEach(function (waits) {
+        register('abort:' + trigger + ':' + waits + ':flight:notready', function () { return abort(trigger, waits, true, 'notready'); });
+        FAILURE_KINDS.forEach(function (kind) {
+            register('abort:' + trigger + ':' + waits + ':flight:fail:' + kind, function () { return abort(trigger, waits, true, kind); });
+        });
+    });
+    FAILURE_KINDS.forEach(function (kind) {
+        register('first:' + trigger + ':fail:' + kind, function () { return abortFirstInFlight(trigger, kind); });
+    });
+});
+// ... com um ouvinte de host de `update-failed` que lança: o painel já está vazio quando ele lança
+register('abort:cancel:2:flight:fail:callback-throws', function () { return abort('cancel', 2, true, 'http403', true); });
+// AC-8967-4 (controle): sem interrupção, um aviso de `updating` por resposta
+register('follow:ready', followReady);
 
 // AC-8955-1 e -2
 ['cancel', 'switch'].forEach(function (trigger) {

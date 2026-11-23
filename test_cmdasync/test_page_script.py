@@ -34,6 +34,26 @@ STATIC_CMDASYNC = ROOT / 'commands_async' / 'static' / 'cmdasync'
 
 REVOKE_KINDS = ('http403', 'http404', 'http500', 'html200', 'falseWithError', 'falseNoError')
 REVOKE_PHASES = ('tracking', 'late')
+# Os tipos de falha da consulta de estado que chegam ao `.fail` do handler (o `FAILURE_KINDS` do scenarios.js).
+STATUS_FAILURE_KINDS = ('html200', 'http403', 'http404', 'http500', 'network')
+
+
+def interrupted_answer_scenarios():
+    """Os cenários em que a consulta de estado em voo TERMINA depois da interrupção, por resposta ou por falha (AC-8967-1).
+
+    Devolve (nome, o que é o fim): 'answer' para a resposta (pronta ou não) e 'failure' para a falha.
+    """
+    found = []
+    for trigger in ('cancel', 'switch'):
+        for answer in ('notready', 'ready'):
+            found.append(('first:{0}:{1}'.format(trigger, answer), 'answer'))
+        for waits in (2, 3):
+            found.append(('abort:{0}:{1}:flight'.format(trigger, waits), 'answer'))
+            found.append(('abort:{0}:{1}:flight:notready'.format(trigger, waits), 'answer'))
+            for kind in STATUS_FAILURE_KINDS:
+                found.append(('abort:{0}:{1}:flight:fail:{2}'.format(trigger, waits, kind), 'failure'))
+    found.append(('abort:cancel:2:flight:fail:callback-throws', 'failure'))
+    return found
 
 
 @functools.lru_cache(maxsize=1)
@@ -192,7 +212,7 @@ class CallbackFailureTest(ScenarioTestCase):
 
 
 class AbortTest(ScenarioTestCase):
-    """Interromper o acompanhamento: o Cancel e a troca de comando na lista (AC-8866-6 e -16, AC-8955-1 e -2)."""
+    """Interromper o acompanhamento: o Cancel e a troca de comando na lista (AC-8866-6 e -16, AC-8955-1 e -2, AC-8967-1 a -6)."""
 
     def test_an_interrupted_follow_up_ends_whole(self):
         """AC-8866-6: com uma consulta agendada, o Cancel e a troca de comando encerram o acompanhamento por inteiro."""
@@ -212,12 +232,124 @@ class AbortTest(ScenarioTestCase):
                     self.assertAtRest(second)
 
     def test_switching_the_command_hides_the_copy_button(self):
-        # Robustez (sem ID): a troca limpa o painel antes de liberar a tela, e o Copy acompanha o que o painel guarda.
+        """AC-8967-6 (controle): a troca de comando com a consulta agendada libera a tela na hora, com o painel vazio e o Copy escondido."""
+        # A troca limpa o painel antes de liberar a tela (a página), e o Copy acompanha o que o painel guarda.
         for waits in (1, 2, 3):
             with self.subTest(waits=waits):
                 after = self.scenario('abort:switch:{0}:timer'.format(waits))['afterAbort']
+                self.assertAtRest(after, msg='the screen was not released at once')
                 self.assertEqual(after['output'], '', msg='precondition: the panel was cleared')
                 self.assertTrue(after['copyHidden'], msg='the copy button is visible over an empty panel')
+
+    def test_cancelling_with_a_scheduled_query_leaves_the_panel_empty(self):
+        """AC-8967-2: o Cancel com uma consulta agendada libera a tela na hora, com o painel de saída vazio e o Copy escondido."""
+        for waits in (1, 2, 3):
+            name = 'abort:cancel:{0}:timer'.format(waits)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertEqual(found['before']['liveTimers'], 1, msg='precondition: a new query is scheduled')
+                self.assertEqual(found['before']['output'], self.texts['runningText'],
+                                 msg='precondition: the panel holds the text of the previous query')
+                after = found['afterAbort']
+                self.assertAtRest(after, msg='the screen was not released at once')
+                self.assertEqual(after['output'], '', msg='the panel kept the running text after the Cancel')
+                self.assertTrue(after['copyHidden'], msg='the copy button is visible over the running text')
+
+    def test_an_interrupted_query_that_ends_leaves_the_panel_empty(self):
+        """AC-8967-1: depois do Cancel ou da troca, a consulta em voo que termina (resposta ou falha) libera a tela com o painel vazio e o Copy escondido."""
+        scenarios = interrupted_answer_scenarios()
+        self.assertEqual(len(scenarios), 33, msg='the scenario list changed size')
+        for name, ending in scenarios:
+            with self.subTest(scenario=name, ending=ending):
+                found = self.scenario(name)
+                self.assertEqual(found['afterAbort']['pendingStatus'], 1, msg='precondition: the query is in flight')
+                answered = found['afterAnswer']
+                self.assertEqual(answered['pendingStatus'], 0, msg='precondition: the query ended')
+                self.assertAtRest(answered, msg='the screen was not released when the query ended')
+                self.assertEqual(answered['output'], '', msg='the panel is not empty after the query ended')
+                self.assertTrue(answered['copyHidden'], msg='the copy button is visible after the query ended')
+
+    def test_a_failed_first_query_after_the_interruption_leaves_the_panel_empty(self):
+        """AC-8967-1 (controle): a 1ª consulta que falha depois da interrupção libera a tela com o painel vazio (ele nunca guardou o texto)."""
+        for trigger in ('cancel', 'switch'):
+            for kind in STATUS_FAILURE_KINDS:
+                name = 'first:{0}:fail:{1}'.format(trigger, kind)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.assertEqual(found['afterAbort']['pendingStatus'], 1, msg='precondition: the first query is in flight')
+                    answered = found['afterAnswer']
+                    self.assertAtRest(answered, msg='the screen was not released when the query failed')
+                    self.assertEqual(answered['output'], '')
+                    self.assertTrue(answered['copyHidden'])
+
+    def test_a_host_callback_that_raises_on_update_failed_does_not_leave_the_running_text(self):
+        """AC-8967-1: o ouvinte de host de `update-failed` que lança não impede o painel vazio (o `empty()` vem antes dele)."""
+        found = self.scenario('abort:cancel:2:flight:fail:callback-throws')
+        self.assertEqual([failure['message'] for failure in found['afterAnswer']['uncaught']], ['Error: host callback raised'],
+                         msg='precondition: the host callback raised')
+        self.assertEqual(found['afterAbort']['output'], self.texts['runningText'], msg='precondition: the panel held the running text')
+        answered = found['afterAnswer']
+        self.assertAtRest(answered, msg='the screen was not released')
+        self.assertEqual(answered['output'], '', msg='the panel kept the running text')
+        self.assertTrue(answered['copyHidden'])
+
+    def test_the_running_text_shows_while_the_follow_up_goes_on(self):
+        """AC-8967-3 (controle): com o acompanhamento ativo, a resposta «não pronta» deixa o texto de execução no painel."""
+        for name in ('abort:none:1', 'abort:none:2'):
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertEqual(found['before']['output'], self.texts['runningText'])
+                self.assertEqual(found['after']['output'], self.texts['runningText'], msg='the text went away while following')
+                self.assertEqual(found['after']['pendingStatus'], 1, msg='precondition: the follow-up goes on')
+
+    def test_the_running_text_is_the_one_the_template_publishes(self):
+        """AC-8967-3: o texto de execução no painel é o que o template publica (traduzido quando há tradução), e não o literal em inglês."""
+        found = self.scenario('abort:none:1:translated')
+        translated = 'Executando comando...'
+        self.assertNotEqual(translated, self.texts['runningText'], msg='precondition: the published text is not the English one')
+        self.assertEqual(found['before']['output'], translated, msg='the page wrote a text the template did not publish')
+        self.assertEqual(found['after']['output'], translated, msg='the text went away while following')
+        self.assertEqual(found['after']['pendingStatus'], 1, msg='precondition: the follow-up goes on')
+
+    def test_the_updating_event_is_notified_once_per_answer_while_following(self):
+        """AC-8967-4 (controle): com o acompanhamento ativo, cada resposta (pronta ou não) avisa o `updating` uma vez."""
+        for name, answers in (('abort:none:1', 1), ('abort:none:2', 2)):
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertEqual(found['before']['updatingCalls'], answers)
+                # a consulta que saiu depois ainda não foi respondida: nenhum aviso a mais
+                self.assertEqual(found['after']['updatingCalls'], answers)
+        with self.subTest(scenario='follow:ready'):
+            found = self.scenario('follow:ready')
+            self.assertEqual(found['afterNotReady']['updatingCalls'], 1)
+            self.assertEqual(found['afterReady']['updatingCalls'], 2, msg='the ready answer did not notify updating')
+            self.assertEqual(found['afterReady']['output'], 'TASK OUTPUT', msg='precondition: the ready answer ended the follow-up')
+
+    def test_the_updating_event_is_not_notified_after_an_interruption(self):
+        """AC-8967-5: depois do Cancel ou da troca, a resposta da consulta em voo (pronta ou não) não avisa o `updating`."""
+        cases = []
+        for trigger in ('cancel', 'switch'):
+            for answer in ('notready', 'ready'):
+                cases.append(('first:{0}:{1}'.format(trigger, answer), 0))
+            for waits in (2, 3):
+                cases.append(('abort:{0}:{1}:flight'.format(trigger, waits), waits))
+                cases.append(('abort:{0}:{1}:flight:notready'.format(trigger, waits), waits))
+        for name, before_interruption in cases:
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertEqual(found['afterAbort']['updatingCalls'], before_interruption,
+                                 msg='precondition: one notification per answer before the interruption')
+                self.assertEqual(found['afterAnswer']['pendingStatus'], 0, msg='precondition: the query was answered')
+                self.assertEqual(found['afterAnswer']['updatingCalls'], before_interruption,
+                                 msg='updating was notified for the answer of an interrupted follow-up')
+
+    def test_a_failure_without_interruption_keeps_the_screen_as_it_is(self):
+        # Controle sem ID: a falha da consulta SEM interrupção segue como está neste ticket (o texto de execução
+        # e o Copy ficam); mudar isso é o follow-up F1 do #8967, que troca este teste.
+        after = self.scenario('status:html200:midway')['after']
+        self.assertAtRest(after, msg='the screen was not released')
+        self.assertEqual(after['output'], self.texts['runningText'])
+        self.assertFalse(after['copyHidden'])
 
     def test_without_the_abort_the_scheduled_query_goes_out(self):
         """AC-8866-6 (controle): sem interromper, a consulta agendada sai."""
