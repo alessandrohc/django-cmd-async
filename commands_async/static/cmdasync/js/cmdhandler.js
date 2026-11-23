@@ -65,6 +65,9 @@ cmdasyncform = {
         this.$form = null;
         this.task = null;
         this.requestTimeout = null;
+        // The bound on_form_valid that ajax() registers lives and dies with the lists above: after a
+        // new init() the next ajax() binds the on_form_valid the object has then.
+        this.form_valid_callback = null;
     },
     // The follow-up starts when the form is sent, not at the first poll: from here Cancel and the
     // command switch have something to end (update_abort reads `running`), and no task is known yet.
@@ -236,8 +239,13 @@ cmdasyncform = {
         options = options || {};
         options.dataType = 'json';
 
-        if (this.events['form-valid'].indexOf(this.on_form_valid) === -1)
-            this.add_event_callback("form-valid", this.on_form_valid.bind(this));
+        // bind() returns a new function on every call, so a test against `this.on_form_valid` never
+        // found the one an earlier call had registered: each ajax() call added another follow-up per
+        // task. The bound function is made once and looked up in the current list.
+        if (!this.form_valid_callback)
+            this.form_valid_callback = this.on_form_valid.bind(this);
+        if (this.events['form-valid'].indexOf(this.form_valid_callback) === -1)
+            this.add_event_callback("form-valid", this.form_valid_callback);
 
         // The follow-up begins with the submit. The page's own beforeSubmit may refuse the submit
         // (it returns false, e.g. a second click while one runs): then nothing begins and the

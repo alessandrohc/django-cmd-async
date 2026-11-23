@@ -207,7 +207,9 @@ that enabled its Revoke button early ends the click like any failed revocation. 
 goes through `ajax()` keeps the old behaviour of the interruption: it is ignored until the second
 query. The `updating` event is fired for the answer of each status query while the follow-up goes
 on, and **not** for the answer of an interrupted follow-up (the handler empties the output panel
-and releases the screen instead).
+and releases the screen instead). `ajax()` may be called more than once: the handler registers its
+own `form-valid` callback once per `init()`, so a task is followed by a single chain of status
+queries however many times it is called.
 
 ### The workers probe of the page
 

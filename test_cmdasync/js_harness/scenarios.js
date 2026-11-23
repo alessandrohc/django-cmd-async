@@ -245,6 +245,85 @@ function abortFirstInFlight(trigger, answer) {
     return result;
 }
 
+// ---------------------------------------------------------------- #8968: o host que chama o ajax() mais de uma vez
+const TASK_FORM = 'form#taskform';
+
+// As chamadas a mais do `ajax()` depois do boot da página (que já o chamou uma vez): 'new' (um objeto de opções novo a cada
+// chamada), 'same' (o objeto que a chamada anterior devolveu) ou 'mixed' (novo, o devolvido, novo).
+function callAjaxAgain(world, kind, calls) {
+    for (let i = 0; i < calls; i++) {
+        const returned = world.ajaxForm; // o objeto que a chamada anterior deixou no ajaxForm do dublê
+        const options = (kind === 'same' || (kind === 'mixed' && i === 1)) ? returned : {};
+        world.cmdasyncform.ajax(TASK_FORM, options);
+    }
+}
+
+// O acompanhamento de uma tarefa pelo caminho do envio: o form-valid, uma resposta «não pronta», o timer, a resposta pronta e a espera.
+function followOneTask(world) {
+    const result = {};
+    world.execute('t1');
+    result.afterFormValid = world.state();
+    world.answerStatus(NOT_READY);
+    result.afterNotReady = world.state();
+    world.advance(1000);
+    result.afterTimer = world.state();
+    world.answerStatus(ready('TASK OUTPUT'));
+    result.afterReady = world.state();
+    world.advance(5000);
+    result.afterLater = world.state();
+    return result;
+}
+
+// AC-8968-1: o host chama o `ajax()` de novo, desde o último `init()`.
+function againChain(kind, calls) {
+    const world = createWorld();
+    callAjaxAgain(world, kind, calls);
+    return followOneTask(world);
+}
+
+// AC-8968-1 e -3: o `init()` refaz a lista de ouvintes; `calls` chamadas do `ajax()` depois dele (o boot da página já chamou uma antes).
+function reinitChain(calls) {
+    const world = createWorld();
+    world.cmdasyncform.init('#task-output');
+    for (let i = 0; i < calls; i++) world.cmdasyncform.ajax(TASK_FORM, {});
+    return followOneTask(world);
+}
+
+// AC-8968-2: a interrupção durante o envio com o `ajax()` chamado de novo com o objeto que a página passou (o do `ajaxForm()`).
+function againInterrupt(trigger) {
+    const world = createWorld({commandsList: trigger === 'switch'});
+    world.cmdasyncform.ajax(TASK_FORM, world.ajaxForm);
+    world.executeStart(); // o formulário está em voo
+    const result = {before: world.state()};
+    result.clicked = trigger === 'cancel' ? world.click('#btn-task-cancel') : world.switchCommand(0);
+    result.afterAbort = world.state();
+    world.formValid('t1'); // o servidor aceitou a tarefa
+    result.afterAnswer = world.state();
+    world.advance(5000);
+    result.afterAdvance = world.state();
+    followNext(world, result);
+    return result;
+}
+
+// Robustez (sem ID): o host troca o `on_form_valid` depois do `init()` e antes do `ajax()`: o que ele pôs é o que roda.
+function reinitOverride() {
+    const world = createWorld();
+    const calls = [];
+    world.cmdasyncform.init('#task-output');
+    world.cmdasyncform.on_form_valid = function (data) { calls.push(data.task.id); };
+    world.cmdasyncform.ajax(TASK_FORM, {});
+    world.formValid('t1');
+    return {calls: calls, after: world.state()};
+}
+
+// Robustez (sem ID): o `init()` sem o `ajax()` não liga o acompanhamento (um form-valid à mão não consulta).
+function initWithoutAjax() {
+    const world = createWorld();
+    world.cmdasyncform.init('#task-output');
+    world.cmdasyncform.exc_event_callbacks('form-valid', {task: {id: 't1', command: {name: 'cmdasync_echo'}}});
+    return {after: world.state()};
+}
+
 function revokeUrls(world) {
     return world.revokeRequests().map(function (request) { return request.url; });
 }
@@ -586,6 +665,20 @@ register('follow:ready', followReady);
     });
 });
 register('submit:none', function () { return abortDuringSubmit('cancel', false); });
+
+// #8968, AC-8968-1 a -3: o host que chama o ajax() mais de uma vez, e o init() no meio
+register('ajax:again:new', function () { return againChain('new', 1); });
+register('ajax:again:same', function () { return againChain('same', 1); });
+register('ajax:again:many', function () { return againChain('new', 3); });
+register('ajax:again:mixed', function () { return againChain('mixed', 3); });
+register('ajax:reinit:many', function () { return reinitChain(2); });
+register('ajax:reinit', function () { return reinitChain(1); });
+['cancel', 'switch'].forEach(function (trigger) {
+    register('ajax:again:same:interrupt:' + trigger, function () { return againInterrupt(trigger); });
+});
+// Robustez (sem ID)
+register('ajax:reinit:override', reinitOverride);
+register('robust:init-without-ajax', initWithoutAjax);
 
 // AC-8955-3, -4 e -5
 ['first', 'second'].forEach(function (run) {

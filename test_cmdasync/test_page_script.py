@@ -526,6 +526,67 @@ class FollowUpRobustnessTest(ScenarioTestCase):
         self.assertEqual(found['afterFormValid']['statusRequests'], 0, msg='the interruption did not stop the first query')
 
 
+class AjaxRegistrationTest(ScenarioTestCase):
+    """O `ajax()` do handler chamado mais de uma vez pelo host registra o acompanhamento uma só vez (AC-8968-1 a -3)."""
+
+    CHAIN_SCENARIOS = ('ajax:again:new', 'ajax:again:same', 'ajax:again:many', 'ajax:again:mixed', 'ajax:reinit:many')
+
+    def assertOneChain(self, found, name):
+        """Uma só cadeia de consultas: uma consulta depois do form-valid, uma nova por resposta «não pronta», e a pronta a termina."""
+        sent = found['afterFormValid']
+        self.assertEqual((sent['statusRequests'], sent['pendingStatus']), (1, 1),
+                         msg='{0}: more than one status query went out for the task'.format(name))
+        waiting = found['afterNotReady']
+        self.assertEqual((waiting['pendingStatus'], waiting['liveTimers']), (0, 1),
+                         msg='{0}: the not-ready answer did not leave exactly one new query scheduled'.format(name))
+        timed = found['afterTimer']
+        self.assertEqual((timed['statusRequests'], timed['pendingStatus'], timed['liveTimers']), (2, 1, 0),
+                         msg='{0}: the timer did not send exactly one query'.format(name))
+        done = found['afterReady']
+        self.assertEqual((done['pendingStatus'], done['liveTimers']), (0, 0),
+                         msg='{0}: the ready answer did not end the follow-up (a query in flight or a timer is left)'.format(name))
+        self.assertEqual(found['afterLater']['statusRequests'], 2, msg='{0}: a query went out after the follow-up ended'.format(name))
+
+    def test_a_task_is_followed_by_one_chain_of_queries_however_many_times_ajax_was_called(self):
+        """AC-8968-1: com o ajax() chamado mais de uma vez desde o último init() (objeto novo, o devolvido ou os dois), a tarefa é acompanhada por uma só cadeia de consultas de estado."""
+        for name in self.CHAIN_SCENARIOS:
+            with self.subTest(scenario=name):
+                self.assertOneChain(self.scenario(name), name)
+
+    def test_an_interruption_during_the_submit_ends_the_follow_up_whole_with_ajax_called_again(self):
+        """AC-8968-2: o Cancel e a troca de comando durante o envio, com o ajax() chamado de novo com o objeto que ele devolveu, liberam a tela quando a resposta chega, sem consulta, e o comando seguinte é acompanhado até o fim."""
+        for trigger in ('cancel', 'switch'):
+            with self.subTest(trigger=trigger):
+                found = self.scenario('ajax:again:same:interrupt:{0}'.format(trigger))
+                self.assertEqual(found['before']['statusRequests'], 0, msg='precondition: the form is still in flight')
+                self.assertTrue(found['clicked'], msg='precondition: the interruption reached the handler (the button was enabled)')
+                answered = found['afterAnswer']
+                self.assertEqual(answered['statusRequests'], 0, msg='a status query went out for the interrupted task')
+                self.assertEqual(answered['pendingStatus'], 0)
+                self.assertEqual(answered['liveTimers'], 0)
+                self.assertAtRest(answered, msg='the screen was not released when the answer of the form arrived')
+                self.assertEqual(answered['output'], '', msg='an output was shown after the interruption')
+                self.assertEqual(found['afterAdvance']['statusRequests'], 0, msg='a status query went out later')
+                second = found['second']
+                self.assertEqual(second['output'], 'SECOND OUTPUT', msg='the next command was not followed to its end')
+                self.assertAtRest(second)
+
+    def test_the_follow_up_starts_after_the_init_and_one_ajax_call(self):
+        """AC-8968-3 (controle): o ajax(), o init() e uma só chamada do ajax() de novo ainda acompanham a tarefa, com uma só cadeia."""
+        self.assertOneChain(self.scenario('ajax:reinit'), 'ajax:reinit')
+
+    def test_a_host_that_replaces_on_form_valid_after_the_init_gets_its_function_called(self):
+        # Robustez (sem ID): depois de um init(), o ajax() liga o on_form_valid que o objeto tem então (a troca do host vale).
+        found = self.scenario('ajax:reinit:override')
+        self.assertEqual(found['calls'], ['t1'], msg='the on_form_valid the host put in place was not the one called, or it was called twice')
+        self.assertEqual(found['after']['statusRequests'], 0, msg='the default on_form_valid ran as well')
+
+    def test_init_without_ajax_does_not_wire_the_follow_up(self):
+        # Robustez (sem ID): o init() sem o ajax() não liga o acompanhamento; um form-valid disparado à mão não consulta.
+        found = self.scenario('robust:init-without-ajax')
+        self.assertEqual(found['after']['statusRequests'], 0, msg='a form-valid after init() with no ajax() started a follow-up')
+
+
 class AlertClearingTest(ScenarioTestCase):
     """O aviso de falha some na ação seguinte do usuário (AC-8866-12)."""
 
@@ -806,6 +867,15 @@ class DoubleAssumptionsTest(TestCase):
         ajax = re.search(r'\.ajax\(', source)
         self.assertLess(position, validate, msg='the beforeSubmit no longer runs before the form-submit-validate event')
         self.assertLess(position, ajax.start(), msg='the beforeSubmit no longer runs before the $.ajax of the submit')
+
+    def test_jquery_form_unbinds_the_form_events_before_it_binds_the_new_options(self):
+        # O dublê (world.js, ajaxForm) guarda só o último objeto de opções: o jquery.form de verdade, chamado de novo no mesmo
+        # elemento, desliga os eventos do formulário antes de ligar os do objeto novo (ajaxFormUnbind), então um host que chama o
+        # ajax() mais de uma vez tem um `success` por envio e o que acumula é a lista de ouvintes do handler (#8968). Lido na fonte
+        # entregue (jquery.form.v4.4.2.min.js, ajaxForm); se a versão mudar, este teste obriga a conferir de novo.
+        source = JQUERY_FORM.read_text(encoding='utf-8')
+        found = re.findall(r'ajaxFormUnbind\(\)\.on\(["\']submit\.form-plugin["\']', source)
+        self.assertEqual(len(found), 1, msg='ajaxForm no longer unbinds the form events before it binds the new ones (or does it twice)')
 
     def test_the_notice_of_the_page_has_the_body_and_the_badge_the_double_assumes(self):
         # O dublê (world.js) dá ao #popup-msg um `.toast-body` e um `.online` à mão; o script de workers escreve a frase do 403, os
