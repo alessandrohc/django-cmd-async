@@ -37,7 +37,7 @@ OWNER_CACHES = {
     'dropping': {'BACKEND': 'test_cmdasync.caches.DroppingCache', 'LOCATION': 'dropping-8864'},
     'broken': {'BACKEND': 'test_cmdasync.caches.RaisingCache', 'LOCATION': 'broken-8864'},
 }
-#: os casos em que o pedido não é de um dono: o que a rota nega com o mesmo 404 (AC-8864-5 … -10, -13)
+#: os casos em que o pedido não é de um dono: o que a rota nega com o mesmo 404 (AC-8992-1, AC-8864-6 … -10, -13)
 DENIALS = ('foreign', 'unknown', 'lost', 'dropped', 'unreadable')
 OWNER_ALIAS = 'COMMANDS_ASYNC_OWNER_CACHE_ALIAS'
 OWNERSHIP = 'COMMANDS_ASYNC_TASK_OWNERSHIP'
@@ -140,7 +140,7 @@ class OwnerCheckTest(OwnerTestCase):
     """O que a rota status nega a quem não é dono da tarefa, e o que serve a quem é."""
 
     def test_another_user_is_answered_not_found_with_any_method(self):
-        """AC-8864-5: a task launched by another user is answered 404 with `task` null, with any HTTP method, and no data."""
+        """AC-8992-1: a task launched by another user is answered 404 with `task` null, with any HTTP method, and no data."""
         owner = self.launched_by_owner('task-5')
         other = self.logged(self.other)
 
