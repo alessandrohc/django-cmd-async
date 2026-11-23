@@ -210,6 +210,17 @@ ALERT_TEXTS = {
     'data-not-found-text': 'Task not found.',
 }
 
+# Os dois textos de falha do #8961, exatamente como o AC-8961-7 os diz: o de erro de servidor e o de falha de conexão, em inglês
+# (sem tradução) e em português (o do .po pt_BR); a chave é o data-* do #task-panel.
+FAILURE_TEXTS = {
+    'data-server-error-text': 'The server could not answer the request, and the last command sent may still be running: check before running it again.',
+    'data-network-error-text': 'The connection to the server failed or took too long, and the last command sent may still be running: check before running it again.',
+}
+FAILURE_TEXTS_PT_BR = {
+    'data-server-error-text': 'O servidor não conseguiu responder ao pedido, e o último comando enviado pode continuar em execução: confira antes de executá-lo de novo.',
+    'data-network-error-text': 'A conexão com o servidor falhou ou demorou demais, e o último comando enviado pode continuar em execução: confira antes de executá-lo de novo.',
+}
+
 
 class AlertContractTest(TestCase):
     """O que o script usa nos avisos de falha e no texto de execução, publicado pela página do pacote (AC-8866-9, AC-8967-3)."""
@@ -248,6 +259,23 @@ class AlertContractTest(TestCase):
             translated = translation.gettext(phrase)
             self.assertNotEqual(translated, phrase, msg='the pt_BR catalog has no entry for this phrase')
             self.assertEqual(panel.get('data-running-text'), translated)
+
+    def test_the_page_publishes_the_server_and_connection_failure_texts_untranslated(self):
+        """AC-8961-7: o painel publica o texto de erro de servidor e o de falha de conexão, exatamente nas frases do critério, quando não há tradução."""
+        panel = self.page()['task-panel']
+        for attribute, phrase in FAILURE_TEXTS.items():
+            with self.subTest(attribute=attribute):
+                self.assertEqual(panel.get(attribute), phrase)
+
+    def test_the_page_publishes_the_server_and_connection_failure_texts_in_pt_br(self):
+        """AC-8961-7: os dois textos chegam em pt_BR, exatamente nas frases do critério, quando o idioma é pt-br (o catálogo traduz as duas frases)."""
+        with translation.override('pt-br'):
+            panel = self.page()['task-panel']
+            for attribute, phrase in FAILURE_TEXTS.items():
+                with self.subTest(attribute=attribute):
+                    self.assertEqual(translation.gettext(phrase), FAILURE_TEXTS_PT_BR[attribute],
+                                     msg='the pt_BR catalog does not translate this phrase')
+                    self.assertEqual(panel.get(attribute), FAILURE_TEXTS_PT_BR[attribute])
 
     def test_the_page_publishes_the_failure_texts_translated(self):
         """AC-8866-9: os textos da falha chegam traduzidos para o idioma do usuário quando há tradução."""

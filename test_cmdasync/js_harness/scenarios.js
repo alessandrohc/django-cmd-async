@@ -29,6 +29,13 @@ const STATUS_FAILURES = {
     http429: {status: 429, body: 'Too Many Requests'},
     http500: {status: 500, body: '<html>boom</html>'},
     network: {status: 0, body: ''},
+    // #8961 (AC-8961-1): as outras falhas HTTP da consulta; o `html202` é um 2xx que não é 200 nem 204 com corpo que não é JSON
+    // (o que o jQuery manda ao `.fail` como `parsererror`; o 204 é sucesso «nocontent» no jQuery e fica fora, follow-up F3)
+    http400: jsonResponse(400, {task: null}),
+    http401: {status: 401, body: ''},
+    http405: {status: 405, body: ''},
+    http503: jsonResponse(503, {task: null}),
+    html202: {status: 202, body: '<html>accepted</html>'},
 };
 
 const SERVER_ERROR_TEXT = 'Server said: <b>no</b>';
@@ -48,6 +55,14 @@ const TEMPLATES = {
     nospace: {alertSpace: false, texts: false},
     spaceonly: {alertSpace: true, texts: false},
 };
+
+// Os modelos dos cenários de falha do #8961: os de sempre e os de um host que traz só parte dos dois textos novos
+// (oldtexts: o espaço do aviso e os três textos antigos, sem os novos; noserver: só o de conexão; nonetwork: só o de servidor).
+const FAILURE_TEMPLATES = Object.assign({}, TEMPLATES, {
+    oldtexts: {failureTexts: 'none'},
+    noserver: {failureTexts: 'network'},
+    nonetwork: {failureTexts: 'server'},
+});
 
 // Envia o comando e passa por `waits` respostas "não pronta"; no fim há uma nova consulta AGENDADA (timer vivo).
 function trackWaits(world, waits) {
@@ -90,7 +105,7 @@ function revokeAccepted() {
 }
 
 function statusFailure(kind, template) {
-    const world = createWorld(TEMPLATES[template]);
+    const world = createWorld(FAILURE_TEMPLATES[template]);
     world.execute('t1');
     world.answerStatus(STATUS_FAILURES[kind]);
     const result = {after: world.state()};
@@ -600,6 +615,201 @@ function workersResult(kind) {
     return result;
 }
 
+// ---------------------------------------------------------------- #8961: o motivo da falha, o aviso e o tempo limite
+// As falhas do envio do formulário (o `error` do ajaxForm recebe o jqXHR; o 400 traz os erros do formulário em JSON).
+const FIELD_ERRORS_400 = {app_command: ['bad command'], args: ['bad args'], kwargs: ['bad kwargs']};
+const FORM_FAILURES = {
+    http400: {status: 400, responseJSON: {form: {errors: FIELD_ERRORS_400}}},
+    http401: {status: 401},
+    http403: {status: 403},
+    http413: {status: 413},
+    http429: {status: 429},
+    http500: {status: 500},
+    http503: {status: 503},
+    network: {status: 0},
+};
+
+// AC-8961-4, -6, -9 e -12: o envio que falha, num modelo de template.
+function formFailure(kind, template) {
+    const world = createWorld(FAILURE_TEMPLATES[template]);
+    world.executeStart();
+    world.formError(FORM_FAILURES[kind]);
+    return {after: world.state()};
+}
+
+// AC-8961-4 e -12: o 400 com os erros em JSON e todo status de 401 a 499, um mundo novo para cada: o aviso de cada um e a tela.
+function formSweep() {
+    const statuses = [400];
+    for (let status = 401; status <= 499; status++) statuses.push(status);
+    const rows = statuses.map(function (status) {
+        const world = createWorld();
+        world.executeStart();
+        world.formError(status === 400 ? FORM_FAILURES.http400 : {status: status});
+        const state = world.state();
+        return {status: status, alert: state.alert, execute: state.execute, cancel: state.cancel, revoke: state.revoke, uncaught: state.uncaught};
+    });
+    return {rows: rows};
+}
+
+// AC-8961-4: o Cancel ou a troca de comando com o envio em voo, e o envio falha depois.
+function submitInterruptedFailure(trigger, kind) {
+    const world = createWorld({commandsList: trigger === 'switch'});
+    world.executeStart();
+    clickTrigger(world, trigger);
+    const result = {afterAbort: world.state()};
+    world.formError(FORM_FAILURES[kind]);
+    result.afterFail = world.state();
+    return result;
+}
+
+// AC-8961-3 e -6: a 1ª consulta de estado sem resposta; o corte aos 30 s (o padrão do handler).
+function timeoutFirst(template) {
+    const world = createWorld(FAILURE_TEMPLATES[template]);
+    world.execute('t1');
+    const result = {start: world.state()};
+    world.advance(29999);
+    result.at29999 = world.state();
+    world.advance(1);
+    result.at30000 = world.state();
+    world.advance(60000);
+    result.later = world.state();
+    return result;
+}
+
+// AC-8961-3: a 2ª consulta (sai em t = 1000, depois de uma resposta «não pronta») tem o limite dela, contado do envio dela.
+// Não se afirma o painel: a falha da 2ª consulta em diante deixa «Running command...» (o #9005).
+function timeoutSecond() {
+    const world = createWorld();
+    world.execute('t1');
+    world.answerStatus(NOT_READY);
+    world.advance(1000);
+    const result = {start: world.state()};
+    world.advance(29999);
+    result.at29999 = world.state();
+    world.advance(1);
+    result.at30000 = world.state();
+    return result;
+}
+
+// AC-8961-3 (controle): a consulta respondida a tempo não é cortada.
+function timeoutAnswered() {
+    const world = createWorld();
+    world.execute('t1');
+    world.advance(29999);
+    world.answerStatus(ready('done'));
+    const result = {afterAnswer: world.state()};
+    world.advance(120000);
+    result.later = world.state();
+    return result;
+}
+
+// AC-8961-3: o valor que o host atribui DEPOIS do init() (a página já o chamou): 5000 corta aos 5 s, e 0 desliga o corte.
+function timeoutValue(value) {
+    const world = createWorld();
+    world.cmdasyncform.query_timeout = value;
+    world.execute('t1');
+    const result = {start: world.state()};
+    world.advance(value === 0 ? 120000 : value - 1);
+    result.beforeCut = world.state();
+    if (value > 0) {
+        world.advance(1);
+        result.afterCut = world.state();
+    }
+    return result;
+}
+
+// AC-8961-3: o valor que o host atribui ANTES do init() sobrevive a ele, e a consulta seguinte o leva.
+function timeoutBeforeInit() {
+    const world = createWorld();
+    world.cmdasyncform.query_timeout = 5000;
+    world.cmdasyncform.init('#task-output');
+    const result = {afterInit: world.cmdasyncform.query_timeout};
+    world.cmdasyncform.request({id: 't9'});
+    result.afterRequest = world.state();
+    return result;
+}
+
+// AC-8961-3: o Cancel ou a troca de comando com a consulta em voo, e o corte aos 30 s depois deles.
+function timeoutInterrupted(trigger) {
+    const world = createWorld({commandsList: trigger === 'switch'});
+    world.execute('t1');
+    clickTrigger(world, trigger);
+    const result = {afterAbort: world.state()};
+    world.advance(30000);
+    result.afterCut = world.state();
+    return result;
+}
+
+// AC-8961-8 e -10: os ouvintes de um host veem o motivo e, depois dele, o `update-finish`.
+function failureReasons(kind) {
+    const world = createWorld();
+    const log = [];
+    world.cmdasyncform.add_event_callback('update-failed', function (reason) { log.push('failed:' + reason); });
+    world.cmdasyncform.add_event_callback('update-finish', function () { log.push('finish'); });
+    world.execute('t1');
+    if (kind === 'timeout') world.advance(30000);
+    else world.answerStatus(STATUS_FAILURES[kind]);
+    return {log: log, after: world.state()};
+}
+
+// AC-8961-5: o corte da consulta de workers. 'default': a página (30 s); 'custom': o host atribui 5000 antes da consulta
+// (modo manual); 'hostload': um script do host atribui 5000 na carga e a 1ª consulta da página usa o valor; 'zero': o corte desligado.
+function workersTimeout(how) {
+    const world = how === 'default' ? createWorld({workers: 'page'})
+        : how === 'hostload' ? createWorld({workers: 'page', queryTimeout: 5000})
+            : createWorld({workers: 'manual'});
+    if (how === 'custom') world.cmdasyncform.query_timeout = 5000;
+    if (how === 'zero') world.cmdasyncform.query_timeout = 0;
+    if (how === 'custom' || how === 'zero') world.workersCheck();
+    const result = {start: world.state()};
+    if (how === 'zero') {
+        world.advance(120000);
+        result.later = world.state();
+        return result;
+    }
+    const limit = how === 'default' ? 30000 : 5000;
+    world.advance(limit - 1);
+    result.beforeCut = world.state();
+    world.advance(1);
+    result.atCut = world.state();
+    world.advance(4999);
+    result.beforeAgain = world.state();
+    world.advance(1);
+    result.again = world.state();
+    return result;
+}
+
+// AC-8961-5: o valor que o host atribui DEPOIS da 1ª consulta é o limite da consulta seguinte (a sonda lê a propriedade a cada
+// rodada, e não a guarda na 1ª): a 1ª leva o padrão e é cortada aos 30 s, e a 2ª, que sai 5 s depois, leva o valor novo.
+function workersTimeoutLater() {
+    const world = createWorld({workers: 'page'});
+    const result = {start: world.state()};
+    world.cmdasyncform.query_timeout = 5000;
+    world.advance(30000);
+    result.atFirstCut = world.state();
+    world.advance(5000);
+    result.secondSent = world.state();
+    world.advance(4999);
+    result.beforeSecondCut = world.state();
+    world.advance(1);
+    result.atSecondCut = world.state();
+    return result;
+}
+
+// AC-8961-11 (`SHALL CONTINUE TO`): a revogação em voo não é cortada por tempo, qualquer que seja o `query_timeout`
+// ('default', '5000' ou 'zero'); o `ajaxForm` do envio não leva `timeout` (o estado traz `formTimeout`).
+function outOfScope(how) {
+    const world = createWorld();
+    if (how === '5000') world.cmdasyncform.query_timeout = 5000;
+    if (how === 'zero') world.cmdasyncform.query_timeout = 0;
+    trackWaits(world, 1);
+    world.click('#btn-task-revoke');
+    const result = {inFlight: world.state()};
+    world.advance(120000);
+    result.later = world.state();
+    return result;
+}
+
 const scenarios = {};
 function register(name, fn) {
     try {
@@ -735,12 +945,71 @@ register('boot:workers', function () {
     return {state: world.state(), boot: world.boot()};
 });
 
+// #8961: o motivo da falha, o aviso e o tempo limite
+// AC-8961-6: o host que traz só parte dos textos novos (os modelos de FAILURE_TEMPLATES que não são os de sempre)
+['http500', 'http429', 'html502', 'network'].forEach(function (kind) {
+    ['oldtexts', 'noserver', 'nonetwork'].forEach(function (template) {
+        register('status:' + kind + ':' + template, function () { return statusFailure(kind, template); });
+    });
+});
+// AC-8961-3 e -6: o corte da 1ª consulta (o modelo de cada host), o da 2ª, o da respondida a tempo (controle), o valor do host
+['full', 'nospace', 'spaceonly', 'oldtexts'].forEach(function (template) {
+    register('timeout:status:first:' + template, function () { return timeoutFirst(template); });
+});
+register('timeout:status:second', timeoutSecond);
+register('timeout:status:answered', timeoutAnswered);
+register('timeout:status:value:5000', function () { return timeoutValue(5000); });
+register('timeout:status:value:zero', function () { return timeoutValue(0); });
+register('timeout:status:before-init', timeoutBeforeInit);
+['cancel', 'switch'].forEach(function (trigger) {
+    register('timeout:status:interrupted:' + trigger, function () { return timeoutInterrupted(trigger); });
+});
+// AC-8961-4, -6, -9 e -12: o envio que falha
+['http500', 'http503', 'network', 'http400'].forEach(function (kind) {
+    register('form:' + kind + ':full', function () { return formFailure(kind, 'full'); });
+});
+['http500', 'network'].forEach(function (kind) {
+    ['nospace', 'spaceonly', 'oldtexts'].forEach(function (template) {
+        register('form:' + kind + ':' + template, function () { return formFailure(kind, template); });
+    });
+});
+register('form:4xx-sweep', formSweep);
+['cancel', 'switch'].forEach(function (trigger) {
+    ['http500', 'network'].forEach(function (kind) {
+        register('submit:' + trigger + ':fail:' + kind, function () { return submitInterruptedFailure(trigger, kind); });
+    });
+});
+// AC-8961-8 e -10: o motivo que os ouvintes do evento recebem
+['http400', 'http429', 'http500', 'html502', 'html202', 'network', 'timeout', 'http403', 'http404', 'html200'].forEach(function (kind) {
+    register('reasons:' + kind, function () { return failureReasons(kind); });
+});
+// AC-8961-5: o corte da consulta de workers
+['default', 'custom', 'hostload', 'zero'].forEach(function (how) {
+    register('workers:timeout:' + how, function () { return workersTimeout(how); });
+});
+// AC-8961-6 (o host com só um dos textos): o envio que falha e o corte da consulta de estado
+['http500', 'network'].forEach(function (kind) {
+    ['noserver', 'nonetwork'].forEach(function (template) {
+        register('form:' + kind + ':' + template, function () { return formFailure(kind, template); });
+    });
+});
+['noserver', 'nonetwork'].forEach(function (template) {
+    register('timeout:status:first:' + template, function () { return timeoutFirst(template); });
+});
+// AC-8961-5: o valor que o host atribui depois da 1ª consulta
+register('workers:timeout:later', workersTimeoutLater);
+// AC-8961-11: o envio e a revogação sem corte por tempo
+['default', '5000', 'zero'].forEach(function (how) {
+    register('timeout:out-of-scope:' + how, function () { return outOfScope(how); });
+});
+
 const initial = createWorld().state();
 process.stdout.write(JSON.stringify({
     constants: {
         texts: TEXTS,
         page: PAGE,
         serverErrorText: SERVER_ERROR_TEXT,
+        fieldErrors400: FIELD_ERRORS_400,
         initialButtons: {
             execute: initial.execute.disabled,
             cancel: initial.cancel.disabled,

@@ -11,6 +11,10 @@ function cmdasyncTextNode(value) {
 }
 
 cmdasyncform = {
+    // How long (ms) a status query, and the workers probe, waits for an answer before it is cut and told as a network
+    // failure ('network'); 0 turns the cut off, as in jQuery. The default lives here and not in init(): a host that
+    // assigns it before or after init() is served, and init() never undoes it. Read when each query goes out.
+    query_timeout: 30000,
     csrfSafeMethod: function(method) {
         // these HTTP methods do not require CSRF protection
         return (/^(GET|HEAD|OPTIONS|TRACE)$/.test(method));
@@ -56,8 +60,8 @@ cmdasyncform = {
             'form-valid': [],
             'update-finish': [],
             'updating': [],
-            // the status query was refused or never got a JSON answer; the argument says why
-            // ('login', 'forbidden' or 'not-found')
+            // the status query failed; the argument says why ('login', 'forbidden', 'not-found', 'server' or
+            // 'network', see failure_reason)
             'update-failed': [],
             // the revocation request failed; the argument is the text the server sent, or null
             'revoke-failed': []
@@ -88,7 +92,10 @@ cmdasyncform = {
             type: "get",
             url: "status/" + task.id,
             cache: false,
-            dataType: "json"
+            dataType: "json",
+            // a query with no answer in this time is aborted by jQuery as a 'timeout' (status 0), which
+            // failure_reason tells as 'network'
+            timeout: self.query_timeout
         });
         req.done(function (data) {
             var task = data.task;
@@ -155,8 +162,12 @@ cmdasyncform = {
             return 'forbidden';
         if (xhr.status === 404)
             return 'not-found';
-        // server errors and network failures stop the follow-up without a reason
-        return null;
+        // no answer at all: the network failed, or jQuery cut the query at query_timeout (status 0)
+        if (xhr.status === 0)
+            return 'network';
+        // any other failure: an HTTP error (400, 401, 405, 429, a 5xx, an HTML error page) or a 2xx with a body that is
+        // not JSON. The user needs the same thing for all of them, so the reason is not told by status
+        return 'server';
     },
     revoke_task : function () {
         var self = this;

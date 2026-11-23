@@ -199,6 +199,227 @@ class StatusFailureTest(ScenarioTestCase):
                 self.assertEqual(found['later']['liveTimers'], 0)
 
 
+class StatusFailureTextTest(ScenarioTestCase):
+    """O aviso da consulta de estado que falha por erro de servidor ou de rede (AC-8961-1 e -2, #8961)."""
+
+    # os erros HTTP que não são 403, 404 nem o 200 que não é JSON; o `html202` é um 2xx com corpo HTML (o que o jQuery real manda ao `.fail`)
+    SERVER_KINDS = ('http400', 'http401', 'http405', 'http429', 'http500', 'http503', 'html502', 'html202')
+
+    def test_a_status_query_that_fails_with_an_http_error_tells_the_server_could_not_answer(self):
+        """AC-8961-1: o erro HTTP da consulta de estado que não é 403, 404 nem o login mostra o texto de erro de servidor."""
+        self.assertNotEqual(self.texts['serverFailureText'], self.texts['networkFailureText'], msg='precondition: the two texts differ')
+        for kind in self.SERVER_KINDS:
+            with self.subTest(failure=kind):
+                found = self.scenario('status:{0}:full'.format(kind))
+                after = found['after']
+                self.assertEqual(after['uncaught'], [], msg='the status callback raised')
+                self.assertAlertShows(after, self.texts['serverFailureText'], msg=kind)
+                # a parada e a liberação seguem as de hoje (AC-8866-5): o aviso não prende a tela nem agenda consulta
+                self.assertAtRest(after)
+                self.assertEqual(after['liveTimers'], 0, msg='a new query stayed scheduled')
+                self.assertEqual(found['later']['statusRequests'], 1, msg='a new query went out after the failure')
+
+    def test_a_status_query_without_an_answer_tells_the_connection_failed(self):
+        """AC-8961-2: a consulta de estado que falha sem resposta do servidor (a falha de rede) mostra o texto de falha de conexão."""
+        found = self.scenario('status:network:full')
+        after = found['after']
+        self.assertEqual(after['uncaught'], [])
+        self.assertAlertShows(after, self.texts['networkFailureText'], msg='network')
+        self.assertAtRest(after)
+        self.assertEqual(after['liveTimers'], 0, msg='a new query stayed scheduled')
+        self.assertEqual(found['later']['statusRequests'], 1, msg='a new query went out after the failure')
+
+    def test_the_notice_also_shows_when_the_follow_up_was_interrupted(self):
+        """AC-8961-1, AC-8961-2: com o acompanhamento interrompido (Cancel ou troca de comando), a consulta em voo que falha mostra o mesmo aviso."""
+        cases = []
+        for trigger in ('cancel', 'switch'):
+            for waits in (2, 3):
+                cases.append(('abort:{0}:{1}:flight:fail:http500'.format(trigger, waits), 'serverFailureText'))
+                cases.append(('abort:{0}:{1}:flight:fail:network'.format(trigger, waits), 'networkFailureText'))
+            cases.append(('first:{0}:fail:http500'.format(trigger), 'serverFailureText'))
+            cases.append(('first:{0}:fail:network'.format(trigger), 'networkFailureText'))
+        self.assertEqual(len(cases), 12, msg='the case list changed size')
+        for name, text in cases:
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertEqual(found['afterAbort']['pendingStatus'], 1, msg='precondition: the query is in flight')
+                self.assertAlertEmpty(found['afterAbort'], msg='precondition: the Cancel or the switch hid the previous notice')
+                answered = found['afterAnswer']
+                self.assertEqual(answered['pendingStatus'], 0, msg='precondition: the query ended')
+                self.assertAlertShows(answered, self.texts[text], msg=name)
+                self.assertAtRest(answered)
+
+
+class StatusTimeoutTest(ScenarioTestCase):
+    """O tempo limite da consulta de estado e a propriedade `query_timeout` do handler (AC-8961-3, #8961)."""
+
+    def test_a_status_query_without_an_answer_is_cut_after_30_seconds_as_a_connection_failure(self):
+        """AC-8961-3: a consulta de estado sem resposta é cortada aos 30 s e tratada como a falha de rede (texto de conexão, tela liberada)."""
+        found = self.scenario('timeout:status:first:full')
+        self.assertEqual(found['start']['pendingStatus'], 1, msg='precondition: the query is in flight')
+        self.assertEqual(found['start']['statusTimeouts'], [30000], msg='the status query does not carry the 30 s limit')
+        waiting = found['at29999']
+        self.assertEqual(waiting['pendingStatus'], 1, msg='the query was cut before 30 seconds')
+        self.assertTrue(waiting['execute']['disabled'], msg='the screen was released before 30 seconds')
+        self.assertAlertEmpty(waiting, msg='a notice showed before the limit')
+        cut = found['at30000']
+        self.assertEqual(cut['uncaught'], [])
+        self.assertEqual(cut['pendingStatus'], 0, msg='the query was not cut at 30 seconds')
+        self.assertAlertShows(cut, self.texts['networkFailureText'], msg='the cut is a connection failure')
+        self.assertAtRest(cut)
+        self.assertEqual(cut['liveTimers'], 0, msg='a new query stayed scheduled')
+        self.assertEqual(found['later']['statusRequests'], 1, msg='a new query went out after the cut')
+
+    def test_each_status_query_has_its_own_limit_counted_from_its_send(self):
+        """AC-8961-3: a 2ª consulta do acompanhamento (enviada 1 s depois de uma resposta «não pronta») tem o limite dela, contado do envio dela."""
+        # Não se afirma o painel: a falha da 2ª consulta em diante deixa «Running command...» e o Copy (o #9005).
+        found = self.scenario('timeout:status:second')
+        start = found['start']
+        self.assertEqual(start['statusRequests'], 2, msg='precondition: the second query went out')
+        self.assertEqual(start['pendingStatus'], 1, msg='precondition: the second query is in flight')
+        self.assertEqual(start['statusTimeouts'], [30000, 30000], msg='the queries do not carry the 30 s limit')
+        self.assertEqual(found['at29999']['pendingStatus'], 1, msg='the second query was cut before its own 30 seconds')
+        cut = found['at30000']
+        self.assertEqual(cut['pendingStatus'], 0, msg='the second query was not cut 30 seconds after its send')
+        self.assertAlertShows(cut, self.texts['networkFailureText'])
+        self.assertAtRest(cut)
+
+    def test_a_status_query_answered_in_time_is_not_cut(self):
+        """AC-8961-3 (controle): a consulta respondida antes do limite não é cortada depois dele."""
+        found = self.scenario('timeout:status:answered')
+        self.assertEqual(found['afterAnswer']['output'], 'done', msg='precondition: the answer ended the follow-up')
+        later = found['later']
+        self.assertEqual(later['uncaught'], [], msg='the cut of an answered query raised')
+        self.assertEqual(later['output'], 'done')
+        self.assertAlertEmpty(later, msg='an answered query was cut')
+        self.assertEqual(later['statusRequests'], 1)
+
+    def test_the_value_the_host_assigns_is_the_limit_and_zero_turns_the_cut_off(self):
+        """AC-8961-3: o `query_timeout` que o host atribui depois do `init()` é o limite da consulta (5000 corta aos 5 s), e 0 desliga o corte."""
+        custom = self.scenario('timeout:status:value:5000')
+        self.assertEqual(custom['start']['statusTimeouts'], [5000], msg='the status query does not carry the value the host assigned')
+        self.assertEqual(custom['beforeCut']['pendingStatus'], 1, msg='the query was cut before the value the host assigned')
+        self.assertEqual(custom['afterCut']['pendingStatus'], 0, msg='the query was not cut at the value the host assigned')
+        self.assertAlertShows(custom['afterCut'], self.texts['networkFailureText'])
+        self.assertAtRest(custom['afterCut'])
+        zero = self.scenario('timeout:status:value:zero')
+        self.assertEqual(zero['start']['statusTimeouts'], [0], msg='the status query does not carry the zero the host assigned')
+        self.assertEqual(zero['beforeCut']['pendingStatus'], 1, msg='the query was cut with the limit turned off')
+        self.assertAlertEmpty(zero['beforeCut'])
+        self.assertTrue(zero['beforeCut']['execute']['disabled'], msg='the screen was released with the limit turned off')
+
+    def test_the_value_assigned_before_the_init_survives_it(self):
+        """AC-8961-3: o valor que o host atribui ao `query_timeout` antes do `init()` sobrevive a ele, e a consulta seguinte o leva."""
+        found = self.scenario('timeout:status:before-init')
+        self.assertEqual(found['afterInit'], 5000, msg='the init() reset the value the host assigned')
+        self.assertEqual(found['afterRequest']['statusTimeouts'], [5000], msg='the query after the init() does not carry the value')
+
+    def test_the_cut_after_an_interruption_releases_the_screen_with_the_connection_notice(self):
+        """AC-8961-3, AC-8961-2: o Cancel ou a troca de comando com a consulta em voo, e o corte aos 30 s depois deles, liberam a tela com o aviso de conexão."""
+        for trigger in ('cancel', 'switch'):
+            with self.subTest(trigger=trigger):
+                found = self.scenario('timeout:status:interrupted:{0}'.format(trigger))
+                self.assertEqual(found['afterAbort']['pendingStatus'], 1, msg='precondition: the query is in flight')
+                cut = found['afterCut']
+                self.assertEqual(cut['pendingStatus'], 0, msg='the query was not cut at 30 seconds')
+                self.assertAlertShows(cut, self.texts['networkFailureText'])
+                self.assertAtRest(cut)
+
+
+class FormFailureTest(ScenarioTestCase):
+    """O envio do formulário que falha: o texto de cada falha e a tela (AC-8961-4, -9 e -12, #8961)."""
+
+    def test_a_submit_that_fails_with_a_server_error_or_no_answer_tells_why(self):
+        """AC-8961-4: o envio que falha por 5xx mostra o texto de erro de servidor, e o que falha sem resposta, o de falha de conexão."""
+        for name, text in (('form:http500:full', 'serverFailureText'), ('form:http503:full', 'serverFailureText'),
+                           ('form:network:full', 'networkFailureText')):
+            with self.subTest(scenario=name):
+                after = self.scenario(name)['after']
+                self.assertEqual(after['uncaught'], [])
+                self.assertAlertShows(after, self.texts[text], msg=name)
+                self.assertAtRest(after)
+
+    def test_the_notice_also_shows_when_the_submit_was_interrupted(self):
+        """AC-8961-4: o Cancel ou a troca de comando com o envio em voo, que depois falha, mostra o mesmo aviso."""
+        for trigger in ('cancel', 'switch'):
+            for kind, text in (('http500', 'serverFailureText'), ('network', 'networkFailureText')):
+                name = 'submit:{0}:fail:{1}'.format(trigger, kind)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.assertTrue(found['afterAbort']['execute']['disabled'], msg='precondition: the submit is in flight')
+                    self.assertAlertEmpty(found['afterAbort'], msg='precondition: the Cancel or the switch hid the previous notice')
+                    self.assertAlertShows(found['afterFail'], self.texts[text], msg=name)
+                    self.assertAtRest(found['afterFail'])
+
+    def test_no_other_failure_of_the_submit_shows_those_texts(self):
+        """AC-8961-4 (controle): nenhuma outra falha do envio (o 400 com os erros do formulário e todo status de 401 a 499) mostra os textos de servidor e de conexão."""
+        rows = self.scenario('form:4xx-sweep')['rows']
+        self.assertEqual([row['status'] for row in rows], [400] + list(range(401, 500)), msg='the sweep changed')
+        for row in rows:
+            with self.subTest(status=row['status']):
+                self.assertIsNotNone(row['alert'], msg='the page has no alert space')
+                self.assertEqual(row['alert']['text'], '', msg='the submit refused with {0} showed a text'.format(row['status']))
+                self.assertTrue(row['alert']['hidden'])
+
+    def test_a_submit_refused_with_the_form_errors_shows_each_error_next_to_its_field(self):
+        """AC-8961-9 (controle): o 400 com os erros do formulário em JSON mostra o erro de cada campo (o do comando e os dos argumentos) ao lado do campo."""
+        after = self.scenario('form:http400:full')['after']
+        errors = self.constants['fieldErrors400']
+        self.assertEqual(after['uncaught'], [])
+        self.assertEqual(after['fieldErrors'], {field: [messages[0]] for field, messages in errors.items()},
+                         msg='the error of a field was not put next to the field')
+        for field in errors:
+            self.assertTrue(after['invalidFields'][field], msg='the field {0} was not marked invalid'.format(field))
+
+    def test_every_failed_submit_releases_the_screen(self):
+        """AC-8961-12 (controle): toda falha do envio (o 400 com os erros em JSON, os outros 4xx, o 5xx, a falta de resposta e o login) libera a tela."""
+        rows = self.scenario('form:4xx-sweep')['rows']
+        self.assertEqual(len(rows), 100, msg='the sweep changed size')
+        for row in rows:
+            with self.subTest(status=row['status']):
+                self.assertEqual(row['uncaught'], [])
+                self.assertAtRest(row, msg='status {0}'.format(row['status']))
+        for name in ('form:http500:full', 'form:http503:full', 'form:network:full', 'form:login200'):
+            with self.subTest(scenario=name):
+                self.assertAtRest(self.scenario(name)['after'], msg=name)
+
+
+class FailureReasonTest(ScenarioTestCase):
+    """O motivo que o handler avisa no evento `update-failed` (AC-8961-8 e -10, #8961)."""
+
+    def test_the_handler_tells_a_server_or_a_network_reason_before_it_releases_the_screen(self):
+        """AC-8961-8: a consulta de estado que falha por erro HTTP avisa o motivo `server`, a que falha sem resposta ou por tempo, `network`, e o `update-failed` sai antes do `update-finish`."""
+        for kind, reason in (('http400', 'server'), ('http429', 'server'), ('http500', 'server'), ('html502', 'server'),
+                             ('html202', 'server'), ('network', 'network'), ('timeout', 'network')):
+            with self.subTest(failure=kind):
+                found = self.scenario('reasons:{0}'.format(kind))
+                self.assertEqual(found['after']['uncaught'], [])
+                self.assertEqual(found['log'], ['failed:' + reason, 'finish'], msg=kind)
+
+    def test_the_handler_keeps_the_reasons_of_a_refusal_and_of_the_login_page(self):
+        """AC-8961-10 (controle): o 403, o 404 e o 200 que não é JSON seguem com os motivos `forbidden`, `not-found` e `login`, antes do `update-finish`."""
+        for kind, reason in (('http403', 'forbidden'), ('http404', 'not-found'), ('html200', 'login')):
+            with self.subTest(failure=kind):
+                found = self.scenario('reasons:{0}'.format(kind))
+                self.assertEqual(found['log'], ['failed:' + reason, 'finish'], msg=kind)
+
+
+class NoClientTimeoutTest(ScenarioTestCase):
+    """O envio do formulário e a revogação seguem sem corte por tempo (AC-8961-11, #8961)."""
+
+    def test_the_submit_and_the_revocation_are_not_cut_by_time_whatever_the_query_timeout(self):
+        """AC-8961-11 (controle): o pedido de revogação em voo segue em voo depois de 120 s e o envio não leva `timeout`, com o `query_timeout` padrão, 5000 e 0."""
+        for how in ('default', '5000', 'zero'):
+            with self.subTest(query_timeout=how):
+                found = self.scenario('timeout:out-of-scope:{0}'.format(how))
+                self.assertEqual(found['inFlight']['pendingRevoke'], 1, msg='precondition: the revocation is in flight')
+                later = found['later']
+                self.assertEqual(later['uncaught'], [])
+                self.assertEqual(later['pendingRevoke'], 1, msg='the revocation was cut by time')
+                self.assertEqual(later['revokeTimeouts'], [None], msg='the revocation carries a time limit')
+                self.assertIsNone(later['formTimeout'], msg='the submit carries a time limit')
+
+
 class CallbackFailureTest(ScenarioTestCase):
     """Um callback de outro código que lança não pode prender a tela (robustez, sem ID)."""
 
@@ -768,6 +989,51 @@ class WorkersProbeTest(ScenarioTestCase):
         self.assertEqual(nobody['afterAnswer']['toast']['body'], ['no Celery worker answered'])
         self.assertEqual(nobody['afterAnswer']['toast']['shown'], 1)
 
+    def test_a_probe_without_an_answer_is_cut_after_30_seconds_and_asked_again_5_seconds_later(self):
+        """AC-8961-5: a consulta de workers sem resposta é cortada aos 30 s e refeita 5 segundos depois, sem abrir o aviso dos workers."""
+        found = self.scenario('workers:timeout:default')
+        self.assertEqual(found['start']['pendingWorkers'], 1, msg='precondition: the query is in flight')
+        self.assertEqual(found['start']['workersTimeouts'], [30000], msg='the workers query does not carry the 30 s limit')
+        self.assertEqual(found['beforeCut']['pendingWorkers'], 1, msg='the query was cut before 30 seconds')
+        cut = found['atCut']
+        self.assertEqual(cut['uncaught'], [], msg='the cut raised a script error')
+        self.assertEqual(cut['pendingWorkers'], 0, msg='the query was not cut at 30 seconds')
+        self.assertEqual(cut['workersRequests'], 1)
+        self.assertEqual(cut['toast']['shown'], 0, msg='the cut opened the notice')
+        self.assertEqual(found['beforeAgain']['workersRequests'], 1, msg='the query was asked again before 5 seconds')
+        self.assertEqual(found['again']['workersRequests'], 2, msg='the query was not asked again 5 seconds after the cut')
+        self.assertEqual(found['again']['pendingWorkers'], 1)
+
+    def test_the_probe_reads_the_query_timeout_when_each_query_goes_out(self):
+        """AC-8961-5: o limite da consulta de workers é o `query_timeout` de quando ela sai (a 1ª, no carregamento, usa o que o host atribuiu até então), e 0 desliga o corte."""
+        for how in ('custom', 'hostload'):
+            with self.subTest(case=how):
+                found = self.scenario('workers:timeout:{0}'.format(how))
+                self.assertEqual(found['start']['pendingWorkers'], 1, msg='precondition: the query is in flight')
+                self.assertEqual(found['start']['workersTimeouts'], [5000], msg='the workers query does not carry the value of the host')
+                self.assertEqual(found['beforeCut']['pendingWorkers'], 1, msg='the query was cut before the value of the host')
+                self.assertEqual(found['atCut']['pendingWorkers'], 0, msg='the query was not cut at the value of the host')
+                self.assertEqual(found['atCut']['uncaught'], [])
+                self.assertEqual(found['beforeAgain']['workersRequests'], 1, msg='the query was asked again before 5 seconds')
+                self.assertEqual(found['again']['workersRequests'], 2, msg='the query was not asked again 5 seconds after the cut')
+        with self.subTest(case='zero'):
+            found = self.scenario('workers:timeout:zero')
+            self.assertEqual(found['start']['workersTimeouts'], [0], msg='the workers query does not carry the zero of the host')
+            self.assertEqual(found['later']['pendingWorkers'], 1, msg='the query was cut with the limit turned off')
+            self.assertEqual(found['later']['workersRequests'], 1)
+
+    def test_a_value_assigned_after_the_first_query_is_the_limit_of_the_next_one(self):
+        """AC-8961-5: o `query_timeout` que o host atribui depois da 1ª consulta é o limite da consulta seguinte em diante (a sonda o lê a cada rodada, e não o guarda na 1ª)."""
+        default = self.scenario('workers:timeout:default')
+        self.assertEqual(default['again']['workersTimeouts'], [30000, 30000], msg='the second query of the probe does not carry the default')
+        found = self.scenario('workers:timeout:later')
+        self.assertEqual(found['start']['workersTimeouts'], [30000], msg='precondition: the first query carries the default')
+        self.assertEqual(found['atFirstCut']['pendingWorkers'], 0, msg='precondition: the first query was cut at its own 30 seconds')
+        self.assertEqual(found['secondSent']['workersTimeouts'], [30000, 5000],
+                         msg='the next query does not carry the value the host assigned after the first one')
+        self.assertEqual(found['beforeSecondCut']['pendingWorkers'], 1, msg='the next query was cut before the value the host assigned')
+        self.assertEqual(found['atSecondCut']['pendingWorkers'], 0, msg='the next query was not cut at the value the host assigned')
+
 
 class HostTemplateTest(ScenarioTestCase):
     """Um host com template próprio, sem o espaço do aviso ou sem os textos (AC-8866-15)."""
@@ -806,6 +1072,73 @@ class HostTemplateTest(ScenarioTestCase):
             for kind in REVOKE_KINDS:
                 with self.subTest(template=template, revoke=kind):
                     self.assertEqual(self.scenario('revoke:{0}:{1}:tracking'.format(kind, template))['after']['uncaught'], [])
+
+    def test_a_host_template_without_the_failure_texts_handles_the_failures_silently(self):
+        """AC-8961-6: sem os textos de erro de servidor e de conexão (com ou sem o espaço do aviso), a consulta de estado (erro de servidor, rede, tempo limite) e o envio (5xx, rede) não lançam erro de script, liberam a tela e não mostram texto."""
+        for template in ('nospace', 'spaceonly', 'oldtexts'):
+            for kind in ('http500', 'http429', 'html502', 'network'):
+                name = 'status:{0}:{1}'.format(kind, template)
+                with self.subTest(scenario=name):
+                    after = self.scenario(name)['after']
+                    self.assertEqual(after['uncaught'], [])
+                    self.assertAtRest(after)
+                    self.assertAlertEmpty(after, msg=name)
+            name = 'timeout:status:first:{0}'.format(template)
+            with self.subTest(scenario=name):
+                cut = self.scenario(name)['at30000']
+                self.assertEqual(cut['uncaught'], [])
+                self.assertEqual(cut['pendingStatus'], 0, msg='the query was not cut')
+                self.assertAtRest(cut)
+                self.assertAlertEmpty(cut, msg=name)
+            for kind in ('http500', 'network'):
+                name = 'form:{0}:{1}'.format(kind, template)
+                with self.subTest(scenario=name):
+                    after = self.scenario(name)['after']
+                    self.assertEqual(after['uncaught'], [])
+                    self.assertAtRest(after)
+                    self.assertAlertEmpty(after, msg=name)
+
+    def test_a_host_template_with_only_one_failure_text_shows_that_one_on_the_submit_and_the_cut(self):
+        """AC-8961-6: o host que traz só um dos dois textos mostra o dele também no envio e no corte da consulta, e fica sem texto na outra falha (nunca o texto da outra)."""
+        # noserver traz só o texto de conexão; nonetwork, só o de servidor
+        for template, kind, text in (('noserver', 'http500', None), ('noserver', 'network', 'networkFailureText'),
+                                     ('nonetwork', 'http500', 'serverFailureText'), ('nonetwork', 'network', None)):
+            name = 'form:{0}:{1}'.format(kind, template)
+            with self.subTest(scenario=name):
+                after = self.scenario(name)['after']
+                self.assertEqual(after['uncaught'], [])
+                self.assertAtRest(after)
+                if text is None:
+                    self.assertAlertEmpty(after, msg=name)
+                else:
+                    self.assertAlertShows(after, self.texts[text], msg=name)
+        # o corte da consulta de estado é uma falha de conexão
+        for template, text in (('noserver', 'networkFailureText'), ('nonetwork', None)):
+            name = 'timeout:status:first:{0}'.format(template)
+            with self.subTest(scenario=name):
+                cut = self.scenario(name)['at30000']
+                self.assertEqual(cut['uncaught'], [])
+                self.assertEqual(cut['pendingStatus'], 0, msg='precondition: the query was cut')
+                self.assertAtRest(cut)
+                if text is None:
+                    self.assertAlertEmpty(cut, msg=name)
+                else:
+                    self.assertAlertShows(cut, self.texts[text], msg=name)
+
+    def test_a_host_template_with_only_one_failure_text_shows_that_one(self):
+        """AC-8961-6: o host que traz só um dos dois textos mostra o dele na falha que ele cobre e fica sem texto na outra, sem erro de script."""
+        # noserver traz só o texto de conexão; nonetwork, só o de servidor
+        for template, kind, text in (('noserver', 'http500', None), ('noserver', 'network', 'networkFailureText'),
+                                     ('nonetwork', 'http500', 'serverFailureText'), ('nonetwork', 'network', None)):
+            name = 'status:{0}:{1}'.format(kind, template)
+            with self.subTest(scenario=name):
+                after = self.scenario(name)['after']
+                self.assertEqual(after['uncaught'], [])
+                self.assertAtRest(after)
+                if text is None:
+                    self.assertAlertEmpty(after, msg=name)
+                else:
+                    self.assertAlertShows(after, self.texts[text], msg=name)
 
 
 def balanced_call(source, start):
@@ -876,6 +1209,57 @@ class DoubleAssumptionsTest(TestCase):
         source = JQUERY_FORM.read_text(encoding='utf-8')
         found = re.findall(r'ajaxFormUnbind\(\)\.on\(["\']submit\.form-plugin["\']', source)
         self.assertEqual(len(found), 1, msg='ajaxForm no longer unbinds the form events before it binds the new ones (or does it twice)')
+
+    def test_the_vendored_jquery_cuts_a_query_with_a_positive_timeout_as_a_timeout(self):
+        # O dublê (world.js, $.ajax) corta o pedido sem resposta quando `timeout > 0` passa, com `textStatus` «timeout» e `status` 0, e
+        # não corta com 0, null nem undefined: é o que o jQuery entregue faz (jquery-3.7.1.min.js, linha do `setTimeout` do `ajax`).
+        # Se a versão mudar, este teste obriga a conferir o corte de novo (#8961).
+        source = (STATIC_CMDASYNC / 'js' / 'jquery-3.7.1.min.js').read_text(encoding='utf-8')
+        self.assertRegex(source, r'async&&0<\w+\.timeout&&\(\w+=\w+\.setTimeout\(function\(\)\{\w+\.abort\("timeout"\)\},\w+\.timeout\)\)',
+                         msg='the vendored jQuery no longer cuts a query with a positive timeout by abort("timeout")')
+
+    def test_the_vendored_jquery_resolves_a_204_as_success_so_the_double_does_not_model_it(self):
+        # O cenário `html202` do dublê (2xx com corpo HTML) chega ao `.fail` como `parsererror` com o status do 2xx; o 204 não: o jQuery
+        # o resolve como sucesso («nocontent») e o `.done` recebe `data` indefinido (o follow-up F3). Lido na fonte entregue
+        # (jquery-3.7.1.min.js); se a versão mudar, este teste obriga a conferir o que o `html202` supõe (#8961).
+        source = (STATIC_CMDASYNC / 'js' / 'jquery-3.7.1.min.js').read_text(encoding='utf-8')
+        self.assertRegex(source, r'204===\w+\|\|"HEAD"===\w+\.type\?\w+="nocontent"',
+                         msg='the vendored jQuery no longer resolves a 204 as success (nocontent)')
+
+    def test_the_wide_variant_of_the_arguments_shows_above_768_px(self):
+        """AC-8961-9 (controle): a variante larga dos argumentos (a que o dublê de node representa) aparece acima de 768 px, e a estreita só até 768 px."""
+        css = (STATIC_CMDASYNC / 'styles.css').read_text(encoding='utf-8')
+        narrow = re.search(r'@media screen and \(max-width:\s*768px\)\s*\{(.*?)\n\}', css, flags=re.S)
+        wide = re.search(r'@media screen and \(min-width:\s*769px\)\s*\{(.*?)\n\}', css, flags=re.S)
+        self.assertIsNotNone(narrow, msg='the rules for the screens up to 768 px are gone')
+        self.assertIsNotNone(wide, msg='the rules for the screens above 768 px are gone')
+        self.assertRegex(narrow.group(1), r'\.form-task-args-lg\s*\{\s*display:\s*none;\s*\}', msg='the wide variant is not hidden up to 768 px')
+        self.assertRegex(narrow.group(1), r'\.form-task-args-md\s*\{\s*display:\s*block;\s*\}', msg='the narrow variant is not shown up to 768 px')
+        self.assertRegex(wide.group(1), r'\.form-task-args-md\s*\{\s*display:\s*none;\s*\}', msg='the narrow variant is not hidden above 768 px')
+        self.assertNotIn('form-task-args-lg', wide.group(1), msg='the wide variant is hidden above 768 px')
+        templates = ROOT / 'commands_async' / 'templates' / 'cmdasync'
+        for name, css_class in (('response-form-task-args-lg.html', 'form-task-args-lg'), ('response-form-task-args-md.html', 'form-task-args-md')):
+            with self.subTest(template=name):
+                self.assertIn(css_class, (templates / name).read_text(encoding='utf-8'), msg='the template lost its variant class')
+
+    def test_jquery_form_hands_the_jqxhr_to_the_error_of_the_page(self):
+        # O dublê chama o `error` do ajaxForm com o jqXHR como 1º argumento, e a falha de rede chega a ele com `status` 0: o jquery.form
+        # embrulha o `error` do host e o repassa com o que o $.ajax entrega (`t.error=function(e,r,a){…w.apply(n,[e,r,a,p])}`). O
+        # formulário não tem campo de arquivo, então o caminho de iframe (que não passa pelo $.ajax) não é usado (#8961).
+        source = JQUERY_FORM.read_text(encoding='utf-8')
+        self.assertRegex(source, r't\.error=function\(e,r,a\)\{var n=t\.context\|\|this;w\.apply\(n,\[e,r,a,p\]\)\}',
+                         msg='the jquery.form no longer hands the jqXHR of the $.ajax to the error of the page')
+
+    def test_the_double_publishes_the_failure_texts_the_template_publishes(self):
+        """AC-8961-7: as frases que o painel da página publica são as mesmas que o dublê de node usa nos cenários de falha."""
+        # O dublê (world.js, TEXTS) publica os dois textos novos nos data-* do painel; se o template mudar a frase, os testes de node
+        # passariam a provar um texto que a tela não mostra (os testes de `test_page.py` conferem o template contra as frases do critério).
+        self.client.force_login(self.user)
+        panel = ButtonCollector()
+        panel.feed(self.client.get(INDEX_URL).content.decode('utf-8'))
+        texts = load_scenarios()['constants']['texts']
+        self.assertEqual(panel.by_id['task-panel'].get('data-server-error-text'), texts['serverFailureText'])
+        self.assertEqual(panel.by_id['task-panel'].get('data-network-error-text'), texts['networkFailureText'])
 
     def test_the_workers_script_reaches_only_the_body_and_the_counter_of_the_notice(self):
         """AC-8969-3 (controle): dentro do aviso, o script da consulta de workers só alcança o corpo e o contador, então o título, o ícone e o botão de fechar ficam como o template os entrega."""

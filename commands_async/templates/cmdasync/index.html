@@ -21,7 +21,7 @@
 {% comment %}
 Everything cmdasync-page.js needs from the server. The two flags are rendered as
 JSON booleans so jQuery.data() hands them over typed, and the messages (the running
-text and the three failure texts) are translated here rather than in the .js so they
+text and the five failure texts) are translated here rather than in the .js so they
 stay in the catalog. #task-alert, below the form, is where the script tells a failure.
 {% endcomment %}
     <div class="card" id="task-panel"
@@ -33,7 +33,9 @@ stay in the catalog. #task-alert, below the form, is where the script tells a fa
          data-running-text="{% trans "Running command..." %}"
          data-revoke-failed-text="{% trans "The revocation request could not be sent." %}"
          data-forbidden-text="{% trans "Access denied: your session may have expired, or you do not have permission to see this task." %}"
-         data-not-found-text="{% trans "Task not found." %}">
+         data-not-found-text="{% trans "Task not found." %}"
+         data-server-error-text="{% trans "The server could not answer the request, and the last command sent may still be running: check before running it again." %}"
+         data-network-error-text="{% trans "The connection to the server failed or took too long, and the last command sent may still be running: check before running it again." %}">
         <div class="card-body">
             {% block panelbody %}
             <h4>{% trans "Checking and updating environment" %}</h4>

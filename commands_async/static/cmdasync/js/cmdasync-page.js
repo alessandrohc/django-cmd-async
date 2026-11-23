@@ -20,7 +20,11 @@ $(document).ready(function () {
         // its own may not publish them: showAlert() then shows only what the server sent.
         revokeFailedText: $panel.data('revoke-failed-text'),
         forbiddenText: $panel.data('forbidden-text'),
-        notFoundText: $panel.data('not-found-text')
+        notFoundText: $panel.data('not-found-text'),
+        // The status query or the submit that fails for a server reason, or with no answer at all (the network failed, or
+        // the query was cut at query_timeout); a host without them shows no text for that failure.
+        serverErrorText: $panel.data('server-error-text'),
+        networkErrorText: $panel.data('network-error-text')
     };
 
     // The alert space (#task-alert) is where a failure is told. .text() only, so what
@@ -169,6 +173,13 @@ $(document).ready(function () {
                         $input.parent().append($feedback.clone().text(data.form.errors[name][0]));
                     }
                     break;
+                case 0:  // no answer: the network failed
+                    showAlert(config.networkErrorText);
+                    break;
+                default:
+                    // a server error says so; the other failures (the 403 of the CSRF, the 429...) show no text
+                    if (xhr.status >= 500)
+                        showAlert(config.serverErrorText);
             }
             requestUpdateFinish();
         }
@@ -201,6 +212,10 @@ $(document).ready(function () {
             showAlert(config.forbiddenText);
         else if (reason === 'not-found')
             showAlert(config.notFoundText);
+        else if (reason === 'server')
+            showAlert(config.serverErrorText);
+        else if (reason === 'network')
+            showAlert(config.networkErrorText);
     });
 
     cmdasyncform.add_event_callback("revoke-failed", function (serverText) {

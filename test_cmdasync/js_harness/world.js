@@ -12,6 +12,10 @@
  *   - sem `dataType`, o HTML do login (200) chega ao `.done` como texto; com `dataType: 'json'` vai
  *     ao `.fail` com `textStatus` 'parsererror' (e status 200);
  *   - um erro HTTP chega ao `.fail` com `textStatus` 'error' e o `status` do jqXHR (0 = rede);
+ *   - `timeout` maior que zero (`jquery-3.7.1.min.js`: `v.async&&0<v.timeout&&(…setTimeout(function(){T.abort("timeout")},
+ *     v.timeout))`) corta o pedido sem resposta quando o tempo passa: o `.fail` recebe `textStatus` 'timeout' e `status` 0;
+ *     `0`, `null` e `undefined` não ligam o corte. O corte confere se o pedido já foi respondido (o jQuery limpa o timer);
+ *     o timer dele não conta em `liveTimers` (que mede as consultas agendadas pela página);
  *   - uma exceção dentro de um callback para os callbacks seguintes da mesma lista e escapa como erro
  *     não capturado (aqui, registrado em `uncaught`, como o `window.onerror` faria);
  *   - `$(function)` e `$(document).ready` rodam numa macrotarefa depois da carga, e a exceção deles
@@ -34,6 +38,10 @@ const TEXTS = {
     revokeFailedText: 'The revocation request could not be sent.',
     forbiddenText: 'Access denied: your session may have expired, or you do not have permission to see this task.',
     notFoundText: 'Task not found.',
+    // Os dois textos de falha do #8961 (data-server-error-text e data-network-error-text). Não se chamam `serverErrorText`:
+    // esse nome é do texto que o SERVIDOR manda na revogação (`serverErrorText` das constantes do scenarios.js).
+    serverFailureText: 'The server could not answer the request, and the last command sent may still be running: check before running it again.',
+    networkFailureText: 'The connection to the server failed or took too long, and the last command sent may still be running: check before running it again.',
     // O que o toast.html do pacote publica em data-forbidden-text (o teste do template, AC-8954-4, confere o real).
     workersForbiddenText: 'Access denied: your session may have expired, or you do not have permission to see the Celery workers.',
 };
@@ -74,8 +82,12 @@ function createWorld(options) {
     // toast: 'full' (o aviso do pacote), 'nophrase' (sem o data-forbidden-text), 'noplugin' (sem o `$.fn.toast`, como num
     // host sem o bootstrap.bundle) ou 'none' (sem o #popup-msg); noFailureReason: um cmdhandler.js sem o `failure_reason`;
     // runningText: o texto de execução que o template publica em data-running-text (padrão TEXTS.runningText; um outro
-    // texto prova que a página escreve o que o template publicou, e não o literal em inglês: a tradução, AC-8967-3).
-    const opts = Object.assign({commandsList: false, alertSpace: true, texts: true, workers: false, toast: 'full', noFailureReason: false}, options || {});
+    // texto prova que a página escreve o que o template publicou, e não o literal em inglês: a tradução, AC-8967-3);
+    // failureTexts: quais dos dois textos de falha do #8961 o painel traz ('both' por padrão, 'none', 'server' ou 'network';
+    // `texts: false` tira também os três antigos); queryTimeout: o valor que um script do host atribui a
+    // `cmdasyncform.query_timeout` na carga, depois do cmdhandler.js e antes do DOM ready (AC-8961-5).
+    const opts = Object.assign({commandsList: false, alertSpace: true, texts: true, workers: false, toast: 'full', noFailureReason: false,
+        failureTexts: 'both', queryTimeout: undefined}, options || {});
     const world = {
         opts: opts,
         toasts: [],
@@ -136,6 +148,8 @@ function createWorld(options) {
         panelData['revoke-failed-text'] = TEXTS.revokeFailedText;
         panelData['forbidden-text'] = TEXTS.forbiddenText;
         panelData['not-found-text'] = TEXTS.notFoundText;
+        if (opts.failureTexts === 'both' || opts.failureTexts === 'server') panelData['server-error-text'] = TEXTS.serverFailureText;
+        if (opts.failureTexts === 'both' || opts.failureTexts === 'network') panelData['network-error-text'] = TEXTS.networkFailureText;
     }
     add('#task-panel', new Node('panel', {data: panelData}));
 
@@ -154,13 +168,20 @@ function createWorld(options) {
         toastNode.finds['.toast-body'] = [toastBody];
         toastNode.finds['.online'] = [toastBadge];
     }
-    add('#task-args', new Node('args'));
-    add('#task-kwargs', new Node('kwargs'));
+    // Os campos do formulário e o nó pai de cada um: o erro de campo do 400 vai ao lado do campo (`$input.parent().append(...)`,
+    // cmdasync-page.js:164-169), então o pai é estável para o teste ler o que foi posto (`fieldErrors` no estado). O dublê tem um nó
+    // por seletor: representa a variante larga dos argumentos (os `id` se repetem nas duas variantes do template, follow-up F4).
+    const fieldParents = {app_command: new Node('app command parent'), args: new Node('args parent'), kwargs: new Node('kwargs parent')};
+    const argsField = add('#task-args', new Node('args'));
+    const kwargsField = add('#task-kwargs', new Node('kwargs'));
+    argsField.parentNode = fieldParents.args;
+    kwargsField.parentNode = fieldParents.kwargs;
     add('#id_args', new Node('hidden args'));
     add('#id_kwargs', new Node('hidden kwargs'));
     add('input#id_app_command', new Node('hidden command'));
     add('#form-app_name', new Node('app name'));
     const appCommand = add('#task-app-command', new Node('app command'));
+    appCommand.parentNode = fieldParents.app_command;
     if (opts.commandsList) {
         appCommand.finds['> span.info'] = [new Node('command info')];
         add('.dropdown-menu > a', new Node('item 1', {attrs: {href: '#test_cmdasync.cmdasync_echo'}}));
@@ -361,6 +382,12 @@ function createWorld(options) {
         if (settings.success) request.done.push(settings.success);
         if (settings.error) request.fail.push(settings.error);
         world.requests.push(request);
+        // o corte por tempo do jQuery: só com `timeout` maior que zero; o pedido já respondido não é cortado
+        if (settings.timeout > 0) {
+            request.timeoutTimer = scheduleTimer(function () {
+                if (!request.responded) world.respond(request, {status: 0, timedOut: true});
+            }, settings.timeout, 'ajax-timeout');
+        }
         const jqXHR = {
             done: function (fn) { request.done.push(fn); return jqXHR; },
             fail: function (fn) { request.fail.push(fn); return jqXHR; },
@@ -374,6 +401,8 @@ function createWorld(options) {
             status: response.status,
             responseText: typeof body === 'string' ? body : JSON.stringify(body),
         };
+        // o corte por tempo: `abort("timeout")` rejeita com o texto «timeout» e o status 0 do jqXHR abortado
+        if (response.timedOut) return {ok: false, textStatus: 'timeout', xhr: xhr};
         if (response.status === 0) return {ok: false, textStatus: 'error', xhr: xhr};
         if (response.status >= 400) {
             if (request.dataType === 'json') {
@@ -395,6 +424,7 @@ function createWorld(options) {
     world.respond = function (request, response) {
         if (request.responded) throw new Error('harness: request already answered: ' + request.url);
         request.responded = true;
+        if (request.timeoutTimer) clearTimeoutStub(request.timeoutTimer); // o jQuery limpa o timer quando o pedido termina
         const result = outcome(request, response);
         const callbacks = result.ok ? request.done : request.fail;
         const args = result.ok ? [result.data, result.textStatus, result.xhr] : [result.xhr, result.textStatus, 'error'];
@@ -445,10 +475,14 @@ function createWorld(options) {
     };
 
     // ---------------------------------------------------------------- relógio
-    function setTimeoutStub(fn, ms) {
-        const timer = {id: world.clock.nextId++, fn: fn, at: world.clock.now + (ms || 0), live: true};
+    // `kind`: 'page' (o `setTimeout` da página) ou 'ajax-timeout' (o corte por tempo de um `$.ajax`, que não conta em `liveTimers`)
+    function scheduleTimer(fn, ms, kind) {
+        const timer = {id: world.clock.nextId++, fn: fn, at: world.clock.now + (ms || 0), live: true, kind: kind};
         world.clock.timers.push(timer);
         return timer.id;
+    }
+    function setTimeoutStub(fn, ms) {
+        return scheduleTimer(fn, ms, 'page');
     }
     function clearTimeoutStub(id) {
         world.clock.timers.forEach(function (timer) {
@@ -456,7 +490,7 @@ function createWorld(options) {
         });
     }
     world.liveTimers = function () {
-        return world.clock.timers.filter(function (timer) { return timer.live; }).length;
+        return world.clock.timers.filter(function (timer) { return timer.live && timer.kind !== 'ajax-timeout'; }).length;
     };
     world.advance = function (ms) {
         const target = world.clock.now + ms;
@@ -508,6 +542,8 @@ function createWorld(options) {
     world.cmdasyncform = context.cmdasyncform;
     // um cmdhandler.js sem o `failure_reason` (um estático sobrescrito, ou o cache do navegador na troca de versão)
     if (opts.noFailureReason) delete world.cmdasyncform.failure_reason;
+    // um script do host que atribui o tempo limite na carga: depois do cmdhandler.js e antes do DOM ready (o `flush()` abaixo)
+    if (opts.queryTimeout !== undefined) world.cmdasyncform.query_timeout = opts.queryTimeout;
     // a chamada do script de workers à mão, com ou sem argumento (a página sempre passa `{onLogin}`)
     world.workersCheck = function (options) {
         if (typeof context.workers_check_status !== 'function') throw new Error('harness: the workers script is not loaded');
@@ -545,6 +581,9 @@ function createWorld(options) {
     function buttonState(node) {
         return {disabled: !!node.props.disabled, progressVisible: !node.progress.classes.has('d-none')};
     }
+    function timeoutOf(request) {
+        return request.opts.timeout === undefined ? null : request.opts.timeout;
+    }
     world.state = function () {
         return {
             execute: buttonState(submit),
@@ -562,6 +601,23 @@ function createWorld(options) {
             statusRequests: world.statusRequests().length,
             pendingStatus: pendingOf('GET').length,
             revokeRequests: world.revokeRequests().length,
+            pendingRevoke: pendingOf('POST').length,
+            // a opção `timeout` que cada pedido levou ao `$.ajax` (null: nenhuma); o `ajaxForm` do envio, idem
+            statusTimeouts: world.statusRequests().map(timeoutOf),
+            revokeTimeouts: world.revokeRequests().map(timeoutOf),
+            workersTimeouts: world.workersRequests().map(timeoutOf),
+            formTimeout: world.ajaxForm && world.ajaxForm.timeout !== undefined ? world.ajaxForm.timeout : null,
+            // o que o erro do 400 pôs ao lado de cada campo, e se o campo foi marcado `is-invalid`
+            fieldErrors: {
+                app_command: fieldParents.app_command.childTexts.slice(),
+                args: fieldParents.args.childTexts.slice(),
+                kwargs: fieldParents.kwargs.childTexts.slice(),
+            },
+            invalidFields: {
+                app_command: appCommand.classes.has('is-invalid'),
+                args: argsField.classes.has('is-invalid'),
+                kwargs: kwargsField.classes.has('is-invalid'),
+            },
             workersRequests: world.workersRequests().length,
             pendingWorkers: pendingWorkers().length,
             // o aviso dos workers: o texto de cada <p> do corpo, o badge e quantas vezes o `toast("show")` foi chamado

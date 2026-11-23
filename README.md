@@ -157,7 +157,8 @@ Before, the exception reached Django, which answered a `500` page. The text of t
 address of the backend never reach the answer. The route stops at the read that failed: the
 state of a task is read once per query, whatever the state (the retries the client of the backend
 makes below Celery do not count), and no read follows the one that failed. The bundled page stops following the task and releases the form on
-any HTTP error, as it did with the `500`.
+any HTTP error, as it did with the `500`, and now tells the user why (see "The command page: when the status
+query or the form fails").
 
 The route adds no time limit of its own: how long a read waits for a backend that does not answer
 is what the Celery of the host gives it. For Redis that is `redis_socket_timeout`
@@ -211,6 +212,33 @@ and releases the screen instead). `ajax()` may be called more than once: the han
 own `form-valid` callback once per `init()`, so a task is followed by a single chain of status
 queries however many times it is called.
 
+### The command page: when the status query or the form fails
+
+When the status query fails the page stops following the task and releases the form, and it now says why (before, it
+released the form with no text, and the user could not tell the failure from a task that had ended). The handler
+(`cmdhandler.js`) tells the host the reason in the `update-failed` event: `login` (a `200` that is not JSON),
+`forbidden` (`403`), `not-found` (`404`), `network` (no answer at all: the network failed, or the query was cut at
+`query_timeout`) and `server` (any other failure: a `400`, `401`, `405`, `429`, a `5xx`, an HTML error page, or a `2xx`
+with a body that is not JSON). A host with a page of its own that tells the reason by `if`/`else` should handle
+`server` and `network` too. The bundled page shows the text it publishes in `data-server-error-text` and
+`data-network-error-text` of `#task-panel` (in the catalog of the package, pt_BR included); a template that does not
+publish a text shows none, and the page still releases the form.
+
+The notice says that **the last command sent may still be running**, and to check before running it again: the status
+query only exists once the task was launched, and the released form offers only Execute. The page does not show the id
+of the task after the failure, so look in the task monitor or in the logs of the host. A `5xx` or no answer to the
+**submit** of the form shows the same two texts; the other failures of the submit (a `400` with the errors of the form,
+a `403`, a `429`...) keep their handling and show neither text.
+
+A status query that gets no answer in `cmdasyncform.query_timeout` (30000 ms; `0` turns the cut off, as in jQuery) is
+cut and told as `network`. The workers probe reads the same property when each query goes out (the first one, when the
+page loads, uses what the host assigned until then; an assignment later applies from the next query) and, when a query
+is cut, asks again 5 seconds later, as for any other failure. The submit of the form and the revocation have **no**
+time limit: the submit launches the task, and giving up on it would invite the user to launch it twice. The cut is the
+browser's, and the server does not see it: the read of the result backend goes on until the limit of the Celery of the
+host (see above), and in the workers route the `workers_lock` stays held during the query, so a live but slow broker
+keeps one more thread of the server busy per round.
+
 ### The workers probe of the page
 
 With `COMMANDS_ASYNC_WORKERS_STATUS_CHECK = True` the page asks `command-async:workers` when it
@@ -224,8 +252,8 @@ message of a false `status`. What the probe does with a failure depends on why i
   the package and translated (pt_BR).
 - **The login page** (an answer that is not JSON, which the browser reaches when a layer outside the
   route redirects): the probe stops and the page takes the user to the login.
-- **A false `status`** (nobody answered, the broker failed), **a network failure or a server error**:
-  the probe asks again after 5 seconds, as before.
+- **A false `status`** (nobody answered, the broker failed), **a network failure, a query with no answer in
+  `query_timeout` or a server error**: the probe asks again after 5 seconds, as before.
 
 A host with a page of its own calls `workers_check_status({onLogin: <function>})`: that function is
 what runs on the login page (the bundled page passes its `goToLogin`), and without it the probe just

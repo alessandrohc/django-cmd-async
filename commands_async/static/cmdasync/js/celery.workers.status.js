@@ -11,6 +11,9 @@ var workers_check_status = function(options) {
         type: "GET",
         dataType: 'json',
         url: "workers/status/",
+        // a query with no answer in this time is cut (jQuery: 'timeout', status 0) and the probe asks again like for any
+        // failure; read at each round, so the value a host assigned is the one used (0 turns the cut off)
+        timeout: cmdasyncform.query_timeout,
         beforeSend: function(xhr, settings) {
             if (!cmdasyncform.csrfSafeMethod(settings.type) && !this.crossDomain) {
                 xhr.setRequestHeader("X-CSRFToken", csrftoken);
@@ -49,7 +52,7 @@ var workers_check_status = function(options) {
                 $toast.toast("show");
             }
         } else {
-            // network failure, server error, not found: they pass, so the probe asks again
+            // network failure (the cut included), server error, not found: they pass, so the probe asks again
             again();
         }
     })
