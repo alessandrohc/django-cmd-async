@@ -88,6 +88,15 @@ The owner is recorded in a Django cache when the form launches the task. Because
   and revokes any task, as before, but an empty task id is still answered `404` (it used to be a
   `500`, because the result backend refuses an empty id). This release narrows what `status`
   serves, so a project that relied on a user following another's tasks has to switch it off.
+- A host that mounts a view of its own on the `status` route, extending `TaskFormStatus`, and keeps
+  the owner of the task by itself (the `plus_base` does, per login session) has to switch
+  `COMMANDS_ASYNC_TASK_OWNERSHIP` off. The two checks run in series through the same `dispatch`:
+  the one of the host first and, if it lets the request through, the `task_denial` of the package.
+  The two records can disagree (a task launched before the package was updated, or one whose record
+  could not be written), and then the package answers `404` `{"task": null}` to a task the host just
+  allowed, before the method runs: a revocation is not sent to Celery and nothing that the `post` of
+  the host does for it, such as an audit line, happens. With the package check off only the one of
+  the host decides, so the host's check has to be the strict one.
 
 `command-async:workers` lists the names of the Celery workers that answer (`GET`). It was open
 to any authenticated user, whatever `COMMANDS_ASYNC_PERMISSION_NAME` said: since this release it
@@ -322,6 +331,7 @@ and the bundled JS stops asking and tells why (see "The workers probe of the pag
 
 ### Whether the status route serves a task only to the user who launched it.
 See "The owner of the task" above. It does not apply to `command-async:workers`.
+A host that replaces the view of the route and keeps the owner by itself switches it off (same section).
 
 [bool] COMMANDS_ASYNC_TASK_OWNERSHIP  (default: True)
 
