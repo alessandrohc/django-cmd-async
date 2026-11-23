@@ -280,6 +280,40 @@ class WorkersNoticeContractTest(TestCase):
         index.feed(self.client.get(INDEX_URL).content.decode('utf-8'))
         return index.by_id.get('popup-msg')
 
+    def notice_html(self):
+        """O HTML do aviso dos workers (do #popup-msg até o #wrap), como a página o entrega."""
+        html = self.client.get(INDEX_URL).content.decode('utf-8')
+        start = html.index("id='popup-msg'")
+        return html[start:html.index('id="wrap"', start)]
+
+    def header_title(self):
+        """O texto do título do cabeçalho do aviso (o `<strong class="mr-auto">` do `.toast-header`), sem o ícone."""
+        match = re.search(r'<div class="toast-header">\s*<strong class="mr-auto">(?:<i[^>]*></i>)?([^<]*)</strong>', self.notice_html())
+        self.assertIsNotNone(match, msg='the notice has no header title')
+        return match.group(1)
+
+    def test_the_notice_header_is_a_neutral_title_untranslated(self):
+        """AC-8969-1: o cabeçalho do aviso dos workers traz o título «Celery workers», exatamente nessas palavras quando não há tradução, sem a palavra «Online»."""
+        title = self.header_title()
+        self.assertEqual(title, 'Celery workers')
+        self.assertNotIn('Online', title)
+
+    def test_the_notice_header_is_a_neutral_title_translated(self):
+        """AC-8969-1: o cabeçalho do aviso dos workers traz o título traduzido para o idioma do usuário quando há tradução (em pt_BR, «Workers do Celery»), sem a palavra «Online»."""
+        with translation.override('pt-br'):
+            # o título exato, e não só «diferente do inglês»: uma entrada fuzzy ou outra frase passaria no assertNotEqual
+            self.assertEqual(translation.gettext('Celery workers'), 'Workers do Celery', msg='the pt_BR catalog has no entry for this title')
+            title = self.header_title()
+            self.assertEqual(title, 'Workers do Celery')
+            self.assertNotIn('Online', title)
+
+    def test_the_notice_header_keeps_its_icon_and_close_button(self):
+        """AC-8969-2 (controle): o cabeçalho do aviso dos workers traz o ícone ao lado do título e o botão de fechar."""
+        notice = self.notice_html()
+        header = notice[notice.index('<div class="toast-header">'):notice.index('<div class="toast-body"')]
+        self.assertRegex(header, r'<strong class="mr-auto"><i class="fa fa-grav"></i>\S', msg='the icon is no longer beside the title')
+        self.assertRegex(header, r'<button[^>]*data-dismiss="toast"', msg='the header lost its close button')
+
     def test_the_page_publishes_the_workers_forbidden_phrase_untranslated(self):
         """AC-8954-4: o aviso dos workers traz a frase de acesso negado, exatamente na frase do critério, quando não há tradução."""
         notice = self.notice()

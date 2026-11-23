@@ -877,7 +877,36 @@ class DoubleAssumptionsTest(TestCase):
         found = re.findall(r'ajaxFormUnbind\(\)\.on\(["\']submit\.form-plugin["\']', source)
         self.assertEqual(len(found), 1, msg='ajaxForm no longer unbinds the form events before it binds the new ones (or does it twice)')
 
+    def test_the_workers_script_reaches_only_the_body_and_the_counter_of_the_notice(self):
+        """AC-8969-3 (controle): dentro do aviso, o script da consulta de workers só alcança o corpo e o contador, então o título, o ícone e o botão de fechar ficam como o template os entrega."""
+        # Teste de fonte: o dublê de node (world.js) devolve vazio para um seletor que ele não conhece, então não pegaria uma escrita
+        # nova no cabeçalho. Uma escrita que não passe por `$toast.find(...)` (`.children()`, um seletor global) passa este teste.
+        source = (STATIC_CMDASYNC / 'js' / 'celery.workers.status.js').read_text(encoding='utf-8')
+        # os comentários saem antes: uma menção a `$toast.find(` num comentário não é uma chamada
+        source = re.sub(r'/\*.*?\*/', '', source, flags=re.S)
+        source = re.sub(r'//[^\n]*', '', source)
+        selectors = set(re.findall(r'\$toast\.find\(\s*[\'"]([^\'"]+)[\'"]\s*\)', source))
+        self.assertEqual(selectors, {'.toast-body', '.online'}, msg='the script reaches a part of the notice other than the body and the counter')
+        self.assertNotIn('toast-header', source, msg='the script names the header of the notice')
+
+    def test_the_workers_script_does_not_reach_the_notice_by_traversal_or_a_global_selector(self):
+        """AC-8969-3 (controle): o script da consulta de workers não alcança o aviso por travessia (`.prev()`, `.children()`…) nem por um seletor global: só pelo `$toast`, e só o corpo e o contador."""
+        # Reforço do teste acima (o verificador): o título do aviso ficaria a um `.prev()` do contador, ou a um `$('.mr-auto')`, sem
+        # que o seletor do `$toast.find(...)` mudasse. O que sobra sem teste (a Premissa 3 da spec o aceita): `$('#popup-msg').find(...)`,
+        # um seletor em variável, `.add(...)`, `document.querySelector` e uma API do DOM (`firstElementChild`).
+        source = (STATIC_CMDASYNC / 'js' / 'celery.workers.status.js').read_text(encoding='utf-8')
+        source = re.sub(r'/\*.*?\*/', '', source, flags=re.S)
+        source = re.sub(r'//[^\n]*', '', source)
+        for method in ('prev', 'next', 'prevAll', 'nextAll', 'prevUntil', 'nextUntil', 'siblings', 'children', 'contents', 'parent',
+                       'parents', 'closest', 'first', 'last', 'eq', 'get'):
+            with self.subTest(method=method):
+                self.assertNotRegex(source, r'\.' + method + r'\(', msg='the script walks the DOM with .{0}()'.format(method))
+        # `$('#popup-msg')` é o aviso; `$('<p ...>')` cria um elemento; qualquer outro seletor global alcançaria o que o `$toast` não alcança
+        reached = [text for text in re.findall(r'\$\(\s*[\'"]([^\'"]*)[\'"]\s*\)', source) if text != '#popup-msg' and not text.startswith('<')]
+        self.assertEqual(reached, [], msg='the script reaches the page with a global selector')
+
     def test_the_notice_of_the_page_has_the_body_and_the_badge_the_double_assumes(self):
+        """AC-8969-5 (controle): o aviso dos workers traz o corpo (.toast-body) onde o script escreve os nomes e as mensagens e o contador (.online) onde ele escreve o número de workers online."""
         # O dublê (world.js) dá ao #popup-msg um `.toast-body` e um `.online` à mão; o script de workers escreve a frase do 403, os
         # nomes e a mensagem no `.toast-body` e o número no `.online`. Lido na página real (#8954): se o template renomear um dos
         # dois, o aviso sai vazio na tela e os testes de node seguem verdes.

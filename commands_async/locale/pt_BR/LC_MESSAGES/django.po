@@ -7,7 +7,7 @@ msgstr ""
 "Project-Id-Version: django-cmd-async 2.3.0\n"
 "Report-Msgid-Bugs-To: \n"
 "POT-Creation-Date: 2026-11-19 19:00+0000\n"
-"PO-Revision-Date: 2026-07-29 08:38-0300\n"
+"PO-Revision-Date: 2026-11-22 22:55-0300\n"
 "Last-Translator: Alessandro Hecht <alessandrohc@gmail.com>\n"
 "Language-Team: Brazilian Portuguese\n"
 "Language: pt_BR\n"
@@ -112,6 +112,10 @@ msgid ""
 msgstr ""
 "Acesso negado: sua sessão pode ter expirado, ou você não tem permissão para "
 "ver os workers do Celery."
+
+#: templates/cmdasync/toast.html:3
+msgid "Celery workers"
+msgstr "Workers do Celery"
 
 #: views.py:282
 msgid "not allowed to run this command"
