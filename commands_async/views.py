@@ -68,14 +68,24 @@ workers_window = {'at': None, 'kind': None, 'names': ()}
 workers_lock = threading.Lock()
 WORKERS_LISTED, WORKERS_NOBODY, WORKERS_FAILED = 'listed', 'nobody', 'failed'
 
-#: limites da pré-verificação do broker (AC-8879-7; o formulário de execução a usa também: AC-8944-1 e AC-8944-5). O Celery do projeto espera até 300 s, em até 100 tentativas, por um broker
-#: que não responde (`plus_base/settings/publique.py:814` e `:818`) e a rota seguraria a thread do pedido esse tempo todo: aqui
-#: a conexão e a leitura do socket têm 1 s, e a verificação toda 2 s por uma tentativa a mais. Medido no #8879 com `redis://`
-#: de um host só: porta recusada 2,0 s e endereço sem rota 4,0 s; Sentinel e cluster não foram medidos. Mudar estes limites pede
-#: refazer a medição do endereço sem rota (#8879, `evidence/T-2.md`: 4,0 s com o socket em 1,0 s): o teste automático só cobre a
-#: porta recusada (~2 s) e não pegaria um endereço sem rota que passasse dos 5 s do AC-8879-7
+#: limites da pré-verificação do broker (AC-8973-5, antes AC-8879-7; o formulário de execução a usa também: AC-8944-1 e AC-8944-5).
+#: O Celery do projeto espera até 300 s, em até 100 tentativas, por um broker que não responde (`plus_base/settings/publique.py:814`
+#: e `:818`) e a rota seguraria a thread do pedido esse tempo todo: aqui a conexão e a leitura do socket têm 1 s, e a verificação
+#: toda 2 s por uma tentativa a mais. Medido com `redis://` de um host só (#8879, #8973): porta recusada 2,0 s, endereço sem rota
+#: 4,0 s e Redis que aceita e não responde 4,4 s. Com Sentinel (#8973, pilha do compose isolada) os mesmos limites valem também no
+#: salto do sentinela (`broker_precheck`): 4,0 a 4,4 s com 1 sentinela sem rota ou mudo e 3,0 a 3,4 s com 3 na URL. Sem eles o
+#: redis-py tenta de novo até 10 vezes cada chamada ao sentinela (`redis/_defaults.py:37-39` e `client.py:285-290`) e a
+#: verificação levava de 15 s (1 sentinela mudo) a 179 s (3, com `retry_on_error` do host). Mudar estes limites pede refazer a
+#: medição do endereço sem rota (#8879, `evidence/T-2.md`; #8973, `evidence/AC-8973-6.md`): o teste automático só cobre a porta
+#: recusada e o endereço que aceita e não responde, e não pegaria um endereço sem rota que passasse dos 5 s. A resolução de nome
+#: que trava não entra na conta: o `getaddrinfo` do redis-py roda antes do `socket_connect_timeout` (`redis/connection.py:1581`
+#: e `:1598`)
 BROKER_PRECHECK_SOCKET_TIMEOUT = 1.0
 BROKER_PRECHECK_TIMEOUT = 2
+#: as chaves do `sentinel_kwargs` do host que religam a nova tentativa do redis-py: a pré-verificação não as leva ao sentinela
+#: (`redis/connection.py:900-910`: `retry_on_error` não vazio dá `Retry(NoBackoff(), 1)` mesmo com `retry=None`; medido: 3 sentinelas
+#: mudos levam 6,1 s só com `retry=None` e 3,0 s sem essas chaves)
+BROKER_PRECHECK_RETRY_KEYS = ('retry', 'retry_on_timeout', 'retry_on_error')
 
 
 def broker_precheck():
@@ -84,10 +94,26 @@ def broker_precheck():
     Os timeouts vão no pedido da conexão, e não lidos do `celery_app.conf`: o Celery mescla as `broker_transport_options` do app
     com as passadas e o `connect_timeout` explícito vence o da configuração (`celery/app/base.py:1061-1066`). O `with` solta a
     conexão também quando a exceção sobe.
+
+    Com um broker Sentinel o salto do sentinela leva os mesmos limites, pelo `sentinel_kwargs` do pedido (lido em
+    `kombu/transport/redis.py:2356`): o redis-py só deriva os `socket_*` da conexão quando o `sentinel_kwargs` é `None`, e cada
+    chamada ao sentinela tenta de novo até 10 vezes (#8973). A mescla é rasa (`celery/app/base.py:1058-1060`): um `sentinel_kwargs`
+    do pedido substituiria o do host por inteiro, e o host com usuário e senha nos sentinelas teria a conferência reprovada. Por
+    isso o dicionário do host entra primeiro, sem as chaves de nova tentativa (`BROKER_PRECHECK_RETRY_KEYS`), com os limites e
+    `retry=None` por cima. O kombu só lê a opção no transporte Sentinel e a ignora nos outros.
+
+    A conferência não limita a chamada real que vem depois dela (`inspect()`, `revoke()` e `apply_async()`): com um sentinela mudo
+    no meio do grupo ela o pula em ~1 s e passa, e a chamada espera o que o Celery do host deixar (medido contra o Sentinel do
+    compose: sem resposta em 90 s; com o 1º sentinela parado, só a 1ª consulta de workers demora, 15,8 s).
     """
+    host_kwargs = (celery_app.conf.broker_transport_options or {}).get('sentinel_kwargs') or {}
+    sentinel_kwargs = {key: value for key, value in host_kwargs.items() if key not in BROKER_PRECHECK_RETRY_KEYS}
+    sentinel_kwargs.update(socket_connect_timeout=BROKER_PRECHECK_SOCKET_TIMEOUT, socket_timeout=BROKER_PRECHECK_SOCKET_TIMEOUT,
+                           retry=None)
     with celery_app.connection_for_write(
             transport_options={'socket_connect_timeout': BROKER_PRECHECK_SOCKET_TIMEOUT,
-                               'socket_timeout': BROKER_PRECHECK_SOCKET_TIMEOUT},
+                               'socket_timeout': BROKER_PRECHECK_SOCKET_TIMEOUT,
+                               'sentinel_kwargs': sentinel_kwargs},
             connect_timeout=BROKER_PRECHECK_SOCKET_TIMEOUT) as connection:
         connection.ensure_connection(max_retries=1, timeout=BROKER_PRECHECK_TIMEOUT)
 

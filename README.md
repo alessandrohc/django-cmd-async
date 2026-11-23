@@ -127,10 +127,36 @@ broker that refuses the connection or does not answer is answered with a false `
 seconds. Without the check the Celery configuration of a project may hold the request for minutes
 (a `broker_connection_timeout` of 300 seconds, for instance). When the owner registry lives in the
 same Redis as the broker and cannot be read, the revocation is answered the `404` of the owner
-check before the broker is touched. Only a `redis://` broker on one host was measured: a refused
-port answers in 2 seconds and an address with no route in 4. Sentinel and cluster were not
-measured (with `N` unreachable sentinels the check should cost about `N` seconds), and a broker
-that is alive but slow is not limited by the check.
+check before the broker is touched. A `redis://` broker on one host answers a refused port in 2
+seconds, an address with no route in 4, and one that accepts the connection and does not answer in
+4.4 (measured).
+
+A Sentinel broker (`sentinel://`) is limited the same way: the check gives the hop to the sentinel a
+limit of 1 second and no new attempt of redis-py, which retries each call to a sentinel up to 10
+times and, when the host defines `sentinel_kwargs` in the `broker_transport_options` of Celery,
+leaves that hop with no limit at all. Measured against the Sentinel of the compose (isolated from
+the dev Redis), a sentinel with no route or that does not answer is answered in 4.0 to 4.4 seconds,
+and three sentinels in the URL (the `;` form of kombu) in 3.0 to 3.4; without the limits the same
+cases took 15 seconds, 59 with a `sentinel_kwargs` in the host and up to 179 with three sentinels
+and a `retry_on_error`. What the host puts in `sentinel_kwargs` (user, password and the rest) still
+reaches the sentinel, except its `retry`, `retry_on_timeout` and `retry_on_error`, which the check
+drops (a new attempt would give 6.1 seconds with three sentinels); the limits of 1 second and the
+missing new attempt go over it. A master that the sentinels indicate and that accepts the connection
+and does not answer takes 4.4 seconds. With `N` sentinels in the URL the check costs about `N`
+seconds, so six or more go over 5 (inferred, not measured; the `plus` project mounts one).
+
+What the check does not limit: a broker that is alive but slow (a sentinel or a master that takes
+more than 1 second to answer is taken as unreachable), the resolution of a name that does not answer
+(redis-py resolves the name before it sets the limit of the socket) and Redis Cluster, which kombu
+has no transport for.
+
+Nor does the check limit the call that comes after it (the broadcast of the workers query, the
+revocation and `apply_async`): that call waits as long as the Celery configuration of the host lets
+it. With one sentinel of a group that accepts the connection and does not answer, the check skips
+that sentinel in about 1 second and passes, and the call that follows went without an answer for 90
+seconds in the same measurement; with the first sentinel stopped, only the first workers query is
+slow (15.8 seconds). Bounding that call is up to the host (the socket options of its
+`broker_transport_options`, and `sentinel_kwargs` with Sentinel; not measured here).
 
 The execution form makes the same check right before it queues the command. It comes after the
 refusal of an ignored command or of a user without the permission, which never touch the broker.
@@ -143,9 +169,9 @@ the broker only reach the log of the package. A host that runs Celery in synchro
 (`task_always_eager`) skips the check, because the task runs in the process with no broker. A host
 that wraps `shared_task` to swallow connection errors (as the `plus` project does) used to see this
 failure in its own log; the exception now reaches the log of this package, with the traceback. The
-same limits apply: only a `redis://` broker on one host was measured, and a test that submits the
-form without replacing `commands_async.views.precheck_before_launch` opens one connection to the
-broker of its environment.
+same limits apply (the Sentinel ones included, above), and a test that submits the form without
+replacing `commands_async.views.precheck_before_launch` opens one connection to the broker of its
+environment.
 
 ### The status query and the result backend
 

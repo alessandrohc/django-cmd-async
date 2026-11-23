@@ -4,7 +4,7 @@
 Execução (container `django`, com o `pyenv` do projeto):
     cd /opt/project/packages/django-cmd-async && /opt/project/pyenv/bin/python runtests.py test_cmdasync.test_broker_errors -v 2
 
-O `celery_app` é trocado por um dublê, salvo em `BrokerUnreachableTest` (AC-8879-7), que usa um app de Celery REAL com a
+O `celery_app` é trocado por um dublê, salvo em `BrokerUnreachableTest` (AC-8973-5, antes AC-8879-7), que usa um app de Celery REAL com a
 configuração do projeto (`plus_base/settings/publique.py:814-818`) apontado para uma porta local recusada: nada vai ao broker
 do dev. A janela da rota workers é estado do módulo `commands_async.views` (`workers_window`): cada teste a zera, e o relógio
 dela (`views.clock`) é trocado por um relógio que o teste avança.
@@ -287,17 +287,17 @@ class BrokerUnreachableTest(BrokerTestCase):
         self.assertIs(json.loads(response.content)['status'], False, msg=label)
 
     def test_the_workers_route_answers_within_the_limit_when_the_connection_is_refused(self):
-        """AC-8879-7: the workers route answers 200 with a false status within 5 seconds when the Redis broker refuses the connection."""
+        """AC-8973-5 (controle): the workers route answers 200 with a false status within 5 seconds when the Redis broker refuses the connection."""
         self.answer_within_the_limit('workers', lambda: self.ask_workers())
 
     def test_the_revocation_answers_within_the_limit_when_the_connection_is_refused_and_the_owner_is_off(self):
-        """AC-8879-7: the revocation answers 200 with a false status within 5 seconds when the Redis broker refuses the connection (owner off)."""
+        """AC-8973-5 (controle): the revocation answers 200 with a false status within 5 seconds when the Redis broker refuses the connection (owner off)."""
         client = self.logged(self.owner)
         with mock.patch.object(app_settings, 'COMMANDS_ASYNC_TASK_OWNERSHIP', False):
             self.answer_within_the_limit('revocation, owner off', lambda: client.post(status_url(TASK)))
 
     def test_the_revocation_answers_within_the_limit_when_the_connection_is_refused_and_the_owner_record_is_readable(self):
-        """AC-8879-7: the same, with the owner check on and the record of the owner readable (the default configuration)."""
+        """AC-8973-5 (controle): the same, with the owner check on and the record of the owner readable (the default configuration)."""
         client = self.launched_by_owner()
         self.answer_within_the_limit('revocation, owner record readable', lambda: client.post(status_url(TASK)))
 

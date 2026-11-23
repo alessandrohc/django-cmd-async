@@ -6,6 +6,8 @@ the result backend (``AsyncResult``) and worker inspection (``control.inspect``)
 -- is replaced here, so no test needs Redis, a worker, or a configured Celery app.
 """
 import json
+import socket
+import threading
 from unittest import mock
 
 from django.contrib.auth.models import Permission, User
@@ -80,6 +82,63 @@ def queued_task(task_id='queued-task-id'):
     task = mock.MagicMock()
     task.id = task_id
     return task
+
+
+class SilentSentinel(object):
+    """Um endereço local que ACEITA a conexão, grava o que recebe e NUNCA responde (#8973).
+
+    É o que um sentinela (ou um Redis) parado/sem resposta faz ao cliente: o `connect` do kernel passa, o cliente manda o
+    `HELLO` e espera. Medido contra o container pausado da pilha Sentinel do compose, os dois dão o mesmo tempo da pré-verificação
+    do broker (15,3 a 15,6 s com o código anterior ao #8973, 4,0 a 4,4 s com o do #8973). Nada sai da máquina: o endereço é `127.0.0.1`.
+
+    `received` junta os bytes de todas as conexões (a senha do `sentinel_kwargs` do host chega aqui no `HELLO 3 AUTH <usuário>
+    <senha>` do redis-py 8). O teste o fecha no `addCleanup(sentinel.close)`.
+    """
+
+    def __init__(self):
+        self.listener = socket.socket()
+        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listener.bind(('127.0.0.1', 0))
+        self.listener.listen(32)
+        self.port = self.listener.getsockname()[1]
+        self.received = b''
+        self.connections = []
+        self.lock = threading.Lock()
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    @property
+    def address(self):
+        return '127.0.0.1', self.port
+
+    def serve(self):
+        while True:
+            try:
+                connection, _ = self.listener.accept()
+            except OSError:
+                return  # o listener foi fechado
+            with self.lock:
+                self.connections.append(connection)
+            threading.Thread(target=self.read, args=(connection,), daemon=True).start()
+
+    def read(self, connection):
+        while True:
+            try:
+                data = connection.recv(4096)
+            except OSError:
+                return
+            if not data:
+                return
+            with self.lock:
+                self.received += data
+
+    def close(self):
+        self.listener.close()
+        with self.lock:
+            for connection in self.connections:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
 
 
 def async_result(task_id='task-id', ready=True, failed=False,
