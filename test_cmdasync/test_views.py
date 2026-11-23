@@ -6,7 +6,7 @@ The broker and the result backend are always replaced -- see
 JavaScript consumes, since that is the actual public interface of these views.
 """
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from unittest import mock
 from urllib.parse import quote, urlencode
 
@@ -504,6 +504,71 @@ class TaskFormStatusAccessTest(TestCase):
                         if method != 'head':  # o cliente de teste descarta o corpo da resposta ao HEAD
                             self.assertEqual(json.loads(response.content), {'task': None})
                             self.assertNoTaskData(response, '%s %s' % (who, method))
+        self.revoke.assert_not_called()
+
+    @staticmethod
+    def sweep():
+        """Every method the Django `View` knows plus one it does not handle: the gate answers before the view looks at the method."""
+        return tuple(View.http_method_names) + ('propfind',)
+
+    @staticmethod
+    def send(client, method):
+        """The request of `method` to the status route of a task, by navigation (no `X-Requested-With`)."""
+        url = status_url(DONE_ID)
+        if method == 'propfind':
+            return client.generic('PROPFIND', url)
+        return getattr(client, method)(url)
+
+    def test_every_http_method_is_sent_to_the_login_url_by_navigation(self):
+        """AC-8991-1 (controle): by navigation, an anonymous request is sent to the login page of the package with any method, the owner check on or off, a permission named or not."""
+        # O gate vem antes do método (views.py:230-243): PUT, PATCH, DELETE, OPTIONS, TRACE e um verbo que a view não trata
+        # não chegam ao 405 nem ao 200 da view. O destino é o `COMMANDS_ASYNC_LOGIN_URL` do pacote, trocado aqui por um valor
+        # diferente do `LOGIN_URL` do projeto, para o teste distinguir os dois.
+        package_login = '/package-login/'
+        self.assertNotEqual(package_login, project_settings.LOGIN_URL, msg='precondition: the two login pages differ')
+        methods = self.sweep()
+        self.assertIn('put', methods, msg='precondition: the sweep includes the methods the view does not handle')
+        with self.permission_required():
+            self.assertReads(self.logged(self.runner), 'the holder of the permission')
+        for ownership in (True, False):
+            for named in (True, False):
+                with mock.patch.object(app_settings, 'COMMANDS_ASYNC_TASK_OWNERSHIP', ownership), \
+                        mock.patch.object(app_settings, 'COMMANDS_ASYNC_LOGIN_URL', package_login), \
+                        (self.permission_required() if named else nullcontext()):
+                    for method in methods:
+                        with self.subTest(owner_check=ownership, permission_named=named, method=method):
+                            response = self.send(self.client, method)
+                            self.assertRedirects(response, '%s?next=%s' % (package_login, status_url(DONE_ID)),
+                                                 fetch_redirect_response=False,
+                                                 msg_prefix='%s: must be sent to the login page, not answered by the method' % method)
+                            if method != 'head':  # o cliente de teste descarta o corpo da resposta ao HEAD
+                                self.assertNoTaskData(response, method)
+        self.revoke.assert_not_called()
+
+    def test_every_http_method_is_forbidden_without_the_named_permission_by_navigation(self):
+        """AC-8991-2 (controle): by navigation, a user without the named permission is answered 403 with any method, never the method's answer nor the owner's 404, the owner check on or off."""
+        # O gate vem antes do método e do dono (views.py:230-243): com o dono ligado, quem não é dono receberia o 404 do
+        # `task_denial` se a ordem se invertesse; sem a permissão nomeada o dono recusa este usuário, e é essa recusa que o
+        # 403 tem de preceder (a pré-condição abaixo a mede).
+        methods = self.sweep()
+        self.assertIn('put', methods, msg='precondition: the sweep includes the methods the view does not handle')
+        holder = self.logged(self.runner)
+        client = self.logged(self.plain)
+        with mock.patch.object(app_settings, 'COMMANDS_ASYNC_TASK_OWNERSHIP', True):
+            launch(holder, DONE_ID)
+            with self.permission_required():
+                self.assertReads(holder, 'holds the permission, owner check on')
+            self.assertEqual(client.get(status_url(DONE_ID)).status_code, 404,
+                             msg='precondition: with no permission named, the owner check refuses a user who did not launch the task')
+        for ownership in (True, False):
+            with mock.patch.object(app_settings, 'COMMANDS_ASYNC_TASK_OWNERSHIP', ownership), self.permission_required():
+                for method in methods:
+                    with self.subTest(owner_check=ownership, method=method):
+                        response = self.send(client, method)
+                        self.assertEqual(response.status_code, 403,
+                                         msg='%s: must be forbidden at the gate, not answered by the method nor by the owner check' % method)
+                        if method != 'head':  # o cliente de teste descarta o corpo da resposta ao HEAD
+                            self.assertNoTaskData(response, method)
         self.revoke.assert_not_called()
 
     def test_every_denial_is_marked_no_store(self):
