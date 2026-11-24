@@ -60,8 +60,8 @@ cmdasyncform = {
             'form-valid': [],
             'update-finish': [],
             'updating': [],
-            // the status query failed; the argument says why ('login', 'forbidden', 'not-found', 'server' or
-            // 'network', see failure_reason)
+            // the status query failed, or came back with no task; the argument says why ('login', 'forbidden', 'not-found',
+            // 'server' or 'network', see failure_reason)
             'update-failed': [],
             // the revocation request failed; the argument is the text the server sent, or null
             'revoke-failed': []
@@ -97,8 +97,15 @@ cmdasyncform = {
             // failure_reason tells as 'network'
             timeout: self.query_timeout
         });
-        req.done(function (data) {
-            var task = data.task;
+        req.done(function (data, textStatus, xhr) {
+            var task = data && data.task;
+            // A response with no task cannot be followed: a 204 or a 304 (jQuery resolves them as a success with no data), or
+            // JSON whose `task` is missing or is not a JSON object, which a layer in front of the server can answer. It ends the
+            // query as the failure `server`: before `updating` (it is no «not ready» answer) and with no new query scheduled.
+            if (!task || typeof task !== 'object' || Array.isArray(task)) {
+                self.query_failed(xhr, textStatus);
+                return;
+            }
             var $output = self.$output;
             if (self.update) {
                 // `updating` only while the follow-up goes on: the page writes the running text in
@@ -138,21 +145,26 @@ cmdasyncform = {
             }
         });
         req.fail(function (xhr, textStatus) {
-            self.running = false;
-            // Whatever ended the query, the panel is emptied: with the follow-up interrupted (as in .done) or going on, where the
-            // failure belies the running text the last answer left there (the page shows the Copy button by what the panel holds).
-            // It is emptied before the callbacks: one that raises must not skip it, and what a host writes in the panel on
-            // `update-failed` or `update-finish` stays.
-            self.$output.empty();
-            try {
-                var reason = self.failure_reason(xhr, textStatus);
-                if (reason)
-                    self.exc_event_callbacks('update-failed', reason);
-            } finally {
-                // whatever the page does with the reason, the screen is released
-                self.exc_event_callbacks('update-finish', self.$form);
-            }
+            self.query_failed(xhr, textStatus);
         });
+    },
+    // The status query ended with no answer that can be followed: it failed, or it came back with no task (see .done). The
+    // screen is released through `update-failed` (the reason) and `update-finish`, and no new query is scheduled.
+    query_failed: function (xhr, textStatus) {
+        this.running = false;
+        // Whatever ended the query, the panel is emptied: with the follow-up interrupted (as in .done) or going on, where the
+        // failure belies the running text the last answer left there (the page shows the Copy button by what the panel holds).
+        // It is emptied before the callbacks: one that raises must not skip it, and what a host writes in the panel on
+        // `update-failed` or `update-finish` stays.
+        this.$output.empty();
+        try {
+            var reason = this.failure_reason(xhr, textStatus);
+            if (reason)
+                this.exc_event_callbacks('update-failed', reason);
+        } finally {
+            // whatever the page does with the reason, the screen is released
+            this.exc_event_callbacks('update-finish', this.$form);
+        }
     },
     failure_reason: function (xhr, textStatus) {
         // 200 that is not JSON: the browser followed the login redirect
@@ -165,8 +177,9 @@ cmdasyncform = {
         // no answer at all: the network failed, or jQuery cut the query at query_timeout (status 0)
         if (xhr.status === 0)
             return 'network';
-        // any other failure: an HTTP error (400, 401, 405, 429, a 5xx, an HTML error page) or a 2xx with a body that is
-        // not JSON. The user needs the same thing for all of them, so the reason is not told by status
+        // any other failure: an HTTP error (400, 401, 405, 429, a 5xx, an HTML error page), a 2xx with a body that is not JSON,
+        // or a response that carries no task (a 204 or a 304, or JSON whose `task` is missing or is not an object: see .done).
+        // The user needs the same thing for all of them, so the reason is not told by status
         return 'server';
     },
     revoke_task : function () {

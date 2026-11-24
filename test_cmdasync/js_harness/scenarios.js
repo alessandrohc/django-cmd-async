@@ -29,14 +29,36 @@ const STATUS_FAILURES = {
     http429: {status: 429, body: 'Too Many Requests'},
     http500: {status: 500, body: '<html>boom</html>'},
     network: {status: 0, body: ''},
-    // #8961 (AC-8961-1): as outras falhas HTTP da consulta; o `html202` é um 2xx que não é 200 nem 204 com corpo que não é JSON
-    // (o que o jQuery manda ao `.fail` como `parsererror`; o 204 é sucesso «nocontent» no jQuery e fica fora, follow-up F3)
+    // #8961 (AC-8961-1, hoje AC-9018-1): as outras falhas HTTP da consulta; o `html202` é um 2xx que não é 200 nem 204 com corpo que não é JSON
+    // (o que o jQuery manda ao `.fail` como `parsererror`; o 204 e o 304 são sucesso no jQuery e chegam ao `.done` sem `task`: estão em
+    // `NOTASK_RESPONSES`, abaixo, e não nesta lista, #9018)
     http400: jsonResponse(400, {task: null}),
     http401: {status: 401, body: ''},
     http405: {status: 405, body: ''},
     http503: jsonResponse(503, {task: null}),
     html202: {status: 202, body: '<html>accepted</html>'},
 };
+
+// #9018 (AC-9018-1 a -4): as respostas da consulta de estado que o navegador entrega como SUCESSO e que não trazem a tarefa (o `task` falta
+// ou não é um objeto JSON). Ficam fora de STATUS_FAILURES de propósito: o `.done` as recebe, não o `.fail`, e o AC-9005-5 (`SHALL CONTINUE
+// TO` não avisar `updating`) só vale para as falhas. `{"task": "abc"}`, `{"task": 5}` e `{"task": []}` (um texto, um número e uma lista,
+// como o AC-9018-1 os enumera) provam que a conferência é «não é um objeto JSON», e não só «é falso» nem «não é um texto».
+const NOTASK_RESPONSES = {
+    s204: {status: 204},
+    s304: {status: 304},
+    json_empty: {status: 200, body: {}},
+    json_other: {status: 200, body: {status: 'ok'}},
+    json_tasknull: {status: 200, body: {task: null}},
+    json_taskarray: {status: 200, body: {task: []}},
+    json_taskstring: {status: 200, body: {task: 'abc'}},
+    json_tasknumber: {status: 200, body: {task: 5}},
+    json_null: {status: 200, body: 'null'},
+    json_array: {status: 200, body: '[]'},
+    json202: {status: 202, body: {}},
+};
+// Onde a resposta sem tarefa chega: com o acompanhamento ativo (a consulta que a recebe é a 1ª, a 2ª ou a 3ª) e interrompido (Cancel ou
+// troca de comando) com a 1ª ou a 2ª consulta em voo.
+const NOTASK_CONTEXTS = ['active:0', 'active:1', 'active:2', 'cancel:first', 'cancel:second', 'switch:first', 'switch:second'];
 
 const SERVER_ERROR_TEXT = 'Server said: <b>no</b>';
 const REVOKE_FAILURES = {
@@ -174,7 +196,7 @@ function midwayFailure(kind, waits, options) {
     return result;
 }
 
-// Conta os avisos do evento `updating` (AC-8967-4 e -5) com um ouvinte de host registrado DEPOIS do da página;
+// Conta os avisos do evento `updating` (AC-9018-5, AC-8967-5 e AC-9018-4) com um ouvinte de host registrado DEPOIS do da página;
 // toda `world.state()` passa a trazer `updatingCalls`, a contagem até aquele momento.
 function countUpdating(world) {
     let calls = 0;
@@ -236,7 +258,7 @@ function noAbortControl(waits, runningText) {
     return result;
 }
 
-// AC-8967-4 (controle): sem interrupção, uma resposta «não pronta» e depois a pronta; cada uma avisa o `updating` uma vez.
+// AC-9018-5 (controle): sem interrupção, uma resposta «não pronta» e depois a pronta; cada uma avisa o `updating` uma vez.
 function followReady() {
     const world = createWorld();
     countUpdating(world);
@@ -259,6 +281,47 @@ function followNext(world, result) {
     world.execute('t2');
     world.answerStatus(ready('SECOND OUTPUT'), 'last');
     result.second = world.state();
+}
+
+// #9018: a consulta de estado recebe uma resposta SEM tarefa (`kind` de NOTASK_RESPONSES) em um dos NOTASK_CONTEXTS: 'active:<waits>'
+// (acompanhamento ativo, depois de `waits` respostas «não pronta») ou '<cancel|switch>:<first|second>' (interrompido, com a 1ª ou a 2ª
+// consulta em voo). `before` é a tela logo antes da resposta (nos interrompidos, depois do clique), `after` logo depois e `later` 5 s depois;
+// `log` é a ordem dos eventos `update-failed` e `update-finish` que um ouvinte de host registrou; `options.world` são as opções do mundo,
+// `options.host` registra um ouvinte de host ('throws', 'writes-failed' ou 'writes-finish') e `options.next` envia o comando seguinte.
+function noTaskResponse(kind, context, options) {
+    options = options || {};
+    const parts = context.split(':');
+    const interrupt = parts[0] === 'cancel' || parts[0] === 'switch' ? parts[0] : null;
+    const world = createWorld(Object.assign({commandsList: interrupt === 'switch'}, options.world));
+    countUpdating(world);
+    const log = [];
+    world.cmdasyncform.add_event_callback('update-failed', function (reason) { log.push('failed:' + reason); });
+    world.cmdasyncform.add_event_callback('update-finish', function () { log.push('finish'); });
+    if (options.host === 'throws') hostFailsOnUpdateFailed(world);
+    else if (options.host === 'writes-failed') hostWritesInPanel(world, 'update-failed');
+    else if (options.host === 'writes-finish') hostWritesInPanel(world, 'update-finish');
+    if (interrupt) {
+        if (parts[1] === 'first') {
+            world.execute('t1'); // a 1ª consulta está em voo
+        } else {
+            trackWaits(world, 1);
+            world.advance(1000); // a 2ª consulta está em voo
+        }
+        clickTrigger(world, interrupt);
+    } else {
+        trackWaits(world, Number(parts[1]));
+        world.advance(1000); // a consulta que vai receber a resposta sai (a 1ª já está em voo desde o envio)
+    }
+    const result = {before: world.state()};
+    world.answerStatus(NOTASK_RESPONSES[kind]);
+    result.after = world.state();
+    world.advance(5000);
+    result.later = world.state();
+    result.log = log;
+    // o comando seguinte só se envia com a tela liberada (o botão Execute habilitado): numa tela presa o clique não faz nada e o teste
+    // lê `after` para dizer isso, em vez de o harness lançar «nenhuma consulta em voo»
+    if (options.next && !result.after.execute.disabled) followNext(world, result);
+    return result;
 }
 
 // AC-8955-1: interromper (Cancel ou troca de comando) com o formulário em voo, antes da resposta do servidor.
@@ -774,7 +837,7 @@ function timeoutInterrupted(trigger) {
     return result;
 }
 
-// AC-8961-8 e -10: os ouvintes de um host veem o motivo e, depois dele, o `update-finish`.
+// AC-9018-2 (antes AC-8961-8) e AC-8961-10: os ouvintes de um host veem o motivo e, depois dele, o `update-finish`.
 function failureReasons(kind) {
     const world = createWorld();
     const log = [];
@@ -891,6 +954,32 @@ register('midway:2:http500:writes-finish', function () { return midwayFailure('h
 });
 register('midway:2:http500:nospace', function () { return midwayFailure('http500', 2, {world: TEMPLATES.nospace}); });
 
+// #9018: a resposta sem tarefa, de cada forma de NOTASK_RESPONSES em cada um dos NOTASK_CONTEXTS (AC-9018-1 a -4)
+Object.keys(NOTASK_RESPONSES).forEach(function (kind) {
+    NOTASK_CONTEXTS.forEach(function (context) {
+        register('notask:' + kind + ':' + context, function () { return noTaskResponse(kind, context); });
+    });
+});
+// ... com o ouvinte de host que lança e com os que escrevem no painel (o que a falha promete, herdado por construção, sem ID), com o comando
+// seguinte e com o template sem o espaço do aviso (robustez, sem ID)
+register('notask:s204:active:2:throws', function () { return noTaskResponse('s204', 'active:2', {host: 'throws'}); });
+register('notask:json_empty:cancel:second:throws', function () { return noTaskResponse('json_empty', 'cancel:second', {host: 'throws'}); });
+['writes-failed', 'writes-finish'].forEach(function (host) {
+    register('notask:s204:active:2:' + host, function () { return noTaskResponse('s204', 'active:2', {host: host}); });
+});
+['s204', 's304', 'json_empty', 'json_taskarray'].forEach(function (kind) {
+    register('notask:' + kind + ':active:2:next', function () { return noTaskResponse(kind, 'active:2', {next: true}); });
+});
+register('notask:s204:active:2:nospace', function () { return noTaskResponse('s204', 'active:2', {world: TEMPLATES.nospace}); });
+register('notask:json_empty:cancel:second:nospace', function () { return noTaskResponse('json_empty', 'cancel:second', {world: TEMPLATES.nospace}); });
+// o 200 sem corpo (`body: ''`, a forma fiel ao jQuery: `parsererror` com status 200) continua levando ao login, como todo 200 que não é JSON
+register('status:empty200', function () {
+    const world = createWorld();
+    world.execute('t1');
+    world.answerStatus({status: 200, body: ''});
+    return {after: world.state()};
+});
+
 ['cancel', 'switch'].forEach(function (trigger) {
     [1, 2, 3].forEach(function (waits) {
         register('abort:' + trigger + ':' + waits + ':timer', function () { return abort(trigger, waits, false); });
@@ -918,7 +1007,7 @@ register('abort:none:1:translated', function () { return noAbortControl(1, 'Exec
 });
 // ... com um ouvinte de host de `update-failed` que lança: o painel já está vazio quando ele lança
 register('abort:cancel:2:flight:fail:callback-throws', function () { return abort('cancel', 2, true, 'http403', true); });
-// AC-8967-4 (controle): sem interrupção, um aviso de `updating` por resposta
+// AC-9018-5 (controle): sem interrupção, um aviso de `updating` por resposta
 register('follow:ready', followReady);
 
 // AC-8955-1 e -2
@@ -1033,7 +1122,7 @@ register('form:4xx-sweep', formSweep);
         register('submit:' + trigger + ':fail:' + kind, function () { return submitInterruptedFailure(trigger, kind); });
     });
 });
-// AC-8961-8 e -10: o motivo que os ouvintes do evento recebem
+// AC-9018-2 (antes AC-8961-8) e AC-8961-10: o motivo que os ouvintes do evento recebem
 ['http400', 'http429', 'http500', 'html502', 'html202', 'network', 'timeout', 'http403', 'http404', 'html200'].forEach(function (kind) {
     register('reasons:' + kind, function () { return failureReasons(kind); });
 });
@@ -1176,6 +1265,9 @@ process.stdout.write(JSON.stringify({
         statusFailureKinds: Object.keys(STATUS_FAILURES),
         midwayKinds: MIDWAY_KINDS,
         midwayHostText: MIDWAY_HOST_TEXT,
+        // #9018: as formas de resposta sem tarefa (a lista é tirada daqui) e os contextos em que chegam
+        noTaskKinds: Object.keys(NOTASK_RESPONSES),
+        noTaskContexts: NOTASK_CONTEXTS,
         translatedRunningText: TRANSLATED_RUNNING_TEXT,
         initialButtons: {
             execute: initial.execute.disabled,

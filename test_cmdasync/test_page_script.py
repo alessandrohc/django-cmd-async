@@ -200,13 +200,13 @@ class StatusFailureTest(ScenarioTestCase):
 
 
 class StatusFailureTextTest(ScenarioTestCase):
-    """O aviso da consulta de estado que falha por erro de servidor ou de rede (AC-8961-1 e -2, #8961)."""
+    """O aviso da consulta de estado que falha por erro de servidor ou de rede (AC-9018-1, AC-8961-2, #8961 e #9018)."""
 
     # os erros HTTP que não são 403, 404 nem o 200 que não é JSON; o `html202` é um 2xx com corpo HTML (o que o jQuery real manda ao `.fail`)
     SERVER_KINDS = ('http400', 'http401', 'http405', 'http429', 'http500', 'http503', 'html502', 'html202')
 
     def test_a_status_query_that_fails_with_an_http_error_tells_the_server_could_not_answer(self):
-        """AC-8961-1: o erro HTTP da consulta de estado que não é 403, 404 nem o login mostra o texto de erro de servidor."""
+        """AC-9018-1 (controle): o erro HTTP da consulta de estado que não é 403, 404 nem o login mostra o texto de erro de servidor (a metade que já valia; a resposta sem tarefa é o `NoTaskResponseTest`)."""
         self.assertNotEqual(self.texts['serverFailureText'], self.texts['networkFailureText'], msg='precondition: the two texts differ')
         for kind in self.SERVER_KINDS:
             with self.subTest(failure=kind):
@@ -230,7 +230,7 @@ class StatusFailureTextTest(ScenarioTestCase):
         self.assertEqual(found['later']['statusRequests'], 1, msg='a new query went out after the failure')
 
     def test_the_notice_also_shows_when_the_follow_up_was_interrupted(self):
-        """AC-8961-1, AC-8961-2: com o acompanhamento interrompido (Cancel ou troca de comando), a consulta em voo que falha mostra o mesmo aviso."""
+        """AC-9018-1 (controle), AC-8961-2: com o acompanhamento interrompido (Cancel ou troca de comando), a consulta em voo que falha mostra o mesmo aviso (a metade que já valia)."""
         cases = []
         for trigger in ('cancel', 'switch'):
             for waits in (2, 3):
@@ -385,10 +385,10 @@ class FormFailureTest(ScenarioTestCase):
 
 
 class FailureReasonTest(ScenarioTestCase):
-    """O motivo que o handler avisa no evento `update-failed` (AC-8961-8 e -10, #8961)."""
+    """O motivo que o handler avisa no evento `update-failed` (AC-9018-2 e AC-8961-10, #8961 e #9018)."""
 
     def test_the_handler_tells_a_server_or_a_network_reason_before_it_releases_the_screen(self):
-        """AC-8961-8: a consulta de estado que falha por erro HTTP avisa o motivo `server`, a que falha sem resposta ou por tempo, `network`, e o `update-failed` sai antes do `update-finish`."""
+        """AC-9018-2 (controle): a consulta de estado que falha por erro HTTP avisa o motivo `server`, a que falha sem resposta ou por tempo, `network`, e o `update-failed` sai antes do `update-finish`."""
         for kind, reason in (('http400', 'server'), ('http429', 'server'), ('http500', 'server'), ('html502', 'server'),
                              ('html202', 'server'), ('network', 'network'), ('timeout', 'network')):
             with self.subTest(failure=kind):
@@ -534,7 +534,7 @@ class AbortTest(ScenarioTestCase):
         self.assertEqual(found['after']['pendingStatus'], 1, msg='precondition: the follow-up goes on')
 
     def test_the_updating_event_is_notified_once_per_answer_while_following(self):
-        """AC-8967-4 (controle): com o acompanhamento ativo, cada resposta (pronta ou não) avisa o `updating` uma vez."""
+        """AC-9018-5 (controle): com o acompanhamento ativo, cada resposta que traz a tarefa (pronta ou não) avisa o `updating` uma vez."""
         for name, answers in (('abort:none:1', 1), ('abort:none:2', 2)):
             with self.subTest(scenario=name):
                 found = self.scenario(name)
@@ -723,6 +723,140 @@ class FailureMidwayTest(ScenarioTestCase):
                     self.assertEqual(found['before']['updatingCalls'], waits,
                                      msg='precondition: one notification per answered query. {0}'.format(name))
                     self.assertEqual(found['after']['updatingCalls'], waits, msg='the failed query notified updating. {0}'.format(name))
+
+
+class NoTaskResponseTest(ScenarioTestCase):
+    """A consulta de estado que recebe uma resposta sem tarefa (o 204, o 304, um 2xx com JSON sem um objeto `task`) termina como a falha `server` (AC-9018-1 a -4, #9018)."""
+
+    def following(self, before, context, msg=''):
+        """A precondição de cada caso: a consulta que vai receber a resposta está em voo, a tela segue presa e, na 2ª e na 3ª consulta ativas, o painel guardava o texto de execução."""
+        self.assertTrue(before['execute']['disabled'], msg='precondition: the screen was not held. {0}'.format(msg))
+        self.assertEqual(before['pendingStatus'], 1, msg='precondition: the query that gets the response was not in flight. {0}'.format(msg))
+        self.assertEqual(before['uncaught'], [], msg='precondition: a script error before the response. {0}'.format(msg))
+        if context in ('active:1', 'active:2'):
+            self.assertEqual(before['output'], self.texts['runningText'], msg='precondition: the panel did not hold the running text. {0}'.format(msg))
+
+    def sweep(self, check):
+        """Cada forma de resposta sem tarefa em cada contexto (a lista vem do harness), com a precondição conferida; `check(nome, contexto, cenário)` afirma."""
+        kinds = self.constants['noTaskKinds']
+        contexts = self.constants['noTaskContexts']
+        self.assertEqual(len(kinds), 11, msg='precondition: the eleven forms of a response with no task')
+        for form in ('s204', 's304', 'json_taskarray', 'json_taskstring', 'json_tasknumber', 'json_null'):
+            self.assertIn(form, kinds, msg='precondition: the sweep has the form {0}'.format(form))
+        self.assertEqual(len(contexts), 7, msg='precondition: three active contexts and four interrupted ones')
+        for kind in kinds:
+            for context in contexts:
+                name = 'notask:{0}:{1}'.format(kind, context)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.following(found['before'], context, name)
+                    check(name, context, found)
+
+    def test_a_response_with_no_task_tells_the_server_could_not_answer(self):
+        """AC-9018-1: a consulta de estado que recebe uma resposta sem tarefa (o 204, o 304, ou um 2xx com JSON cujo `task` falta ou não é um objeto) mostra o texto de erro de servidor, com o acompanhamento ativo ou interrompido com a consulta em voo."""
+        def check(name, context, found):
+            self.assertEqual(found['after']['uncaught'], [], msg='the status callback raised. {0}'.format(name))
+            self.assertAlertEmpty(found['before'], msg='precondition: no notice before the response. {0}'.format(name))
+            self.assertAlertShows(found['after'], self.texts['serverFailureText'], msg=name)
+        self.sweep(check)
+
+    def test_a_response_with_no_task_tells_the_reason_before_it_releases_the_screen(self):
+        """AC-9018-2: a consulta de estado que recebe uma resposta sem tarefa avisa o `update-failed` com o motivo `server` e depois o `update-finish`."""
+        def check(name, context, found):
+            self.assertEqual(found['after']['uncaught'], [], msg='the status callback raised. {0}'.format(name))
+            self.assertEqual(found['log'], ['failed:server', 'finish'], msg=name)
+        self.sweep(check)
+
+    def test_a_response_with_no_task_stops_the_query_and_releases_the_screen_with_an_empty_panel(self):
+        """AC-9018-3: a consulta de estado que recebe uma resposta sem tarefa para de consultar e solta a tela, com o painel de saída vazio e o Copy escondido."""
+        def check(name, context, found):
+            after, later = found['after'], found['later']
+            self.assertEqual(after['uncaught'], [], msg='the status callback raised. {0}'.format(name))
+            self.assertAtRest(after, msg=name)
+            self.assertEqual(after['output'], '', msg='the panel kept its text. {0}'.format(name))
+            self.assertTrue(after['copyHidden'], msg='the copy button is visible over an empty panel. {0}'.format(name))
+            # parar de consultar: nenhuma consulta saiu nem ficou agendada. O `liveTimers` é lido logo depois da resposta e o `uncaught`, 5 s
+            # depois: um `.done` que agendasse a consulta seguinte teria um timer vivo agora, e ele dispararia e lançaria em `task.id`
+            # (antes do `$.ajax`) quando a tarefa não existe, sem aumentar `statusRequests`
+            self.assertEqual(after['liveTimers'], 0, msg='a new query stayed scheduled. {0}'.format(name))
+            self.assertEqual(later['statusRequests'], found['before']['statusRequests'], msg='a new query went out after the response. {0}'.format(name))
+            self.assertEqual(later['liveTimers'], 0, msg='a timer is alive 5 s after the response. {0}'.format(name))
+            self.assertEqual(later['uncaught'], [], msg='a script error in the 5 s after the response. {0}'.format(name))
+        self.sweep(check)
+
+    def test_a_response_with_no_task_does_not_notify_updating(self):
+        """AC-9018-4: a consulta de estado que recebe uma resposta sem tarefa, com o acompanhamento ativo, não avisa os ouvintes do `updating`."""
+        checked = []
+
+        def check(name, context, found):
+            if not context.startswith('active:'):
+                return
+            waits = int(context.split(':')[1])
+            checked.append(name)  # antes dos asserts: a conta dos casos não pode depender de eles passarem
+            self.assertEqual(found['before']['updatingCalls'], waits, msg='precondition: one notification per answered query. {0}'.format(name))
+            self.assertEqual(found['after']['updatingCalls'], waits, msg='updating was notified for a response with no task. {0}'.format(name))
+        self.sweep(check)
+        self.assertEqual(len(checked), 33, msg='precondition: eleven forms in the three active contexts')
+
+    def test_a_host_listener_that_raises_does_not_keep_the_screen_stuck_on_a_response_with_no_task(self):
+        # Robustez (sem ID; o sem-tarefa passa pelo mesmo caminho da falha, que guarda isso no AC-9005-3): o ouvinte de host de `update-failed`
+        # que lança não prende a tela (o `update-finish` sai) e o erro dele chega ao host.
+        for name, context in (('notask:s204:active:2:throws', 'active:2'), ('notask:json_empty:cancel:second:throws', 'cancel:second')):
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.following(found['before'], context, name)
+                after = found['after']
+                self.assertAtRest(after, msg='update-finish never fired after a callback raised. {0}'.format(name))
+                self.assertEqual([failure['message'] for failure in after['uncaught']], ['Error: host callback raised'], msg=name)
+                self.assertEqual(found['log'], ['failed:server', 'finish'], msg=name)
+
+    def test_the_text_a_host_listener_writes_in_the_panel_stays_on_a_response_with_no_task(self):
+        # Robustez (sem ID; o AC-9005-2 guarda isso para a falha): o texto que um ouvinte de host de `update-failed` ou de `update-finish`
+        # escreve no painel fica quando a tela é solta.
+        for host in ('writes-failed', 'writes-finish'):
+            name = 'notask:s204:active:2:{0}'.format(host)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.following(found['before'], 'active:2', name)
+                after = found['after']
+                self.assertEqual(after['uncaught'], [], msg=name)
+                self.assertAtRest(after, msg=name)
+                self.assertEqual(after['output'], self.constants['midwayHostText'], msg='the text the host wrote in the panel was erased. {0}'.format(name))
+
+    def test_the_command_sent_after_a_response_with_no_task_is_followed_to_the_end(self):
+        # Robustez (sem ID; o AC-9005-4 guarda isso para a falha): depois da resposta sem tarefa o comando seguinte mostra a saída e solta a tela.
+        for kind in ('s204', 's304', 'json_empty', 'json_taskarray'):
+            name = 'notask:{0}:active:2:next'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertAtRest(found['after'], msg='precondition: the response released the screen. {0}'.format(name))
+                second = found['second']
+                self.assertEqual(second['uncaught'], [], msg=name)
+                self.assertEqual(second['output'], 'SECOND OUTPUT', msg='the next command was not followed to its end. {0}'.format(name))
+                self.assertAtRest(second, msg=name)
+
+    def test_a_response_with_no_task_with_a_template_without_the_alert_space_releases_the_screen_silently(self):
+        # Robustez (sem ID; o AC-8866-15 e o AC-8961-6 guardam isso para a falha): o host sem o espaço do aviso nem os textos solta a tela em
+        # silêncio, com o painel vazio, sem texto à mostra e sem erro de script.
+        for name, context in (('notask:s204:active:2:nospace', 'active:2'), ('notask:json_empty:cancel:second:nospace', 'cancel:second')):
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.following(found['before'], context, name)
+                after = found['after']
+                self.assertEqual(after['uncaught'], [], msg=name)
+                self.assertAtRest(after, msg=name)
+                self.assertEqual(after['output'], '', msg='the panel kept its text. {0}'.format(name))
+                self.assertTrue(after['copyHidden'], msg='the copy button is visible over an empty panel. {0}'.format(name))
+                self.assertAlertEmpty(after, msg=name)
+
+    def test_an_empty_200_still_sends_the_user_to_the_login(self):
+        # Robustez (sem ID; o AC-8866-3 vale para ele): o 200 sem corpo (`body: ''`, a forma fiel ao jQuery: `parsererror` com status 200, como todo
+        # 200 que não é JSON) continua levando ao login, e não ao aviso de erro de servidor; é o que o README diz.
+        after = self.scenario('status:empty200')['after']
+        self.assertEqual(after['uncaught'], [])
+        self.assertEqual(after['locations'], [self.login_target])
+        self.assertAtRest(after, msg='the screen was left stuck: update-finish never fired')
+        self.assertAlertEmpty(after, msg='the login redirect must not show the server notice')
 
 
 class RevokeWindowTest(ScenarioTestCase):
@@ -1320,13 +1454,22 @@ class DoubleAssumptionsTest(TestCase):
         self.assertRegex(source, r'async&&0<\w+\.timeout&&\(\w+=\w+\.setTimeout\(function\(\)\{\w+\.abort\("timeout"\)\},\w+\.timeout\)\)',
                          msg='the vendored jQuery no longer cuts a query with a positive timeout by abort("timeout")')
 
-    def test_the_vendored_jquery_resolves_a_204_as_success_so_the_double_does_not_model_it(self):
+    def test_the_vendored_jquery_resolves_a_204_as_success_with_no_data_as_the_double_does(self):
         # O cenário `html202` do dublê (2xx com corpo HTML) chega ao `.fail` como `parsererror` com o status do 2xx; o 204 não: o jQuery
-        # o resolve como sucesso («nocontent») e o `.done` recebe `data` indefinido (o follow-up F3). Lido na fonte entregue
-        # (jquery-3.7.1.min.js); se a versão mudar, este teste obriga a conferir o que o `html202` supõe (#8961).
+        # o resolve como sucesso («nocontent») e o `.done` recebe `data` indefinido, e o dublê (world.js, `outcome`) o repete desde o
+        # #9018 (o `NOTASK_RESPONSES.s204`). Lido na fonte entregue (jquery-3.7.1.min.js); se a versão mudar, este teste obriga a
+        # conferir o que o dublê supõe (#8961, #9018).
         source = (STATIC_CMDASYNC / 'js' / 'jquery-3.7.1.min.js').read_text(encoding='utf-8')
         self.assertRegex(source, r'204===\w+\|\|"HEAD"===\w+\.type\?\w+="nocontent"',
                          msg='the vendored jQuery no longer resolves a 204 as success (nocontent)')
+
+    def test_the_vendored_jquery_resolves_a_304_as_success_with_no_data_as_the_double_does(self):
+        # O 304 chega ao `.done` como o 204: «notmodified» e `data` indefinido (o `data` só é atribuído no 3º ramo da cadeia). O dublê
+        # (world.js, `outcome`) o repete (o `NOTASK_RESPONSES.s304`, #9018). Lido na fonte entregue (jquery-3.7.1.min.js, a linha do
+        # `204===e||"HEAD"===v.type?l="nocontent":304===e?l="notmodified":(l=s.state,o=s.data,i=!(a=s.error))`).
+        source = (STATIC_CMDASYNC / 'js' / 'jquery-3.7.1.min.js').read_text(encoding='utf-8')
+        self.assertRegex(source, r'204===\w+\|\|"HEAD"===\w+\.type\?\w+="nocontent":304===\w+\?\w+="notmodified":\(\w+=\w+\.state,\w+=\w+\.data,',
+                         msg='the vendored jQuery no longer resolves a 304 as success with no data (notmodified)')
 
     def test_the_wide_variant_of_the_arguments_shows_above_768_px(self):
         """AC-9019-7 (controle): a regra entregue esconde a variante larga dos argumentos até 768 px e a estreita acima de 768 px, e cada template traz a classe da sua variante."""

@@ -243,8 +243,8 @@ A host with a page of its own that uses `cmdhandler.js` gets the same through
 that enabled its Revoke button early ends the click like any failed revocation. A host that never
 goes through `ajax()` keeps the old behaviour of the interruption: it is ignored until the second
 query. The `updating` event is fired for the answer of each status query while the follow-up goes
-on, and **not** for the answer of an interrupted follow-up, nor for a status query that fails (in both cases the
-handler empties the output panel and releases the screen instead). `ajax()` may be called more than once: the handler registers its
+on, and **not** for the answer of an interrupted follow-up, nor for a status query that fails or comes back with no
+task (in all these cases the handler empties the output panel and releases the screen instead). `ajax()` may be called more than once: the handler registers its
 own `form-valid` callback once per `init()`, so a task is followed by a single chain of status
 queries however many times it is called.
 
@@ -254,9 +254,10 @@ When the status query fails the page stops following the task and releases the f
 released the form with no text, and the user could not tell the failure from a task that had ended). The handler
 (`cmdhandler.js`) tells the host the reason in the `update-failed` event: `login` (a `200` that is not JSON),
 `forbidden` (`403`), `not-found` (`404`), `network` (no answer at all: the network failed, or the query was cut at
-`query_timeout`) and `server` (any other failure: a `400`, `401`, `405`, `429`, a `5xx`, an HTML error page, or a `2xx`
-with a body that is not JSON). A host with a page of its own that tells the reason by `if`/`else` should handle
-`server` and `network` too. The bundled page shows the text it publishes in `data-server-error-text` and
+`query_timeout`) and `server` (any other failure: a `400`, `401`, `405`, `429`, a `5xx`, an HTML error page, a `2xx`
+with a body that is not JSON, or a response that carries no task: a `204` or a `304`, or a `2xx` whose JSON has no `task`
+object, which only a layer in front of the server, a proxy or a CDN, can answer). A host with a page of its own that
+tells the reason by `if`/`else` should handle `server` and `network` too. The bundled page shows the text it publishes in `data-server-error-text` and
 `data-network-error-text` of `#task-panel` (in the catalog of the package, pt_BR included); a template that does not
 publish a text shows none, and the page still releases the form.
 
@@ -268,11 +269,28 @@ handler empties the panel **before** it fires `update-failed` and then `update-f
 that **reads** the panel sees it empty, and what a listener **writes** there stays: to show the reason in the panel,
 write it in a listener of `update-failed`. `empty()` discards everything the panel held, not only the running text:
 the output of an earlier run (in a host that does not clear it when the form is sent) and what a `form-valid` or
-`updating` listener wrote. A `204`, and a `200` whose JSON carries no `task`, are not covered: the handler takes them
-for an answer, not for a failure, and they do not go through this path. A host with a template of its own that has no
+`updating` listener wrote. A host with a template of its own that has no
 space for the notice, or publishes no text, now releases the screen with an empty panel and no text at all after the
 failure (a failure of the first query already did). A host with its own copy, or an old copy, of `cmdhandler.js` does
 not get the change: collect the static files again.
+
+**A response that carries no task ends the status query as the failure `server`.** jQuery resolves a `204` and a `304`
+as a success with no data, and the handler used to read `data.task` on them and raise a `TypeError`, which left the
+screen stuck; a `2xx` whose JSON has no `task` object (`{}`, `null`, a list, `{"task": null}`, `{"task": "text"}`,
+`{"task": 5}`, `{"task": []}`) fired `updating` and then either raised a `TypeError` too or was read as a task that was
+not ready and went on asking for `status/undefined`. Now the handler tells such a response from a task (the `task` field must be a JSON object), and for any other
+one it does what it does for a failed query: it stops asking, empties the output panel, tells `update-failed` with the
+reason `server` and then `update-finish`, and does not fire `updating`. The bundled page shows the server notice, with
+the follow-up active or interrupted (an interrupted follow-up used to be released with no notice when the answer was
+JSON with no `task`). A host with a page of its own that listens to `update-failed` now receives `server` in these cases,
+where the screen used to stay stuck with no event. Two details for such a host: `failure_reason(xhr, textStatus)` is
+now also called with the `xhr` of a success (a `2xx` or a `304`; `textStatus` is `success`, `nocontent` or `notmodified`),
+so an override that assumes a failure status should not trust `xhr.status`; and `query_failed(xhr, textStatus)`, the
+method that ends the query for a failure and for a response with no task, is a new public method of `cmdasyncform`. An
+empty `200` (no body) is **not** one of these: with `dataType` json jQuery sends it to the failure handler as a
+`parsererror` with status `200`, as it does for any `200` that is not JSON, so it still goes to the login. A task with
+a `task` object that has no `id` or `ready` is not covered either: the page asks for `status/undefined` until the user
+cancels.
 
 The notice says that **the last command sent may still be running**, and to check before running it again: the status
 query only exists once the task was launched, and the released form offers only Execute. The page does not show the id

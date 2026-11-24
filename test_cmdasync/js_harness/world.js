@@ -11,6 +11,10 @@
  *     dos `.done`/`.fail` encadeados;
  *   - sem `dataType`, o HTML do login (200) chega ao `.done` como texto; com `dataType: 'json'` vai
  *     ao `.fail` com `textStatus` 'parsererror' (e status 200);
+ *   - o 204 e o 304 chegam ao `.done` como sucesso com `data` INDEFINIDO e `textStatus` 'nocontent' e 'notmodified', com ou sem
+ *     corpo e mesmo com `dataType: 'json'` (`jquery-3.7.1.min.js`: `204===e||"HEAD"===v.type?l="nocontent":304===e?l="notmodified":
+ *     (l=s.state,o=s.data,i=!(a=s.error))`: o `data` só é atribuído no 3º ramo); o 2xx com corpo que não é JSON segue indo ao `.fail`
+ *     como 'parsererror' (#9018; `DoubleAssumptionsTest` confere a fonte do jQuery);
  *   - um erro HTTP chega ao `.fail` com `textStatus` 'error' e o `status` do jqXHR (0 = rede);
  *   - `timeout` maior que zero (`jquery-3.7.1.min.js`: `v.async&&0<v.timeout&&(…setTimeout(function(){T.abort("timeout")},
  *     v.timeout))`) corta o pedido sem resposta quando o tempo passa: o `.fail` recebe `textStatus` 'timeout' e `status` 0;
@@ -480,6 +484,10 @@ function createWorld(options) {
                 try { xhr.responseJSON = JSON.parse(xhr.responseText); } catch (error) { /* corpo que não é JSON */ }
             }
             return {ok: false, textStatus: 'error', xhr: xhr};
+        }
+        // o 204 e o 304: sucesso sem dado, qualquer que seja o corpo e o `dataType` (a regra do jQuery citada no cabeçalho; #9018)
+        if (response.status === 204 || response.status === 304) {
+            return {ok: true, data: undefined, textStatus: response.status === 204 ? 'nocontent' : 'notmodified', xhr: xhr};
         }
         let data = body;
         if (request.dataType === 'json' && typeof data === 'string') {
