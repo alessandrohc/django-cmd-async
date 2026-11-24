@@ -224,7 +224,8 @@ query. **Cancel** (and, when the page shows the list of commands, the **switch o
 that follow-up wherever it is: while the form is being sent, with the first status query in flight,
 or between two queries. The screen is released when the answer in flight arrives, or at once when a
 new query was only scheduled, and no status query goes out after it. The released screen has an
-empty output panel and no Copy button: the running text of the last query is not left in it.
+empty output panel and no Copy button: the running text of the last query is not left in it (a status query that
+fails releases the screen the same way, see the next section).
 **The task keeps running**:
 stopping it is Revoke, to be used before Cancel, because the page disables Revoke when it releases
 the screen. Before, Cancel and the switch were ignored until the second query: the follow-up went
@@ -242,8 +243,8 @@ A host with a page of its own that uses `cmdhandler.js` gets the same through
 that enabled its Revoke button early ends the click like any failed revocation. A host that never
 goes through `ajax()` keeps the old behaviour of the interruption: it is ignored until the second
 query. The `updating` event is fired for the answer of each status query while the follow-up goes
-on, and **not** for the answer of an interrupted follow-up (the handler empties the output panel
-and releases the screen instead). `ajax()` may be called more than once: the handler registers its
+on, and **not** for the answer of an interrupted follow-up, nor for a status query that fails (in both cases the
+handler empties the output panel and releases the screen instead). `ajax()` may be called more than once: the handler registers its
 own `form-valid` callback once per `init()`, so a task is followed by a single chain of status
 queries however many times it is called.
 
@@ -258,6 +259,20 @@ with a body that is not JSON). A host with a page of its own that tells the reas
 `server` and `network` too. The bundled page shows the text it publishes in `data-server-error-text` and
 `data-network-error-text` of `#task-panel` (in the catalog of the package, pt_BR included); a template that does not
 publish a text shows none, and the page still releases the form.
+
+**The output panel is emptied on every one of these failures**, whether the follow-up was interrupted or not (before,
+only the interruption emptied it). The panel still holds the running text of the last answer (`Running command...`,
+translated when the page is), which the failure belies, and the page shows the Copy button by what the panel holds, so
+the button goes away with the text. This covers the reasons listed above, the cut at `query_timeout` included. The
+handler empties the panel **before** it fires `update-failed` and then `update-finish`, so a listener of those events
+that **reads** the panel sees it empty, and what a listener **writes** there stays: to show the reason in the panel,
+write it in a listener of `update-failed`. `empty()` discards everything the panel held, not only the running text:
+the output of an earlier run (in a host that does not clear it when the form is sent) and what a `form-valid` or
+`updating` listener wrote. A `204`, and a `200` whose JSON carries no `task`, are not covered: the handler takes them
+for an answer, not for a failure, and they do not go through this path. A host with a template of its own that has no
+space for the notice, or publishes no text, now releases the screen with an empty panel and no text at all after the
+failure (a failure of the first query already did). A host with its own copy, or an old copy, of `cmdhandler.js` does
+not get the change: collect the static files again.
 
 The notice says that **the last command sent may still be running**, and to check before running it again: the status
 query only exists once the task was launched, and the released form offers only Execute. The page does not show the id

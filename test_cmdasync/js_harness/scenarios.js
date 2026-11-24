@@ -140,6 +140,40 @@ function statusFailureMidway(kind) {
 // Os tipos de falha da consulta que chegam ao `.fail` do handler (AC-8967-1).
 const FAILURE_KINDS = ['html200', 'http403', 'http404', 'http500', 'network'];
 
+// #9005 (AC-9005-1 a -5): a consulta de estado FALHA no meio do acompanhamento, sem interrupção: depois de `waits` respostas «não pronta»
+// a consulta seguinte sai (a 2ª com waits = 1, a 3ª com waits = 2; a 1ª, com waits = 0, só o AC-9005-5 a usa) e falha. `kind` é um
+// tipo de STATUS_FAILURES ou 'cut', o corte real:
+// a consulta fica sem resposta e o `$.ajax` a corta aos 30 s (o caminho do timer, outro que o da resposta `status: 0` do tipo `network`).
+// `options.world` são as opções do mundo (o texto de execução traduzido, o template sem o aviso); `options.host` registra um ouvinte
+// de host ('throws', 'writes-failed' ou 'writes-finish'); `options.next` envia o comando seguinte, que tem de ser acompanhado até o fim.
+// A tela traz `updatingCalls` (os avisos de `updating` até aquele momento).
+const MIDWAY_HOST_TEXT = 'HOST TEXT';
+const TRANSLATED_RUNNING_TEXT = 'Executando comando...';
+const MIDWAY_KINDS = Object.keys(STATUS_FAILURES).concat(['cut']);
+
+function hostWritesInPanel(world, event) {
+    world.cmdasyncform.add_event_callback(event, function () {
+        world.cmdasyncform.$output.text(MIDWAY_HOST_TEXT);
+    });
+}
+
+function midwayFailure(kind, waits, options) {
+    options = options || {};
+    const world = createWorld(options.world);
+    countUpdating(world);
+    if (options.host === 'throws') hostFailsOnUpdateFailed(world);
+    else if (options.host === 'writes-failed') hostWritesInPanel(world, 'update-failed');
+    else if (options.host === 'writes-finish') hostWritesInPanel(world, 'update-finish');
+    trackWaits(world, waits);
+    world.advance(1000); // a consulta que vai falhar sai
+    const result = {before: world.state()};
+    if (kind === 'cut') world.advance(30000);
+    else world.answerStatus(STATUS_FAILURES[kind]);
+    result.after = world.state();
+    if (options.next) followNext(world, result);
+    return result;
+}
+
 // Conta os avisos do evento `updating` (AC-8967-4 e -5) com um ouvinte de host registrado DEPOIS do da página;
 // toda `world.state()` passa a trazer `updatingCalls`, a contagem até aquele momento.
 function countUpdating(world) {
@@ -677,7 +711,7 @@ function timeoutFirst(template) {
 }
 
 // AC-8961-3: a 2ª consulta (sai em t = 1000, depois de uma resposta «não pronta») tem o limite dela, contado do envio dela.
-// Não se afirma o painel: a falha da 2ª consulta em diante deixa «Running command...» (o #9005).
+// Aqui não se afirma o painel: o que a falha da 2ª consulta em diante deixa nele (e o corte aos 30 s) é o AC-9005-1 (`FailureMidwayTest`).
 function timeoutSecond() {
     const world = createWorld();
     world.execute('t1');
@@ -836,6 +870,26 @@ Object.keys(STATUS_FAILURES).forEach(function (kind) {
 register('status:callback-throws', throwingCallback);
 
 register('status:html200:midway', function () { return statusFailureMidway('html200'); });
+
+// #9005: a falha da consulta no meio do acompanhamento, de cada tipo e do corte aos 30 s, na 2ª e na 3ª consulta (AC-9005-1, -5) e, só
+// para o AC-9005-5, na 1ª (waits = 0)
+[0, 1, 2].forEach(function (waits) {
+    MIDWAY_KINDS.forEach(function (kind) {
+        register('midway:' + waits + ':' + kind, function () { return midwayFailure(kind, waits); });
+    });
+});
+// ... com o texto de execução traduzido (AC-9005-1), com o ouvinte de host que lança (AC-9005-1, -3) e com os que escrevem no painel
+// (AC-9005-2), com o comando seguinte (AC-9005-4) e com o template sem o espaço do aviso (robustez, sem ID)
+register('midway:1:http500:translated', function () {
+    return midwayFailure('http500', 1, {world: {runningText: TRANSLATED_RUNNING_TEXT}});
+});
+register('midway:2:http403:throws', function () { return midwayFailure('http403', 2, {host: 'throws'}); });
+register('midway:2:http500:writes-failed', function () { return midwayFailure('http500', 2, {host: 'writes-failed'}); });
+register('midway:2:http500:writes-finish', function () { return midwayFailure('http500', 2, {host: 'writes-finish'}); });
+['html200', 'http500', 'network', 'cut'].forEach(function (kind) {
+    register('midway:2:' + kind + ':next', function () { return midwayFailure(kind, 2, {next: true}); });
+});
+register('midway:2:http500:nospace', function () { return midwayFailure('http500', 2, {world: TEMPLATES.nospace}); });
 
 ['cancel', 'switch'].forEach(function (trigger) {
     [1, 2, 3].forEach(function (waits) {
@@ -1118,6 +1172,11 @@ process.stdout.write(JSON.stringify({
         echoedText: ECHOED_TEXT,
         refusals: REFUSALS,
         hiddenSelectors: {args: '#id_args', kwargs: '#id_kwargs'},
+        // #9005: os tipos de falha da consulta (a lista de `STATUS_FAILURES`, tirada daqui), os do meio (mais o corte real) e os textos
+        statusFailureKinds: Object.keys(STATUS_FAILURES),
+        midwayKinds: MIDWAY_KINDS,
+        midwayHostText: MIDWAY_HOST_TEXT,
+        translatedRunningText: TRANSLATED_RUNNING_TEXT,
         initialButtons: {
             execute: initial.execute.disabled,
             cancel: initial.cancel.disabled,

@@ -272,7 +272,7 @@ class StatusTimeoutTest(ScenarioTestCase):
 
     def test_each_status_query_has_its_own_limit_counted_from_its_send(self):
         """AC-8961-3: a 2ª consulta do acompanhamento (enviada 1 s depois de uma resposta «não pronta») tem o limite dela, contado do envio dela."""
-        # Não se afirma o painel: a falha da 2ª consulta em diante deixa «Running command...» e o Copy (o #9005).
+        # Aqui não se afirma o painel: o que a falha da 2ª consulta em diante deixa nele (e o corte aos 30 s) é o AC-9005-1 (`FailureMidwayTest`).
         found = self.scenario('timeout:status:second')
         start = found['start']
         self.assertEqual(start['statusRequests'], 2, msg='precondition: the second query went out')
@@ -421,9 +421,10 @@ class NoClientTimeoutTest(ScenarioTestCase):
 
 
 class CallbackFailureTest(ScenarioTestCase):
-    """Um callback de outro código que lança não pode prender a tela (robustez, sem ID)."""
+    """Um callback de outro código que lança não pode prender a tela (AC-9005-3)."""
 
     def test_a_callback_that_raises_on_a_refused_query_does_not_keep_the_screen_stuck(self):
+        """AC-9005-3 (controle): o ouvinte de host de `update-failed` que lança não prende a tela (o `update-finish` sai) e o erro dele chega ao host."""
         # O update-finish sai num finally: a mesma classe de tela presa que o ticket corrige.
         after = self.scenario('status:callback-throws')['after']
         self.assertAtRest(after, msg='update-finish never fired after a callback raised')
@@ -564,14 +565,6 @@ class AbortTest(ScenarioTestCase):
                 self.assertEqual(found['afterAnswer']['updatingCalls'], before_interruption,
                                  msg='updating was notified for the answer of an interrupted follow-up')
 
-    def test_a_failure_without_interruption_keeps_the_screen_as_it_is(self):
-        # Controle sem ID: a falha da consulta SEM interrupção segue como está neste ticket (o texto de execução
-        # e o Copy ficam); mudar isso é o follow-up F1 do #8967, que troca este teste.
-        after = self.scenario('status:html200:midway')['after']
-        self.assertAtRest(after, msg='the screen was not released')
-        self.assertEqual(after['output'], self.texts['runningText'])
-        self.assertFalse(after['copyHidden'])
-
     def test_without_the_abort_the_scheduled_query_goes_out(self):
         """AC-8866-6 (controle): sem interromper, a consulta agendada sai."""
         found = self.scenario('abort:none:2')
@@ -633,6 +626,103 @@ class AbortTest(ScenarioTestCase):
                     answered = found['afterAnswer']
                     self.assertAtRest(answered)
                     self.assertNotIn('TASK OUTPUT', answered['output'], msg='the task output was shown after the interruption')
+
+
+class FailureMidwayTest(ScenarioTestCase):
+    """A consulta de estado que falha no meio do acompanhamento, sem interrupção, deixa o painel vazio (AC-9005-1 a -5, #9005)."""
+
+    def following(self, state, text, msg=''):
+        """A precondição de cada caso do meio: o acompanhamento seguia, a consulta que vai falhar estava em voo e o painel guardava o texto de execução."""
+        self.assertTrue(state['execute']['disabled'], msg='precondition: the screen was not following. {0}'.format(msg))
+        self.assertEqual(state['pendingStatus'], 1, msg='precondition: the query that fails was not in flight. {0}'.format(msg))
+        self.assertEqual(state['output'], text, msg='precondition: the panel did not hold the running text. {0}'.format(msg))
+
+    def released_empty(self, state, msg=''):
+        """A tela solta com o painel de saída vazio e o Copy escondido."""
+        self.assertAtRest(state, msg=msg)
+        self.assertEqual(state['output'], '', msg='the panel kept its text after the failure. {0}'.format(msg))
+        self.assertTrue(state['copyHidden'], msg='the copy button is visible over an empty panel. {0}'.format(msg))
+
+    def test_a_status_query_that_fails_midway_leaves_the_panel_empty_and_the_copy_hidden(self):
+        """AC-9005-1: a consulta de estado que falha a partir da 2ª, sem interrupção (cada tipo de falha e o corte aos 30 s), solta a tela com o painel de saída vazio e o Copy escondido."""
+        kinds = self.constants['midwayKinds']
+        self.assertIn('cut', kinds, msg='precondition: the sweep has the real 30 s cut')
+        self.assertEqual(kinds[:-1], self.constants['statusFailureKinds'], msg='precondition: the sweep is the list of failure kinds of the harness')
+        for waits in (1, 2):
+            for kind in kinds:
+                name = 'midway:{0}:{1}'.format(waits, kind)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.following(found['before'], self.texts['runningText'], name)
+                    after = found['after']
+                    self.assertEqual(after['uncaught'], [], msg=name)
+                    self.assertEqual(after['pendingStatus'], 0, msg='precondition: the query ended. {0}'.format(name))
+                    self.released_empty(after, name)
+
+    def test_the_first_status_query_that_fails_leaves_the_panel_empty_and_the_copy_hidden(self):
+        """AC-9005-1 (controle): a 1ª consulta que falha (o painel nunca guardou o texto de execução) solta a tela com o painel vazio e o Copy escondido."""
+        kinds = self.constants['statusFailureKinds']
+        self.assertGreater(len(kinds), 1, msg='precondition: the sweep has the failure kinds')
+        for kind in kinds:
+            name = 'status:{0}:full'.format(kind)
+            with self.subTest(scenario=name):
+                after = self.scenario(name)['after']
+                self.assertEqual(after['uncaught'], [], msg=name)
+                self.released_empty(after, name)
+
+    def test_a_host_listener_that_raises_does_not_leave_the_running_text_in_the_panel(self):
+        """AC-9005-1: com um ouvinte de host de `update-failed` que lança, a falha do meio solta a tela com o painel vazio e o Copy escondido (o painel já está vazio quando ele lança)."""
+        found = self.scenario('midway:2:http403:throws')
+        self.following(found['before'], self.texts['runningText'])
+        after = found['after']
+        self.assertEqual([failure['message'] for failure in after['uncaught']], ['Error: host callback raised'],
+                         msg='precondition: the host listener raised')
+        self.released_empty(after)
+
+    def test_the_running_text_that_leaves_the_panel_is_the_one_the_template_publishes(self):
+        """AC-9005-1: o texto de execução que sai do painel na falha do meio é o que o template publica (traduzido quando há tradução), e não o literal em inglês."""
+        found = self.scenario('midway:1:http500:translated')
+        translated = self.constants['translatedRunningText']
+        self.assertNotEqual(translated, self.texts['runningText'], msg='precondition: the published text is not the English one')
+        self.following(found['before'], translated)
+        self.assertEqual(found['after']['uncaught'], [])
+        self.released_empty(found['after'])
+
+    def test_the_text_a_host_listener_writes_in_the_panel_stays(self):
+        """AC-9005-2 (controle): o texto que um ouvinte de host de `update-failed` ou de `update-finish` escreve no painel, numa falha do meio, fica no painel quando a tela é solta."""
+        for listener in ('failed', 'finish'):
+            name = 'midway:2:http500:writes-{0}'.format(listener)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.following(found['before'], self.texts['runningText'], name)
+                after = found['after']
+                self.assertEqual(after['uncaught'], [], msg=name)
+                self.assertAtRest(after, msg=name)
+                self.assertEqual(after['output'], self.constants['midwayHostText'],
+                                 msg='the text the host wrote in the panel was erased. {0}'.format(name))
+
+    def test_the_command_sent_after_a_failed_status_query_is_followed_to_the_end(self):
+        """AC-9005-4 (controle): depois de uma falha do meio (a tela de login, o 5xx, a falha de rede, o corte aos 30 s), o comando enviado em seguida é acompanhado: mostra a saída e solta a tela."""
+        for kind in ('html200', 'http500', 'network', 'cut'):
+            name = 'midway:2:{0}:next'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertAtRest(found['after'], msg='precondition: the failure released the screen. {0}'.format(name))
+                second = found['second']
+                self.assertEqual(second['uncaught'], [], msg=name)
+                self.assertEqual(second['output'], 'SECOND OUTPUT', msg='the next command was not followed to its end. {0}'.format(name))
+                self.assertAtRest(second, msg=name)
+
+    def test_a_failed_status_query_does_not_notify_updating(self):
+        """AC-9005-5 (controle): a consulta de estado que falha (a 1ª, a 2ª e a 3ª) não avisa os ouvintes do `updating`: só a resposta «não pronta» o avisa."""
+        for waits in (0, 1, 2):
+            for kind in self.constants['midwayKinds']:
+                name = 'midway:{0}:{1}'.format(waits, kind)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.assertEqual(found['before']['updatingCalls'], waits,
+                                     msg='precondition: one notification per answered query. {0}'.format(name))
+                    self.assertEqual(found['after']['updatingCalls'], waits, msg='the failed query notified updating. {0}'.format(name))
 
 
 class RevokeWindowTest(ScenarioTestCase):
@@ -1060,6 +1150,18 @@ class HostTemplateTest(ScenarioTestCase):
                         self.assertAlertEmpty(after, msg=name)
                     else:
                         self.assertAlertShows(after, self.constants['serverErrorText'], msg=name)
+
+    def test_a_failure_midway_with_a_template_without_the_alert_space_leaves_the_panel_empty(self):
+        # Robustez (sem ID; o texto de nenhum critério a diz): o host sem o espaço do aviso nem os textos solta a tela em silêncio depois
+        # da falha do meio, como a 1ª consulta que falha já a solta (#9005): painel vazio, Copy escondido, nenhum texto e nenhum erro de script.
+        found = self.scenario('midway:2:http500:nospace')
+        self.assertEqual(found['before']['output'], self.texts['runningText'], msg='precondition: the panel held the running text')
+        after = found['after']
+        self.assertEqual(after['uncaught'], [])
+        self.assertAtRest(after)
+        self.assertEqual(after['output'], '', msg='the panel kept the running text')
+        self.assertTrue(after['copyHidden'], msg='the copy button is visible over an empty panel')
+        self.assertAlertEmpty(after)
 
     def test_a_host_template_without_the_alert_parts_does_not_raise(self):
         # Robustez (sem ID): o que já vale hoje; nada lança e a consulta recusada libera a tela.

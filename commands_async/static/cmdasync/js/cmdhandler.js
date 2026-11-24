@@ -139,11 +139,11 @@ cmdasyncform = {
         });
         req.fail(function (xhr, textStatus) {
             self.running = false;
-            // interrupted while this query was in flight: the panel is emptied as in .done, before
-            // the callbacks (one that raises must not skip it). A failure with the follow-up going
-            // on leaves the panel as it is.
-            if (!self.update)
-                self.$output.empty();
+            // Whatever ended the query, the panel is emptied: with the follow-up interrupted (as in .done) or going on, where the
+            // failure belies the running text the last answer left there (the page shows the Copy button by what the panel holds).
+            // It is emptied before the callbacks: one that raises must not skip it, and what a host writes in the panel on
+            // `update-failed` or `update-finish` stays.
+            self.$output.empty();
             try {
                 var reason = self.failure_reason(xhr, textStatus);
                 if (reason)
