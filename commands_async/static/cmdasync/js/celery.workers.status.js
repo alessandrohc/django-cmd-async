@@ -1,3 +1,11 @@
+// Tells an answer with the form the server sends from one without it: an object with `status` and, with a true `status`, the
+// list `workers` (`{"status": true, "workers": [...]}` or `{"status": false, "workers": [], "message": "..."}`). Anything else
+// (no data, as with a 204 or a 304; JSON that is not an object or has no `status`; a true `status` whose `workers` is not a
+// list) would raise reading it, or show an empty notice. A `status` that exists is read as it always was.
+function cmdasyncIsWorkersAnswer(data) {
+    return !!data && data.status !== undefined && (!data.status || Array.isArray(data.workers));
+}
+
 // options.onLogin (optional): what the page does when the answer is the login page, so a session that fell in
 // the middle of the probe takes the user to the login. Every new round carries the same options.
 var workers_check_status = function(options) {
@@ -20,6 +28,13 @@ var workers_check_status = function(options) {
             }
         }
     }).done(function(data) {
+        // An answer without the form the server sends (a 204 or a 304, which jQuery hands success with no data, JSON that is not
+        // an object or has no `status`, or a true `status` with no list of workers) is a query that failed: the notice stays as it
+        // was, and the probe asks again like for any failure (the same branch as .fail). It is checked before the notice is touched.
+        if (!cmdasyncIsWorkersAnswer(data)) {
+            again();
+            return;
+        }
         var $body = $toast.find(".toast-body").empty();
         if (data.status) {
             $toast.find('.online').text(data.workers.length);

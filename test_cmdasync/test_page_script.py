@@ -1117,6 +1117,288 @@ class WellFormedTaskTest(ScenarioTestCase):
         self.assertEqual(len(checked), 8, msg='precondition: two answers, two ways to interrupt and two queries in flight')
 
 
+class SubmitNoTaskTest(ScenarioTestCase):
+    """O envio do formulário respondido com sucesso e sem tarefa (o 204, o 304, um 2xx com JSON cujo corpo não é um objeto, ou cujo `task` falta, não
+    é um objeto ou é um objeto sem `id` em texto não vazio) termina como a falha `server` (AC-9106-1 a -4 e -9, #9106).
+
+    Cada forma de resposta em cada contexto (o envio em voo com o acompanhamento ativo e interrompido pelo Cancel ou pela troca de comando): a lista
+    vem do harness. O ouvinte de host do `form-valid` fica À FRENTE da lista: o `on_form_valid` lança com a resposta sem tarefa e pularia um que
+    entrasse depois dele.
+    """
+
+    def following(self, found, name):
+        """A precondição de cada caso: o envio está em voo e a tela presa, sem consulta de estado e sem erro de script antes da resposta."""
+        before = found['before']
+        self.assertTrue(before['execute']['disabled'], msg='precondition: the screen was not held while the form was in flight. {0}'.format(name))
+        self.assertEqual(before['uncaught'], [], msg='precondition: a script error before the answer. {0}'.format(name))
+        self.assertEqual(before['statusRequests'], 0, msg='precondition: a status query before the answer. {0}'.format(name))
+
+    def sweep(self, check):
+        """Cada forma sem tarefa em cada contexto (a lista vem do harness), com a precondição conferida; `check(nome, cenário)` afirma."""
+        kinds = self.constants['submitNoTaskKinds']
+        contexts = self.constants['submitContexts']
+        self.assertEqual(len(kinds), 25, msg='precondition: the 204, the 304, six bodies that are no object, the 202, two objects with no task and fourteen tasks that are not the one the server sends')
+        for form in ('s204', 's304', 'body_null', 'body_list', 'body_text', 'body_number', 'body_true', 'body_false', 'json202', 'json_empty',
+                     'json_other', 'task_null', 'task_true', 'task_false', 'task_text', 'task_number', 'task_list', 'task_empty', 'task_noid',
+                     'id_null', 'id_empty', 'id_number', 'id_bool', 'id_list', 'id_object'):
+            self.assertIn(form, kinds, msg='precondition: the sweep has the form {0}'.format(form))
+        self.assertEqual(contexts, ['active', 'cancel', 'switch'], msg='precondition: the follow-up active, and interrupted by Cancel and by the command switch')
+        for kind in kinds:
+            for context in contexts:
+                name = 'submitnotask:{0}:{1}'.format(kind, context)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.following(found, name)
+                    check(name, found)
+
+    def test_a_submit_answered_with_no_task_tells_the_server_could_not_answer(self):
+        """AC-9106-1: o envio respondido com sucesso e sem tarefa mostra no aviso o texto de erro de servidor, com o acompanhamento ativo ou interrompido pelo Cancel ou pela troca de comando (um caso por forma e por contexto)."""
+        def check(name, found):
+            self.assertAlertEmpty(found['before'], msg='precondition: no notice before the answer. {0}'.format(name))
+            self.assertEqual(found['after']['uncaught'], [], msg='the success callback of the form raised. {0}'.format(name))
+            self.assertAlertShows(found['after'], self.texts['serverFailureText'], msg=name)
+        self.sweep(check)
+
+    def test_a_submit_answered_with_no_task_tells_the_reason_before_it_releases_the_screen(self):
+        """AC-9106-2: o envio respondido sem tarefa avisa o `update-failed` com o motivo `server` e depois o `update-finish`."""
+        def check(name, found):
+            self.assertEqual(found['after']['uncaught'], [], msg='the success callback of the form raised. {0}'.format(name))
+            self.assertEqual(found['log'], ['failed:server', 'finish'], msg=name)
+        self.sweep(check)
+
+    def test_a_submit_answered_with_no_task_releases_the_screen_without_asking_for_a_status(self):
+        """AC-9106-3: o envio respondido sem tarefa solta a tela (Execute habilitado, Cancel e Revoke desabilitados, sem indicador), sem consultar o estado de uma tarefa e sem lançar erro de script."""
+        def check(name, found):
+            after, later = found['after'], found['later']
+            self.assertEqual(after['uncaught'], [], msg='the success callback of the form raised. {0}'.format(name))
+            self.assertAtRest(after, msg=name)
+            # nenhuma consulta de estado: nem agora nem agendada (o timer vivo dispararia a consulta, e uma consulta a `status/undefined` e afins)
+            self.assertEqual(after['statusRequests'], 0, msg='a status query went out. {0}'.format(name))
+            self.assertEqual(after['liveTimers'], 0, msg='a status query stayed scheduled. {0}'.format(name))
+            self.assertEqual(found['statusUrls'], [], msg='a status query went out. {0}'.format(name))
+            self.assertEqual(later['statusRequests'], 0, msg='a status query went out in the 5 s after the answer. {0}'.format(name))
+            self.assertEqual(later['uncaught'], [], msg='a script error in the 5 s after the answer. {0}'.format(name))
+        self.sweep(check)
+
+    def test_a_template_without_the_alert_space_nor_the_texts_releases_the_screen_silently(self):
+        """AC-9106-3: o envio respondido sem tarefa, com um template sem o espaço do aviso nem o texto de erro de servidor, solta a tela sem lançar erro de script e sem consultar o estado."""
+        for kind in ('s204', 'task_noid'):
+            name = 'submitnotask:{0}:nospace'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertIsNone(found['before']['alert'], msg='precondition: the page has no alert space')
+                self.assertTrue(found['before']['execute']['disabled'], msg='precondition: the screen was held')
+                after = found['after']
+                self.assertEqual(after['uncaught'], [], msg='the success callback of the form raised. {0}'.format(name))
+                self.assertAtRest(after, msg=name)
+                self.assertEqual(after['statusRequests'], 0, msg='a status query went out. {0}'.format(name))
+                self.assertEqual(found['later']['statusRequests'], 0, msg='a status query went out in the 5 s after the answer. {0}'.format(name))
+                self.assertEqual(found['later']['uncaught'], [], msg=name)
+
+    def test_a_submit_answered_with_no_task_does_not_notify_form_valid(self):
+        """AC-9106-4: o envio respondido sem tarefa não avisa os ouvintes do `form-valid` do handler (o ouvinte de host entra à frente da lista)."""
+        # a pré-condição positiva: o mesmo ouvinte, à frente da lista, é avisado quando o servidor manda a tarefa
+        self.assertEqual(sorted(self.constants['submitTaskKinds']), ['extra', 'nocommand', 'ok', 'other_id'],
+                         msg='precondition: the forms that are the task')
+        for kind in self.constants['submitTaskKinds']:
+            with self.subTest(precondition=kind):
+                self.assertEqual(self.scenario('submittask:{0}'.format(kind))['formValidCalls'], 1,
+                                 msg='precondition: the host listener, first in the list, was not notified of a task')
+
+        def check(name, found):
+            self.assertEqual(found['formValidCalls'], 0, msg='a form-valid listener was notified of an answer with no task. {0}'.format(name))
+        self.sweep(check)
+
+    def test_a_submit_answered_with_no_task_leaves_no_mark_of_an_earlier_refusal(self):
+        """AC-9106-9: o envio respondido sem tarefa não deixa ao lado dos campos a mensagem nem a marca de erro de uma recusa (400) anterior, nas duas variantes dos argumentos e no campo do comando."""
+        no_message = {'app_command': [], 'args': [], 'kwargs': []}
+        not_marked = {'app_command': False, 'args': False, 'kwargs': False}
+        kinds = self.constants['submitNoTaskKinds']
+        contexts = self.constants['submitContexts']
+        self.assertEqual((len(kinds), len(contexts)), (25, 3), msg='precondition: the same forms and contexts as the sweep')
+        checked = []
+        for kind in kinds:
+            for context in contexts:
+                name = 'marks:{0}:{1}'.format(kind, context)
+                checked.append(name)  # antes dos asserts: a conta dos casos não pode depender de eles passarem
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    marked, before, after = found['marked'], found['before'], found['after']
+                    # a precondição: o 400 marcou e escreveu a mensagem ao lado de cada campo, nas duas variantes, e o envio seguinte em voo as mantém
+                    for state, when in ((marked, 'after the 400'), (before, 'while the next submit was in flight')):
+                        for field in ('app_command', 'args', 'kwargs'):
+                            self.assertTrue(state['invalidFields'][field], msg='precondition: the field {0} is not marked {1}. {2}'.format(field, when, name))
+                            self.assertTrue(state['fieldErrors'][field], msg='precondition: the field {0} has no message {1}. {2}'.format(field, when, name))
+                        self.assertEqual(state['invalidFieldsNarrow'], {'args': True, 'kwargs': True},
+                                         msg='precondition: the narrow variant is not marked {0}. {1}'.format(when, name))
+                        self.assertTrue(all(state['fieldErrorsNarrow'][field] for field in ('args', 'kwargs')),
+                                        msg='precondition: the narrow variant has no message {0}. {1}'.format(when, name))
+                    self.assertTrue(before['execute']['disabled'], msg='precondition: the second submit was in flight. {0}'.format(name))
+                    self.assertEqual(after['fieldErrors'], no_message, msg='a message of the earlier 400 was left next to a field. {0}'.format(name))
+                    self.assertEqual(after['invalidFields'], not_marked, msg='a field stayed marked by the earlier 400. {0}'.format(name))
+                    self.assertEqual(after['fieldErrorsNarrow'], {'args': [], 'kwargs': []},
+                                     msg='a message of the earlier 400 was left next to a narrow field. {0}'.format(name))
+                    self.assertEqual(after['invalidFieldsNarrow'], {'args': False, 'kwargs': False},
+                                     msg='a narrow field stayed marked by the earlier 400. {0}'.format(name))
+        self.assertEqual(len(checked), 75, msg='precondition: twenty-five forms in three contexts')
+
+
+class SubmitTaskTest(ScenarioTestCase):
+    """O envio respondido com a tarefa (um objeto com `id` em texto não vazio, com ou sem `command` e outros campos) continua sendo a tarefa (AC-9106-7 e -8, #9106).
+
+    São `SHALL CONTINUE TO` (controles): passam no código de antes do #9106 e a mutação prova que discriminam: a conferência que também exige `ready` ou
+    `command` recusa as formas mínimas, a conferência invertida trata a tarefa como a falha e a consulta com o `id` de outra tarefa falha no `other_id`.
+    """
+
+    # a precondição é a do envio sem tarefa: o envio em voo e a tela presa antes da resposta
+    following = SubmitNoTaskTest.following
+
+    def kinds(self):
+        kinds = self.constants['submitTaskKinds']
+        self.assertEqual(sorted(kinds), ['extra', 'nocommand', 'ok', 'other_id'],
+                         msg='precondition: the task as the server sends it, with no command, with more fields and with the id of another task')
+        return kinds
+
+    def test_a_submit_answered_with_a_task_notifies_form_valid_and_follows_the_task(self):
+        """AC-9106-7 (controle): com o acompanhamento ativo, o envio respondido com a tarefa avisa os ouvintes do `form-valid`, e a tarefa é acompanhada (sem o aviso de erro de servidor e sem avisar `update-failed`)."""
+        for kind in self.kinds():
+            name = 'submittask:{0}'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.following(found, name)
+                self.assertEqual(found['formValidCalls'], 1, msg='the form-valid listener was not notified of the task. {0}'.format(name))
+                self.assertEqual(found['after']['uncaught'], [], msg=name)
+                self.assertAlertEmpty(found['after'], msg='the server notice was shown for a task. {0}'.format(name))
+                self.assertEqual(found['log'], [], msg='an answer with a task notified an event of the end. {0}'.format(name))
+                # a tarefa foi acompanhada: a tela segue presa e o painel mostra o texto de execução depois da 1ª resposta «não pronta»
+                after = found['afterNotReady']
+                self.assertEqual(after['uncaught'], [], msg=name)
+                self.assertTrue(after['execute']['disabled'], msg='the screen was released for a task that is not ready. {0}'.format(name))
+                self.assertEqual(after['output'], self.texts['runningText'], msg='the task was not followed. {0}'.format(name))
+                self.assertAlertEmpty(after, msg=name)
+
+    def test_the_first_status_query_asks_for_the_id_the_submit_answer_carried(self):
+        """AC-9106-8 (controle): com o acompanhamento ativo, o envio respondido com a tarefa faz a 1ª consulta de estado pelo endereço `status/` seguido do `id` que a resposta trouxe."""
+        for kind in self.kinds():
+            name = 'submittask:{0}'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.following(found, name)
+                task_id = 'other-9' if kind == 'other_id' else 't1'
+                self.assertEqual(found['statusUrls'], ['status/{0}'.format(task_id)],
+                                 msg='the first query did not ask for the id the answer carried. {0}'.format(name))
+                self.assertEqual(found['after']['pendingStatus'], 1, msg='precondition: the first query is in flight. {0}'.format(name))
+
+
+class RevocationNoBodyTest(ScenarioTestCase):
+    """O pedido de revogação respondido com sucesso e sem um objeto JSON com o campo `status` (o 204, o 304, o JSON que não é um objeto, o objeto sem `status`) é o que falhou (AC-9106-5, #9106)."""
+
+    def test_a_revocation_answered_without_a_status_failed(self):
+        """AC-9106-5: a revogação respondida com sucesso e sem um objeto JSON com `status` é o pedido que falhou: mostra o aviso da falha e deixa o botão Revoke como a falha manda, avisa uma vez o `revoke-failed` e não lança erro de script (um caso por forma e por fase)."""
+        kinds = self.constants['revokeNoBodyKinds']
+        self.assertEqual(len(kinds), 10, msg='precondition: the 204, the 304, six bodies that are no object and two objects with no status')
+        for form in ('s204', 's304', 'body_null', 'body_list', 'body_text', 'body_number', 'body_true', 'body_false', 'json_empty', 'json_other'):
+            self.assertIn(form, kinds, msg='precondition: the sweep has the form {0}'.format(form))
+        for kind in kinds:
+            for phase in ('tracking', 'late'):
+                name = 'revokenobody:{0}:{1}'.format(kind, phase)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    # a precondição: o pedido saiu e o botão espera o servidor (desabilitado, com o indicador)
+                    self.assertTrue(found['clicked']['revoke']['disabled'], msg='precondition: the revoke button was not waiting. {0}'.format(name))
+                    self.assertTrue(found['clicked']['revoke']['progressVisible'], msg='precondition: no progress indicator. {0}'.format(name))
+                    self.assertAlertEmpty(found['clicked'], msg='precondition: a notice before the answer. {0}'.format(name))
+                    after = found['after']
+                    self.assertEqual(after['uncaught'], [], msg='the revocation callback raised. {0}'.format(name))
+                    self.assertAlertShows(after, self.texts['revokeFailedText'], msg=name)
+                    self.assertEqual(after['browserAlerts'], [], msg='a browser alert() window was used. {0}'.format(name))
+                    self.assertEqual(found['failed'], [None], msg='revoke-failed was not notified once, with no text. {0}'.format(name))
+                    if phase == 'tracking':
+                        self.assertTrue(after['execute']['disabled'], msg='precondition: the screen is still tracking. {0}'.format(name))
+                        self.assertFalse(after['revoke']['disabled'], msg='the revoke button stayed disabled. {0}'.format(name))
+                        self.assertFalse(after['revoke']['progressVisible'], msg='the revoke button kept its progress indicator. {0}'.format(name))
+                    else:
+                        self.assertAtRest(found['released'], msg='precondition: the screen was released before the answer arrived. {0}'.format(name))
+                        self.assertTrue(after['revoke']['disabled'], msg='a late failure re-enabled revoke on a released screen. {0}'.format(name))
+                        self.assertFalse(after['revoke']['progressVisible'], msg=name)
+
+
+class WorkersNoShapeTest(ScenarioTestCase):
+    """A consulta de workers respondida com sucesso e sem a forma que o servidor manda (o 204, o 304, o JSON que não é um objeto, o objeto sem `status`, o `status` verdadeiro sem a lista `workers`) é a consulta que falhou: refaz aos 5 s e deixa o aviso como estava (AC-9106-6 e -10, #9106)."""
+
+    def kinds(self):
+        kinds = self.constants['workersNoShapeKinds']
+        self.assertEqual(len(kinds), 16, msg='precondition: the 204, the 304, six bodies that are no object, two objects with no status and six answers with a status and no list')
+        for form in ('s204', 's304', 'body_null', 'body_list', 'body_text', 'body_number', 'body_true', 'body_false', 'json_empty', 'json_other',
+                     'true_noworkers', 'true_workers_null', 'true_workers_text', 'true_workers_number', 'true_workers_bool', 'true_workers_object'):
+            self.assertIn(form, kinds, msg='precondition: the sweep has the form {0}'.format(form))
+        return kinds
+
+    def test_an_answer_without_the_form_makes_the_probe_ask_again_after_5_seconds(self):
+        """AC-9106-6: a consulta de workers respondida com sucesso e sem a forma que o servidor manda refaz a consulta 5 segundos depois (e não antes), sem lançar erro de script (um caso por forma)."""
+        for kind in self.kinds():
+            name = 'workersnoshape:{0}'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertEqual(found['asked']['pendingWorkers'], 1, msg='precondition: the query is in flight. {0}'.format(name))
+                self.assertEqual(found['asked']['workersRequests'], 1, msg='precondition: one query so far. {0}'.format(name))
+                self.assertEqual(found['afterAnswer']['uncaught'], [], msg='the probe raised on the answer. {0}'.format(name))
+                self.assertEqual(found['at4999']['workersRequests'], 1, msg='the query was asked again before 5 seconds. {0}'.format(name))
+                self.assertEqual(found['at5000']['workersRequests'], 2, msg='the query was not asked again after 5 seconds. {0}'.format(name))
+                self.assertEqual(found['at5000']['uncaught'], [], msg='a script error when the query was asked again. {0}'.format(name))
+
+    def test_the_probe_asked_again_after_an_answer_without_the_form_keeps_the_options_of_the_page(self):
+        """AC-9106-6: a sonda aberta pela página, que recebe uma resposta sem a forma que o servidor manda, refaz a consulta 5 segundos depois com as opções da página: a sessão que cai depois dela leva ao login (um caso por forma)."""
+        for kind in self.kinds():
+            name = 'workerspage:{0}'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertEqual(found['afterAnswer']['uncaught'], [], msg='the probe raised on the answer. {0}'.format(name))
+                self.assertEqual(found['afterAnswer']['workersRequests'], 1, msg='precondition: one query so far. {0}'.format(name))
+                self.assertEqual(found['asked']['workersRequests'], 2, msg='precondition: the query was asked again after 5 seconds. {0}'.format(name))
+                self.assertEqual(found['afterLogin']['uncaught'], [], msg=name)
+                self.assertEqual(found['afterLogin']['locations'], [self.login_target],
+                                 msg='the login page after the query asked again did not take the user to the login: the page lost its options. {0}'.format(name))
+                self.assertEqual(found['later']['workersRequests'], 2, msg='a query went out after the login page. {0}'.format(name))
+
+    def test_the_forms_the_server_sends_still_behave_as_before(self):
+        """AC-9106-6 (controle): a lista de workers mostra os nomes e não refaz a consulta, a lista vazia mostra 0 e não refaz, e o `status` falso com `message` mostra a mensagem e refaz aos 5 s."""
+        self.assertEqual(sorted(self.constants['workersControlKinds']), ['emptylist', 'listed', 'nobody'],
+                         msg='precondition: the forms the server sends')
+        listed = self.scenario('workersnoshape:control:listed')
+        self.assertEqual(listed['afterAnswer']['uncaught'], [])
+        self.assertEqual(listed['afterAnswer']['toast'], {'body': ['w1', 'w2'], 'badge': '2', 'shown': 1})
+        self.assertEqual(listed['at5000']['workersRequests'], 1, msg='the list asked again')
+        empty = self.scenario('workersnoshape:control:emptylist')
+        self.assertEqual(empty['afterAnswer']['uncaught'], [])
+        self.assertEqual(empty['afterAnswer']['toast'], {'body': [], 'badge': '0', 'shown': 1})
+        self.assertEqual(empty['at5000']['workersRequests'], 1, msg='the empty list asked again')
+        nobody = self.scenario('workersnoshape:control:nobody')
+        self.assertEqual(nobody['afterAnswer']['uncaught'], [])
+        self.assertEqual(nobody['afterAnswer']['toast'], {'body': ['no worker'], 'badge': '', 'shown': 1})
+        self.assertEqual(nobody['at4999']['workersRequests'], 1, msg='the query was asked again before 5 seconds')
+        self.assertEqual(nobody['at5000']['workersRequests'], 2, msg='the answer with a false status did not ask again after 5 seconds')
+
+    def test_an_answer_without_the_form_leaves_the_notice_as_it_was(self):
+        """AC-9106-10: a consulta de workers respondida com sucesso e sem a forma que o servidor manda deixa o aviso como estava, fechado ou aberto, com o texto e o contador que tinha (um caso por forma)."""
+        closed = {'body': [], 'badge': '', 'shown': 0}
+        opened = {'body': ['celery@w1', '<b>w2</b>'], 'badge': '2', 'shown': 1}
+        for kind in self.kinds():
+            name = 'workersnoshape:{0}'.format(kind)
+            with self.subTest(scenario=name, notice='closed'):
+                found = self.scenario(name)
+                self.assertEqual(found['asked']['toast'], closed, msg='precondition: the notice was closed. {0}'.format(name))
+                self.assertEqual(found['afterAnswer']['toast'], closed, msg='the answer opened or changed the notice. {0}'.format(name))
+            name = 'workerskeep:{0}'.format(kind)
+            with self.subTest(scenario=name, notice='open'):
+                found = self.scenario(name)
+                self.assertEqual(found['opened']['toast'], opened, msg='precondition: the notice shows the names of the workers and their count. {0}'.format(name))
+                self.assertEqual(found['asked']['toast'], opened, msg='precondition: asking again does not touch the notice. {0}'.format(name))
+                self.assertEqual(found['asked']['pendingWorkers'], 1, msg='precondition: the second query is in flight. {0}'.format(name))
+                self.assertEqual(found['afterAnswer']['toast'], opened, msg='the answer changed the open notice. {0}'.format(name))
+                self.assertEqual(found['at5000']['toast'], opened, msg='the query asked again changed the open notice. {0}'.format(name))
+
+
 class RevokeWindowTest(ScenarioTestCase):
     """O Revoke entre o envio do formulário e a resposta do servidor (AC-8955-3, -4 e -5)."""
 
@@ -1822,6 +2104,15 @@ class DoubleAssumptionsTest(TestCase):
         source = JQUERY_FORM.read_text(encoding='utf-8')
         self.assertRegex(source, r't\.error=function\(e,r,a\)\{var n=t\.context\|\|this;w\.apply\(n,\[e,r,a,p\]\)\}',
                          msg='the jquery.form no longer hands the jqXHR of the $.ajax to the error of the page')
+
+    def test_jquery_form_hands_the_data_the_status_and_the_jqxhr_to_the_success_of_the_page(self):
+        # Robustez (sem ID): o dublê (`world.formAnswer`, #9106) chama o `success` do ajaxForm com `(data, textStatus, jqXHR, $form)`, que é o que o
+        # jquery.form repassa de um sucesso do $.ajax (`t.success=function(e,r,a){…T[i].apply(n,[e,r,a||p,p])}`: o 3º argumento é o jqXHR, e o 4º o
+        # formulário). O `data` indefinido do 204 e do 304 chega assim, e o `query_failed(xhr, statusText)` do envio sem tarefa recebe um jqXHR. O formulário
+        # não tem campo de arquivo, então o caminho de iframe (que monta um `xhr` próprio) não é usado.
+        source = JQUERY_FORM.read_text(encoding='utf-8')
+        self.assertRegex(source, r't\.success=function\(e,r,a\)\{for\(var n=t\.context\|\|this,i=0,o=T\.length;i<o;i\+\+\)T\[i\]\.apply\(n,\[e,r,a\|\|p,p\]\)\}',
+                         msg='the jquery.form no longer hands (data, textStatus, jqXHR, form) to the success of the page')
 
     def test_the_double_publishes_the_failure_texts_the_template_publishes(self):
         """AC-8961-7: as frases que o painel da página publica são as mesmas que o dublê de node usa nos cenários de falha."""

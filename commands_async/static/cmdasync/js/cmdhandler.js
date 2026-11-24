@@ -27,6 +27,19 @@ function cmdasyncIsTask(task) {
         && typeof task.id === 'string' && task.id !== '' && typeof task.ready === 'boolean';
 }
 
+/**
+ * Tells the `task` of a submit answer that can be followed from one that cannot.
+ *
+ * What follows the answer reads one field of its task: `id` builds the first query (`status/<id>`). The server sends
+ * `{"task": {"id": <text>, "command": {...}}}` and no `ready` (the submit does not wait for the task: that is why this is
+ * not `cmdasyncIsTask`), so a `task` with no text `id` is not its task: it would ask for `status/undefined`, `status/null` or
+ * `status/5`, or raise (a null `task`). The first clause keeps a null `task` from raising here; a boolean, a text, a number
+ * or a list has no text `id`, so the `id` clause already refuses them.
+ */
+function cmdasyncHasTaskId(task) {
+    return !!task && typeof task.id === 'string' && task.id !== '';
+}
+
 cmdasyncform = {
     // How long (ms) a status query, and the workers probe, waits for an answer before it is cut and told as a network
     // failure ('network'); 0 turns the cut off, as in jQuery. The default lives here and not in init(): a host that
@@ -77,8 +90,9 @@ cmdasyncform = {
             'form-valid': [],
             'update-finish': [],
             'updating': [],
-            // the status query failed, or came back with no task; the argument says why ('login', 'forbidden', 'not-found',
-            // 'server' or 'network', see failure_reason)
+            // the status query failed, or came back with no task; or the submit came back with no task (then no `form-valid`
+            // came before it and `task` is null); the argument says why ('login', 'forbidden', 'not-found', 'server' or
+            // 'network', see failure_reason)
             'update-failed': [],
             // the revocation request failed; the argument is the text the server sent, or null
             'revoke-failed': []
@@ -166,8 +180,9 @@ cmdasyncform = {
             self.query_failed(xhr, textStatus);
         });
     },
-    // The status query ended with no answer that can be followed: it failed, or it came back with no task (see .done). The
-    // screen is released through `update-failed` (the reason) and `update-finish`, and no new query is scheduled.
+    // The status query ended with no answer that can be followed: it failed, or it came back with no task (see .done), or the
+    // submit came back with no task (see ajax()). The screen is released through `update-failed` (the reason) and
+    // `update-finish`, and no new query is scheduled.
     query_failed: function (xhr, textStatus) {
         this.running = false;
         // Whatever ended the query, the panel is emptied: with the follow-up interrupted (as in .done) or going on, where the
@@ -197,7 +212,7 @@ cmdasyncform = {
             return 'network';
         // any other failure: an HTTP error (400, 401, 405, 429, a 5xx, an HTML error page), a 2xx with a body that is not JSON,
         // or a response that carries no task (a 204 or a 304, or JSON whose `task` is missing, is not an object, or has no text
-        // `id` or no boolean `ready`: see .done).
+        // `id` or no boolean `ready`: see .done), or a submit that came back with no task (see ajax()).
         // The user needs the same thing for all of them, so the reason is not told by status
         return 'server';
     },
@@ -221,8 +236,11 @@ cmdasyncform = {
                 }
             },
             success: function(data) {
-                if (!data.status)
-                    self.exc_event_callbacks('revoke-failed', data.error || null);
+                // A 204, a 304 or a null JSON body has no object to read `status` from (jQuery hands success no data for the
+                // first two): the request failed, as it does with a body that has no true `status`. The text the server sent
+                // in `error` goes with the failure when there is one.
+                if (!data || !data.status)
+                    self.exc_event_callbacks('revoke-failed', (data && data.error) || null);
             },
             // HTTP error, or a 200 that is not JSON (parsererror, because of dataType)
             error: function() {
@@ -301,7 +319,16 @@ cmdasyncform = {
             return proceed;
         };
 
+        // `form-valid` means "the server accepted a task": a 204, a 304 or JSON with no task that can be followed is a failed
+        // submit, told as the status query tells its own (query_failed: `update-failed` with the reason `server`, and
+        // `update-finish`), and `form-valid` is not notified for it, to on_form_valid (which reads data.task) nor to the page or
+        // a host. The check is here, in front of the listeners: put inside on_form_valid it would leave the host listeners
+        // running with an answer that has no task.
         options.success = function(responseText, statusText, xhr, $form) {
+            if (!cmdasyncHasTaskId(responseText && responseText.task)) {
+                self.query_failed(xhr, statusText);
+                return;
+            }
             self.exc_event_callbacks('form-valid', responseText, statusText, xhr, $form);
         };
         this.$form = $(elem).ajaxForm(options);

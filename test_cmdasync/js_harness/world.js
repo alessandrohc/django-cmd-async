@@ -439,6 +439,9 @@ function createWorld(options) {
         return new JQ([]);
     }
 
+    // Só percorre lista: um texto, um número, um booleano ou um objeto lançam (`forEach` indefinido). No jQuery real um texto, um número e um
+    // booleano também lançam (`isArrayLike` faz `"length" in e`), mas um OBJETO é percorrido por `for…in`: o `workers` objeto da sonda (#9106) é
+    // vermelho aqui pelo dublê, e o que o prova no verde é o guarda da sonda, que o recusa antes de chegar ao `$.each`.
     $.each = function (list, fn) {
         list.forEach(function (item, index) { fn(index, item); });
         return list;
@@ -666,6 +669,21 @@ function createWorld(options) {
     world.formValid = function (taskId) {
         runGuarded('form success', world.ajaxForm.success,
             [{task: {id: taskId, command: {name: 'cmdasync_echo'}}}, 'success', {status: 200}, $('form#taskform')], null);
+    };
+    // #9106: o servidor responde o envio com `response` (`{status, body}`, a forma das respostas dos outros pontos). O `success` do `ajaxForm`
+    // recebe o que o jQuery entregaria a um SUCESSO com `dataType: 'json'` (o `ajax()` do handler o fixa): `(data, textStatus, xhr, $form)`,
+    // o `data` indefinido no 204 e no 304 (a regra de `outcome`, acima) e o corpo já convertido num JSON que o é. Uma resposta que o jQuery mandaria
+    // ao `error` (um 4xx, um corpo que não é JSON) não passa por aqui: o harness acusa, em vez de fingir um sucesso.
+    world.formAnswer = function (response) {
+        const result = outcome({dataType: 'json'}, response);
+        if (!result.ok) throw new Error('harness: jQuery would not call success for this answer: ' + JSON.stringify(response));
+        runGuarded('form success', world.ajaxForm.success, [result.data, result.textStatus, result.xhr, $('form#taskform')], null);
+    };
+    // #9106: um ouvinte de host do `form-valid` entra À FRENTE da lista (`events` é pública, `cmdhandler.js` `init`): roda antes do
+    // `on_form_valid`, que lança com uma resposta sem tarefa e pularia um ouvinte registrado depois dele (o `exc_event_callbacks` não tem
+    // `try/catch`). É o que mostra se o `form-valid` foi avisado.
+    world.hostFormValidFirst = function (fn) {
+        world.cmdasyncform.events['form-valid'].unshift(fn);
     };
     world.execute = function (taskId) {
         if (world.executeStart()) world.formValid(taskId || 't1');

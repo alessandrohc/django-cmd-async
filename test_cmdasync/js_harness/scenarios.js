@@ -409,6 +409,129 @@ function abortFirstInFlight(trigger, answer) {
     return result;
 }
 
+// ---------------------------------------------------------------- #9106: o envio e a revogação respondidos com sucesso e sem o campo que leem
+// O envio respondido com SUCESSO e sem tarefa (AC-9106-1 a -4 e -9): o 204 e o 304 (o jQuery os entrega ao sucesso sem `data`), um 2xx com JSON
+// cujo corpo não é um objeto (nulo, lista, texto, número, verdadeiro, falso), o 202 e o 200 com um objeto cujo `task` falta, não é um objeto ou
+// é um objeto sem `id` em texto não vazio. O corpo que não é objeto vai como TEXTO JSON, que `world.formAnswer` converte como o jQuery (`dataType:
+// 'json'`): `'null'` vira `null`, `'"abc"'` vira o texto `abc`. A lista é tirada daqui pelo teste: uma forma nova entra sozinha.
+const SUBMIT_NOTASK = {
+    s204: {status: 204},
+    s304: {status: 304},
+    body_null: {status: 200, body: 'null'},
+    body_list: {status: 200, body: '[]'},
+    body_text: {status: 200, body: '"abc"'},
+    body_number: {status: 200, body: '5'},
+    body_true: {status: 200, body: 'true'},
+    body_false: {status: 200, body: 'false'},
+    json202: {status: 202, body: {}},
+    json_empty: {status: 200, body: {}},
+    json_other: {status: 200, body: {status: 'ok'}},
+    task_null: {status: 200, body: {task: null}},
+    task_true: {status: 200, body: {task: true}},
+    task_false: {status: 200, body: {task: false}},
+    task_text: {status: 200, body: {task: 'abc'}},
+    task_number: {status: 200, body: {task: 5}},
+    task_list: {status: 200, body: {task: []}},
+    task_empty: {status: 200, body: {task: {}}},
+    task_noid: {status: 200, body: {task: {command: {name: 'x'}}}},
+    id_null: {status: 200, body: {task: {id: null}}},
+    id_empty: {status: 200, body: {task: {id: ''}}},
+    id_number: {status: 200, body: {task: {id: 5}}},
+    id_bool: {status: 200, body: {task: {id: true}}},
+    id_list: {status: 200, body: {task: {id: ['t1']}}},
+    id_object: {status: 200, body: {task: {id: {}}}},
+};
+// A resposta que É a tarefa (AC-9106-7 e -8): o que o servidor manda (`views.py:346-351`, o `id` e o `command`) e as formas que a conferência
+// tem de continuar aceitando (sem `command`, com campos a mais). `other_id` traz o `id` de OUTRA tarefa, para provar que a 1ª consulta usa o
+// `id` que a resposta trouxe.
+const SUBMIT_TASK = {
+    ok: {status: 200, body: {task: {id: 't1', command: {name: 'cmdasync_echo'}}}},
+    nocommand: {status: 200, body: {task: {id: 't1'}}},
+    extra: {status: 200, body: {task: {id: 't1', command: {name: 'cmdasync_echo'}, ready: false, foo: 1}}},
+    other_id: {status: 200, body: {task: {id: 'other-9', command: {name: 'cmdasync_echo'}}}},
+};
+// Onde a resposta chega: com o acompanhamento ativo e interrompido, com o envio em voo, pelo Cancel ou pela troca de comando (AC-8955-1).
+const SUBMIT_CONTEXTS = ['active', 'cancel', 'switch'];
+
+// O envio em voo (`before`: depois do clique que interrompe, nos contextos interrompidos), a resposta (`after`) e 5 s depois (`later`).
+// `log` é a ordem dos eventos `update-failed` e `update-finish` que um ouvinte de host registrou, e `formValidCalls` quantas vezes um ouvinte de
+// host do `form-valid`, registrado À FRENTE da lista (o `on_form_valid` lança com uma resposta sem tarefa e pularia um registrado depois),
+// foi avisado. `statusUrls` são os endereços das consultas de estado que saíram. `options.world` são as opções do mundo (o template sem o
+// espaço do aviso nem os textos) e `options.priorRefusal` põe antes um 400 com os erros do formulário: as marcas e as mensagens ao lado dos
+// campos (`marked`), que a resposta seguinte tem de não deixar (AC-9106-9).
+// Nas formas de SUBMIT_TASK o roteiro segue: a 1ª consulta de estado recebe «não pronta» (`afterNotReady`), e não há `later`.
+function submitAnswer(kind, context, options) {
+    options = options || {};
+    const answer = SUBMIT_NOTASK[kind] || SUBMIT_TASK[kind];
+    if (!answer) throw new Error('harness: unknown submit answer ' + kind);
+    const world = createWorld(Object.assign({commandsList: context === 'switch'}, options.world));
+    const log = [];
+    const formValid = [];
+    world.cmdasyncform.add_event_callback('update-failed', function (reason) { log.push('failed:' + reason); });
+    world.cmdasyncform.add_event_callback('update-finish', function () { log.push('finish'); });
+    world.hostFormValidFirst(function () { formValid.push('notified'); });
+    const result = {};
+    if (options.priorRefusal) {
+        world.executeStart();
+        world.formError(FORM_FAILURES.http400);
+        result.marked = world.state();
+    }
+    world.executeStart(); // o envio está em voo
+    if (context !== 'active') clickTrigger(world, context);
+    result.before = world.state();
+    world.formAnswer(answer);
+    result.after = world.state();
+    result.formValidCalls = formValid.length;
+    result.statusUrls = world.statusRequests().map(function (request) { return request.url; });
+    result.log = log;
+    if (SUBMIT_TASK[kind]) {
+        world.answerStatus({status: 200, body: {task: {id: answer.body.task.id, ready: false}}});
+        result.afterNotReady = world.state();
+        return result;
+    }
+    world.advance(5000);
+    result.later = world.state();
+    return result;
+}
+
+// AC-9106-5: o pedido de revogação respondido com sucesso e sem um objeto JSON com o campo `status`. As três primeiras formas LANÇAM hoje
+// (`data` indefinido no 204 e no 304, `null` no JSON nulo); as outras já falham como o AC-8866-1 manda (`!undefined`) e são controles que travam
+// o que um guarda só com `!data` estragaria. `revoke-failed` é o evento que o handler avisa; `phase`: 'tracking' (o acompanhamento ativo) ou 'late'
+// (a tela já liberada quando a resposta chega).
+const REVOKE_NOBODY = {
+    s204: {status: 204},
+    s304: {status: 304},
+    body_null: {status: 200, body: 'null'},
+    body_list: {status: 200, body: '[]'},
+    body_text: {status: 200, body: '"abc"'},
+    body_number: {status: 200, body: '5'},
+    body_true: {status: 200, body: 'true'},
+    body_false: {status: 200, body: 'false'},
+    json_empty: {status: 200, body: {}},
+    json_other: {status: 200, body: {foo: 1}},
+};
+
+function revokeNobody(kind, phase) {
+    const world = createWorld();
+    const failed = [];
+    world.cmdasyncform.add_event_callback('revoke-failed', function (error) { failed.push(error); });
+    const result = {};
+    trackWaits(world, 1);
+    result.before = world.state();
+    world.click('#btn-task-revoke');
+    result.clicked = world.state(); // o botão Revoke desabilitado, com o indicador, à espera do servidor
+    if (phase === 'late') {
+        // a tela é liberada (a tarefa terminou) antes de a resposta da revogação chegar
+        world.advance(1000);
+        world.answerStatus(ready('done'));
+        result.released = world.state();
+    }
+    world.answerRevoke(REVOKE_NOBODY[kind]);
+    result.after = world.state();
+    result.failed = failed;
+    return result;
+}
+
 // ---------------------------------------------------------------- #8968: o host que chama o ajax() mais de uma vez
 const TASK_FORM = 'form#taskform';
 
@@ -759,6 +882,86 @@ function workersResult(kind) {
     const world = createWorld({workers: 'page'});
     world.answerWorkers(kind === 'listed' ? WORKERS_LISTED : WORKERS_NOBODY);
     const result = {afterAnswer: world.state()};
+    world.advance(30000);
+    result.later = world.state();
+    return result;
+}
+
+// #9106 (AC-9106-6 e -10): a consulta de workers respondida com sucesso e sem a forma que o servidor manda. O 204, o 304 e o JSON `null` lançam em
+// `data.status`; um objeto com `status` verdadeiro e `workers` que não é lista (ausente, nulo, texto, número, booleano, objeto) lança em `.length`
+// ou no `$.each` (o `true_workers_object` lança só no dublê, `world.js`: o `$.each` do jQuery real percorre um objeto, e o que o prova no verde é o
+// guarda, que o recusa); o JSON que não é objeto (lista, texto, número, verdadeiro, falso) e o objeto sem `status` não lançam e abrem o aviso com um
+// corpo vazio. A lista é tirada daqui pelo teste.
+const WORKERS_NOSHAPE = {
+    s204: {status: 204},
+    s304: {status: 304},
+    body_null: {status: 200, body: 'null'},
+    body_list: {status: 200, body: '[]'},
+    body_text: {status: 200, body: '"abc"'},
+    body_number: {status: 200, body: '5'},
+    body_true: {status: 200, body: 'true'},
+    body_false: {status: 200, body: 'false'},
+    json_empty: {status: 200, body: {}},
+    json_other: {status: 200, body: {foo: 1}},
+    true_noworkers: {status: 200, body: {status: true}},
+    true_workers_null: {status: 200, body: {status: true, workers: null}},
+    true_workers_text: {status: 200, body: {status: true, workers: 'abc'}},
+    true_workers_number: {status: 200, body: {status: true, workers: 5}},
+    true_workers_bool: {status: 200, body: {status: true, workers: true}},
+    true_workers_object: {status: 200, body: {status: true, workers: {}}},
+};
+// Os controles: as formas que o servidor manda, que seguem como eram (a lista mostra os nomes e não refaz; a lista vazia é lista: mostra 0 e não
+// refaz; `status` falso com `message` mostra a mensagem e refaz em 5 s).
+const WORKERS_CONTROLS = {
+    listed: jsonResponse(200, {status: true, workers: ['w1', 'w2']}),
+    emptylist: jsonResponse(200, {status: true, workers: []}),
+    nobody: jsonResponse(200, {status: false, workers: [], message: 'no worker'}),
+};
+
+// A consulta chamada à mão (o setting desligado: a página não a abre) e respondida; o aviso estava FECHADO. `afterAnswer` é a tela logo depois e
+// `at4999` e `at5000` as de 4999 ms e de 5000 ms depois (a consulta refeita aos 5 s, e não antes).
+function workersNoShape(kind) {
+    const world = createWorld({workers: 'manual'});
+    world.workersCheck();
+    const result = {asked: world.state()};
+    world.answerWorkers(WORKERS_NOSHAPE[kind] || WORKERS_CONTROLS[kind]);
+    result.afterAnswer = world.state();
+    world.advance(4999);
+    result.at4999 = world.state();
+    world.advance(1);
+    result.at5000 = world.state();
+    return result;
+}
+
+// O aviso ABERTO (uma 1ª resposta com os dois nomes: o corpo com os nomes, o contador em 2) e o host chama a consulta de novo, à mão; a resposta
+// sem a forma chega: o aviso fica como estava (o corpo, o contador e o número de aberturas) e a consulta é refeita aos 5 s.
+function workersKeepNotice(kind) {
+    const world = createWorld({workers: 'manual'});
+    world.workersCheck();
+    world.answerWorkers(WORKERS_LISTED);
+    const result = {opened: world.state()};
+    world.workersCheck(); // o host pergunta de novo, à mão
+    result.asked = world.state();
+    world.answerWorkers(WORKERS_NOSHAPE[kind]);
+    result.afterAnswer = world.state();
+    world.advance(4999);
+    result.at4999 = world.state();
+    world.advance(1);
+    result.at5000 = world.state();
+    return result;
+}
+
+// A sonda aberta PELA PÁGINA (`workers: 'page'`: o setting ligado, e a página passa `{onLogin}`): a resposta sem a forma refaz a consulta com as
+// MESMAS opções, então a sessão que cai depois dela leva ao login (o AC-8954-3, «depois de consultas que falharam»). Uma sonda refeita sem as
+// opções perderia o `onLogin` e deixaria o usuário na tela sem aviso.
+function workersNoShapePage(kind) {
+    const world = createWorld({workers: 'page'});
+    world.answerWorkers(WORKERS_NOSHAPE[kind]);
+    const result = {afterAnswer: world.state()};
+    world.advance(5000); // a consulta refeita sai
+    result.asked = world.state();
+    world.answerWorkers(LOGIN_PAGE);
+    result.afterLogin = world.state();
     world.advance(30000);
     result.later = world.state();
     return result;
@@ -1288,6 +1491,36 @@ register('workers:retry:network:noreason', function () { return workersRetry('ne
 // AC-8954-7: o resultado no aviso
 register('workers:result:listed', function () { return workersResult('listed'); });
 register('workers:result:nobody', function () { return workersResult('nobody'); });
+
+// #9106 (AC-9106-1 a -10): o envio, a revogação e a sonda respondidos com sucesso e sem o campo que leem. Cada forma em cada contexto, um mundo
+// novo para cada; os controles (as formas que o servidor manda) ao lado.
+Object.keys(SUBMIT_NOTASK).forEach(function (kind) {
+    SUBMIT_CONTEXTS.forEach(function (context) {
+        register('submitnotask:' + kind + ':' + context, function () { return submitAnswer(kind, context); });
+        // AC-9106-9: o mesmo, depois de um 400 com os erros do formulário
+        register('marks:' + kind + ':' + context, function () { return submitAnswer(kind, context, {priorRefusal: true}); });
+    });
+});
+Object.keys(SUBMIT_TASK).forEach(function (kind) {
+    register('submittask:' + kind, function () { return submitAnswer(kind, 'active'); });
+});
+// AC-9106-3: um host com template próprio, sem o espaço do aviso nem os textos (`nospace`): a tela é solta, em silêncio, sem erro de script
+['s204', 'task_noid'].forEach(function (kind) {
+    register('submitnotask:' + kind + ':nospace', function () { return submitAnswer(kind, 'active', {world: TEMPLATES.nospace}); });
+});
+Object.keys(REVOKE_NOBODY).forEach(function (kind) {
+    ['tracking', 'late'].forEach(function (phase) {
+        register('revokenobody:' + kind + ':' + phase, function () { return revokeNobody(kind, phase); });
+    });
+});
+Object.keys(WORKERS_NOSHAPE).forEach(function (kind) {
+    register('workersnoshape:' + kind, function () { return workersNoShape(kind); });
+    register('workerskeep:' + kind, function () { return workersKeepNotice(kind); });
+    register('workerspage:' + kind, function () { return workersNoShapePage(kind); });
+});
+Object.keys(WORKERS_CONTROLS).forEach(function (kind) {
+    register('workersnoshape:control:' + kind, function () { return workersNoShape(kind); });
+});
 // AC-8954-9: a tela com a consulta de workers ligada
 register('boot:workers', function () {
     const world = createWorld({workers: 'page'});
@@ -1510,6 +1743,14 @@ process.stdout.write(JSON.stringify({
         wellFormedKinds: Object.keys(WELLFORMED_RESPONSES),
         noTaskHostKinds: NOTASK_HOST_KINDS,
         activeContexts: ACTIVE_CONTEXTS,
+        // #9106: as formas do envio respondido sem tarefa e com tarefa, os contextos em que chegam, as da revogação sem o campo `status` e as da
+        // sonda sem a forma (a lista é tirada daqui: uma forma nova entra sozinha nos testes), e os controles da sonda
+        submitNoTaskKinds: Object.keys(SUBMIT_NOTASK),
+        submitTaskKinds: Object.keys(SUBMIT_TASK),
+        submitContexts: SUBMIT_CONTEXTS,
+        revokeNoBodyKinds: Object.keys(REVOKE_NOBODY),
+        workersNoShapeKinds: Object.keys(WORKERS_NOSHAPE),
+        workersControlKinds: Object.keys(WORKERS_CONTROLS),
         // #9017: as formas do 400 sem os erros do formulário (a lista é tirada daqui: uma forma nova entra sozinha nos testes) e os contextos
         bad400NoField: Object.keys(BAD400_NOFIELD),
         bad400Field: Object.keys(BAD400_FIELD),

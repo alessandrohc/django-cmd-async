@@ -299,6 +299,34 @@ method that ends the query for a failure and for a response with no task, is a n
 empty `200` (no body) is **not** one of these: with `dataType` json jQuery sends it to the failure handler as a
 `parsererror` with status `200`, as it does for any `200` that is not JSON, so it still goes to the login.
 
+**A submit answered with no task ends as the failure `server` too.** The submit of the form is answered with
+`{"task": {"id": "<text>", "command": {"name": …}}}` (no `ready`: the submit does not wait for the task). A `204`, a `304`,
+a `2xx` whose JSON is not an object (`null`, a list, a text, a number, `true`, `false`) and a `2xx` whose JSON has no
+`task` object, or whose `task` object has no text `id` that is not empty, used to raise a `TypeError` in `on_form_valid`
+and leave the screen stuck, with Execute disabled and no text (Cancel did not release it either), or, with a `task` that
+had no text `id`, ask for `status/undefined`. Now the answer is checked in the `success` of the form (`ajax()`), **in front of
+the listeners of `form-valid`**, and one that carries no task is told as the failed submit: the notice with the server
+text (also when the follow-up was interrupted by Cancel or by the command switch), `update-failed` with the reason
+`server` and then `update-finish`, the screen released with no status query, and **no `form-valid`**. `form-valid` now
+only means "the server accepted a task". The page also clears the message and the mark that an earlier refused submit
+left next to the fields (`requestErrorClean()`, now called by its `update-failed` listener, because this answer passes
+neither through `form-valid` nor through the error handler of the form). For a host with a page of its own that listens to
+the events: `update-failed` and `update-finish` can now arrive from the submit, **with no `form-valid` before them and
+with `cmdasyncform.task` null** (before, every `update-failed` came after a task was accepted, so a listener that reads
+`task.id` there would raise); a `form-valid` listener is no longer notified of an answer with no task (the `TypeError` of
+`on_form_valid`, first in the list, used to skip the ones after it). The check lives in `ajax()`, in front of
+`on_form_valid`: a host that replaces `on_form_valid` to read another shape of answer is not called for an answer with no
+text `id`, and a host that does not call `ajax()` (one that fires `form-valid` by hand) is outside the check. A host with a
+route of its own for the submit, the revocation or the workers has to answer the shape of the package: the submit
+`{"task": {"id": "<text>", …}}`, the revocation `{"status": true}` or `{"status": false, "error": "<text>"}`, and the
+workers `{"status": true, "workers": [<names>]}` or `{"status": false, "workers": [], "message": "<text>"}`.
+
+**A revocation answered with no object is a failed revocation.** A `204`, a `304` and a `null` JSON body used to raise a
+`TypeError` in the `success` of the revocation, which left the Revoke button disabled with its progress indicator, with no
+notice and no `revoke-failed`. They are now the request that failed, like a body with no true `status`: `revoke-failed` is
+fired once, the notice shows the text of the failure, and the button comes back while the follow-up goes on. A `status`
+that exists is read as it always was (a true one is accepted, a false one fails), whatever its type.
+
 The notice says that **the last command sent may still be running**, and to check before running it again: the status
 query only exists once the task was launched, and the released form offers only Execute. The page does not show the id
 of the task after the failure, so look in the task monitor or in the logs of the host. A `5xx` or no answer to the
@@ -307,8 +335,11 @@ the session has expired, a `429`, a `401`...) shows a third text, a different on
 "The server refused the request, and the command was not run. If your session has expired, reload the page; otherwise try
 again in a moment, or check that you have permission to run commands." The bundled page publishes it in
 `data-refused-text` of `#task-panel` (in the catalog of the package, pt_BR included), next to the two others. A `400` with
-the errors of the form still marks each field and shows no text in the alert, and any other failure of the submit (a `2xx`
-that is not JSON, a `3xx`) releases the form and shows no text.
+the errors of the form still marks each field and shows no text in the alert, and the other failure of the submit that
+jQuery sends to the failure handler (a `2xx` other than `200` with a body that is not JSON; a `200` that is not JSON is the
+login page, above) releases the form and shows no text. A `304`,
+and a `2xx` whose JSON carries no task, are not that failure: jQuery resolves them as a success, and they show the server
+text (see the paragraph above).
 
 A `400` that does not carry the errors of the form as JSON (`{"form": {"errors": {field: [messages]}}}`, which is what the
 server always answers) used to raise a `TypeError` in the page and leave the form stuck, with Execute disabled until the
@@ -353,6 +384,11 @@ message of a false `status`. What the probe does with a failure depends on why i
   route redirects): the probe stops and the page takes the user to the login.
 - **A false `status`** (nobody answered, the broker failed), **a network failure, a query with no answer in
   `query_timeout` or a server error**: the probe asks again after 5 seconds, as before.
+- **An answer without the form the server sends** (a `204` or a `304`, which jQuery resolves as a success with no data,
+  JSON that is not an object or has no `status`, or a true `status` whose `workers` is not a list): it is a query that
+  failed. The probe used to raise a `TypeError` and stop asking for good, and a `204` that came after the notice was open
+  emptied its text first; now the notice stays as it was (open or closed, with its text and its count) and the probe asks
+  again after 5 seconds, like for a network failure. A `status` that exists is read as it always was.
 
 A host with a page of its own calls `workers_check_status({onLogin: <function>})`: that function is
 what runs on the login page (the bundled page passes its `goToLogin`), and without it the probe just

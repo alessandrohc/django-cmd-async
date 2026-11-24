@@ -249,9 +249,12 @@ $(document).ready(function () {
         requestUpdateFinish();
     });
 
-    // The status query got no task: the reason arrives here, and the screen is released
+    // The status query got no task, or the submit got no task: the reason arrives here, and the screen is released
     // right after by update-finish.
     cmdasyncform.add_event_callback("update-failed", function (reason) {
+        // A submit that got no task ends here: it passes neither through form-valid nor through the error handler of the form,
+        // which are what clear the message and the mark that an earlier refused submit left next to the fields.
+        requestErrorClean();
         if (reason === 'login')
             goToLogin();
         else if (reason === 'forbidden')
