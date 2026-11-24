@@ -24,7 +24,10 @@ $(document).ready(function () {
         // The status query or the submit that fails for a server reason, or with no answer at all (the network failed, or
         // the query was cut at query_timeout); a host without them shows no text for that failure.
         serverErrorText: $panel.data('server-error-text'),
-        networkErrorText: $panel.data('network-error-text')
+        networkErrorText: $panel.data('network-error-text'),
+        // The submit the server refuses (any 4xx: the 403 of the CSRF, the 429...): the command was not run, so the text must not say
+        // it may still be running; a host without it shows no text for that failure (#9016).
+        refusedText: $panel.data('refused-text')
     };
 
     // The alert space (#task-alert) is where a failure is told. .text() only, so what
@@ -191,11 +194,16 @@ $(document).ready(function () {
                     // screen is released like in any other failure (#9017).
                     var errors = ((xhr.responseJSON || {}).form || {}).errors;
                     var $feedback = $('<div class="invalid-feedback"></div>');
+                    // Set when a field the page has gets its error: a 400 that marks no field (no errors, or only fields the page does not
+                    // show) would leave the user with no text, so it tells the request was refused (#9016).
+                    var marked = false;
                     for (var name in errors) {
                         // a field outside the map shows nothing (and is no loop over undefined)
                         var ids = Object.prototype.hasOwnProperty.call(rel_inputs, name) ? rel_inputs[name] : [];
                         ids.forEach(function (id) {
                             var $input = $("#" + id);
+                            if ($input.length)
+                                marked = true;
                             $input.addClass("is-invalid");
                             // .text(): a validation message echoes back what the user
                             // typed (ast.literal_eval puts the input in its error), so
@@ -205,14 +213,19 @@ $(document).ready(function () {
                             $input.parent().append($feedback.clone().text((errors[name] || [])[0]));
                         });
                     }
+                    if (!marked)
+                        showAlert(config.refusedText);
                     break;
                 case 0:  // no answer: the network failed
                     showAlert(config.networkErrorText);
                     break;
                 default:
-                    // a server error says so; the other failures (the 403 of the CSRF, the 429...) show no text
+                    // a server error says so; a refusal (the 403 of the CSRF, the 429...) says the command was not run; any other
+                    // failure (a 2xx that is no JSON...) shows no text
                     if (xhr.status >= 500)
                         showAlert(config.serverErrorText);
+                    else if (xhr.status >= 400)
+                        showAlert(config.refusedText);
             }
             requestUpdateFinish();
         }

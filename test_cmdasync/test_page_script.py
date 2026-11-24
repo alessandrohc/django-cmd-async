@@ -327,10 +327,10 @@ class StatusTimeoutTest(ScenarioTestCase):
 
 
 class FormFailureTest(ScenarioTestCase):
-    """O envio do formulário que falha: o texto de cada falha e a tela (AC-8961-4, AC-9019-1 e AC-9017-1, #8961, #9019 e #9017)."""
+    """O envio do formulário que falha: o texto de cada falha e a tela (AC-9016-1, AC-9019-1 e AC-9017-1, #8961, #9016, #9019 e #9017)."""
 
     def test_a_submit_that_fails_with_a_server_error_or_no_answer_tells_why(self):
-        """AC-8961-4: o envio que falha por 5xx mostra o texto de erro de servidor, e o que falha sem resposta, o de falha de conexão."""
+        """AC-9016-1 (controle): o envio que falha por 5xx mostra o texto de erro de servidor, e o que falha sem resposta, o de falha de conexão."""
         for name, text in (('form:http500:full', 'serverFailureText'), ('form:http503:full', 'serverFailureText'),
                            ('form:network:full', 'networkFailureText')):
             with self.subTest(scenario=name):
@@ -340,9 +340,9 @@ class FormFailureTest(ScenarioTestCase):
                 self.assertAtRest(after)
 
     def test_the_notice_also_shows_when_the_submit_was_interrupted(self):
-        """AC-8961-4: o Cancel ou a troca de comando com o envio em voo, que depois falha, mostra o mesmo aviso."""
+        """AC-9016-1: o Cancel ou a troca de comando com o envio em voo, que depois falha (5xx, sem resposta ou recusa 4xx), mostra o aviso da falha."""
         for trigger in ('cancel', 'switch'):
-            for kind, text in (('http500', 'serverFailureText'), ('network', 'networkFailureText')):
+            for kind, text in (('http500', 'serverFailureText'), ('network', 'networkFailureText'), ('http403', 'refusedFailureText')):
                 name = 'submit:{0}:fail:{1}'.format(trigger, kind)
                 with self.subTest(scenario=name):
                     found = self.scenario(name)
@@ -351,15 +351,59 @@ class FormFailureTest(ScenarioTestCase):
                     self.assertAlertShows(found['afterFail'], self.texts[text], msg=name)
                     self.assertAtRest(found['afterFail'])
 
+    def test_a_submit_refused_with_a_4xx_shows_the_refusal_text(self):
+        """AC-9016-1: o envio recusado com qualquer erro 4xx (de 401 a 499) mostra o texto de recusa no aviso, e não os de erro de servidor nem de falha de conexão, com o envio em voo, com o Cancel ou com a troca de comando antes da resposta."""
+        for name in ('form:4xx-sweep', 'form:4xx-sweep:cancel', 'form:4xx-sweep:switch'):
+            rows = self.scenario(name)['rows']
+            self.assertEqual([row['status'] for row in rows], [400] + list(range(401, 500)), msg='the sweep changed: ' + name)
+            for row in rows:
+                if row['status'] == 400:  # o 400 com os erros do formulário não é uma recusa sem campo: o teste seguinte o lê
+                    continue
+                with self.subTest(scenario=name, status=row['status']):
+                    self.assertEqual(row['uncaught'], [])
+                    self.assertIsNotNone(row['alert'], msg='the page has no alert space')
+                    self.assertFalse(row['alert']['hidden'], msg='the refusal shows no notice')
+                    self.assertEqual(row['alert']['text'], self.texts['refusedFailureText'], msg='status {0}'.format(row['status']))
+                    self.assertAtRest(row, msg='status {0}'.format(row['status']))
+
     def test_no_other_failure_of_the_submit_shows_those_texts(self):
-        """AC-8961-4 (controle): nenhuma outra falha do envio (o 400 com os erros do formulário e todo status de 401 a 499) mostra os textos de servidor e de conexão."""
-        rows = self.scenario('form:4xx-sweep')['rows']
-        self.assertEqual([row['status'] for row in rows], [400] + list(range(401, 500)), msg='the sweep changed')
+        """AC-9016-1 (controle): cada texto só na sua falha: o 5xx mostra só o de erro de servidor e a falta de resposta só o de conexão; nenhum dos três aparece no 400 que marca um campo, no 202 com corpo que não é JSON nem no login."""
+        # a precondição: o mesmo espaço do aviso mostra um texto (o de erro de servidor no 5xx: o laço seguinte), então «vazio» não vale
+        # num espaço que nunca mostra; o texto de recusa fora da sua falha é o que os mutantes m2, m5 e m6 provam
+        for name, own in (('form:http500:full', 'serverFailureText'), ('form:http503:full', 'serverFailureText'),
+                          ('form:network:full', 'networkFailureText')):
+            with self.subTest(scenario=name):
+                self.assertAlertShows(self.scenario(name)['after'], self.texts[own], msg=name)
+        none_of_the_three = ['form:http400:full', 'form:html202', 'form:login200']
+        none_of_the_three += ['bad400:{0}:fresh'.format(kind) for kind in self.constants['bad400Field']]
+        for name in none_of_the_three:
+            with self.subTest(scenario=name):
+                after = self.scenario(name)['after']
+                self.assertEqual(after['uncaught'], [])
+                self.assertIsNotNone(after['alert'], msg='the page has no alert space')
+                self.assertAlertEmpty(after, msg=name)
+        for name in ('form:4xx-sweep', 'form:4xx-sweep:cancel', 'form:4xx-sweep:switch'):
+            with self.subTest(scenario=name, status=400):
+                row = self.scenario(name)['rows'][0]
+                self.assertEqual(row['status'], 400)
+                self.assertEqual(row['alert']['text'], '', msg='the 400 with the form errors showed a text')
+                self.assertTrue(row['alert']['hidden'])
+
+    def test_a_status_below_400_that_reaches_the_error_handler_shows_no_text(self):
+        """AC-9016-1 (controle): o limite de baixo da recusa: nenhum status de 201 a 399 que chega ao `error` do envio (o 2xx com corpo que não é JSON e todo 3xx, menos o 204 e o 304, que o jQuery trata como sucesso) mostra texto no aviso, e a tela solta sem erro de script."""
+        # a precondição: o mesmo espaço do aviso mostra um texto (o de erro de servidor no 5xx), então «vazio» não vale num espaço que nunca mostra
+        self.assertAlertShows(self.scenario('form:http500:full')['after'], self.texts['serverFailureText'],
+                              msg='precondition: the alert space works')
+        rows = self.scenario('form:below400-sweep')['rows']
+        self.assertEqual([row['status'] for row in rows], [status for status in range(201, 400) if status not in (204, 304)],
+                         msg='the sweep changed')
         for row in rows:
             with self.subTest(status=row['status']):
+                self.assertEqual(row['uncaught'], [])
                 self.assertIsNotNone(row['alert'], msg='the page has no alert space')
-                self.assertEqual(row['alert']['text'], '', msg='the submit refused with {0} showed a text'.format(row['status']))
+                self.assertEqual(row['alert']['text'], '', msg='the submit answered with {0} showed a text'.format(row['status']))
                 self.assertTrue(row['alert']['hidden'])
+                self.assertAtRest(row, msg='status {0}'.format(row['status']))
 
     def test_a_submit_refused_with_the_form_errors_shows_each_error_next_to_its_field(self):
         """AC-9019-1 (controle): o 400 com os erros do formulário em JSON mostra o erro de cada campo (o do comando e os dos argumentos) ao lado do campo."""
@@ -414,7 +458,7 @@ class BadFormErrorsTest(ScenarioTestCase):
         for body_class, kinds in BAD400_CLASSES.items():
             for kind in kinds:
                 self.assertIn(kind, self.kinds, msg='the sweep lost a form of the class "{0}"'.format(body_class))
-        self.assertEqual(set(self.contexts), {'fresh', 'cancel', 'switch', 'nospace'}, msg='the contexts of the sweep changed')
+        self.assertEqual(set(self.contexts), {'fresh', 'cancel', 'switch', 'nospace', 'norefused'}, msg='the contexts of the sweep changed')
 
     def test_a_400_without_the_form_errors_releases_the_screen(self):
         """AC-9017-1: o 400 cujo corpo não traz os erros do formulário como o servidor os manda (sem corpo, não JSON, JSON de outra forma, erro de campo que não é lista) solta a tela sem erro de script, com o envio em voo, com o Cancel ou a troca antes da resposta e num template sem o espaço do aviso."""
@@ -438,20 +482,39 @@ class BadFormErrorsTest(ScenarioTestCase):
                     self.assertEqual(found['after']['uncaught'], [], msg='the page raised a script error. ' + name)
                     self.assertAtRest(found['after'], msg=name)
 
-    def test_a_400_without_the_form_errors_shows_no_text_in_the_alert(self):
-        """AC-9017-2 (controle): o 400 cujo corpo não traz os erros do formulário não mostra texto no aviso (o espaço do aviso fica vazio e escondido)."""
+    def test_a_400_that_marks_no_field_tells_the_request_was_refused(self):
+        """AC-9016-1: o 400 em que a tela não marca campo nenhum (sem corpo, não JSON, sem `form.errors`, com `errors` que não é um objeto, vazio ou só com campos que a tela não mostra) mostra o texto de recusa no aviso, com o envio em voo, com o Cancel ou a troca; o 400 que marca um campo não mostra texto."""
         self.assertSweepCoversEveryClass()
+        for kind in ('errors_empty', 'errors_unmapped'):
+            self.assertIn(kind, self.nofield, msg='the sweep lost the form {0}'.format(kind))
         # a mesma página mostra o texto de servidor para o 5xx: sem isso, «vazio» valeria também para uma página sem o aviso
         self.assertAlertShows(self.scenario('form:http500:full')['after'], self.texts['serverFailureText'],
                               msg='precondition: the alert space works')
-        # o `nospace` fica de fora: sem o espaço do aviso não há o que ler (o `alert` é nulo), e «vazio» valeria à toa
-        for kind in self.kinds:
+        # o `nospace` e o `norefused` ficam de fora: sem o espaço do aviso ou sem o texto não há o que ler (o AC-9016-3 os cobre)
+        for kind in self.nofield:
+            for context in ('fresh', 'cancel', 'switch'):
+                name = 'bad400:{0}:{1}'.format(kind, context)
+                with self.subTest(scenario=name):
+                    after = self.scenario(name)['after']
+                    self.assertEqual(after['uncaught'], [], msg=name)
+                    self.assertAlertShows(after, self.texts['refusedFailureText'], msg=name)
+                    self.assertAtRest(after, msg=name)
+        for kind in self.field:
             for context in ('fresh', 'cancel', 'switch'):
                 name = 'bad400:{0}:{1}'.format(kind, context)
                 with self.subTest(scenario=name):
                     after = self.scenario(name)['after']
                     self.assertIsNotNone(after['alert'], msg='precondition: the page has the alert space. ' + name)
                     self.assertAlertEmpty(after, msg=name)
+
+    def test_a_400_for_a_field_the_page_does_not_have_tells_the_request_was_refused(self):
+        # Robustez (sem ID): a página sem nenhum campo de argumentos que recebe um 400 `{"args": [...]}` não tem onde pôr o erro: mostra a
+        # recusa e solta a tela (a bandeira conta o campo que a página TEM, e não o nome do campo em `rel_inputs`).
+        after = self.scenario('bad400:nofield-on-page')['after']
+        self.assertEqual(after['uncaught'], [])
+        self.assertAlertShows(after, self.texts['refusedFailureText'])
+        self.assertAtRest(after)
+        self.assertEqual(after['fieldErrors']['args'], [], msg='the page has no args field, and a message was put somewhere')
 
     def test_a_400_that_refuses_no_field_marks_and_writes_nothing_next_to_the_fields(self):
         """AC-9019-5, AC-9019-9 (controle): o 400 cujo corpo não recusa campo nenhum não marca nem escreve mensagem ao lado do campo do comando nem dos argumentos, nas duas variantes."""
@@ -1157,6 +1220,17 @@ class AlertClearingTest(ScenarioTestCase):
             self.assertFalse(found['before']['alert']['hidden'])
             self.assertEqual(found['after']['alert'], found['before']['alert'])
 
+    def test_the_refusal_notice_goes_away_on_the_next_action(self):
+        """AC-8866-12: o aviso de recusa do envio (o 403) some quando o usuário envia de novo ou troca de comando."""
+        for trigger in ('submit', 'switch'):
+            with self.subTest(refusal=trigger):
+                found = self.scenario('clear:refusal:{0}'.format(trigger))
+                self.assertIsNotNone(found['before']['alert'], msg='precondition: the page has an alert space')
+                self.assertFalse(found['before']['alert']['hidden'], msg='precondition: the refusal notice is on screen')
+                self.assertEqual(found['before']['alert']['text'], self.texts['refusedFailureText'])
+                self.assertTrue(found['after']['alert']['hidden'], msg='the refusal notice stayed on screen')
+                self.assertEqual(found['after']['alert']['text'], '')
+
 
 class TaskOutputTest(ScenarioTestCase):
     """O fim da tarefa e o login do formulário, que continuam como estão (AC-8866-13 e -14)."""
@@ -1402,6 +1476,38 @@ class HostTemplateTest(ScenarioTestCase):
         self.assertTrue(after['copyHidden'], msg='the copy button is visible over an empty panel')
         self.assertAlertEmpty(after)
 
+    def test_a_host_template_without_the_refusal_text_handles_the_refusal_silently(self):
+        """AC-9016-3 (controle): sem o texto de recusa (com ou sem o espaço do aviso, com ou sem os outros textos), o envio recusado (um 4xx e o 400 em que a tela não marca campo) solta a tela, sem erro de script e sem texto no aviso."""
+        for template in ('nospace', 'spaceonly', 'oldtexts', 'norefused'):
+            for kind in ('http403', 'http429'):
+                name = 'form:{0}:{1}'.format(kind, template)
+                with self.subTest(scenario=name):
+                    after = self.scenario(name)['after']
+                    self.assertEqual(after['uncaught'], [])
+                    self.assertAtRest(after)
+                    self.assertAlertEmpty(after, msg=name)
+        self.assertTrue(self.constants['bad400NoField'], msg='the sweep has no 400 that marks no field')
+        for kind in self.constants['bad400NoField']:
+            for context in ('nospace', 'norefused'):
+                name = 'bad400:{0}:{1}'.format(kind, context)
+                with self.subTest(scenario=name):
+                    after = self.scenario(name)['after']
+                    self.assertEqual(after['uncaught'], [])
+                    self.assertAtRest(after)
+                    self.assertAlertEmpty(after, msg=name)
+
+    def test_a_host_template_publishes_the_texts_the_model_says(self):
+        """AC-9016-3: o modelo de host que traz só o texto de recusa o mostra na recusa e nenhum texto no 5xx; o que traz os outros dois sem o de recusa mostra o de servidor e o de conexão (o dublê publica cada texto onde o modelo manda)."""
+        self.assertAlertShows(self.scenario('form:http403:onlyrefused')['after'], self.texts['refusedFailureText'],
+                              msg='the host with only the refusal text shows it')
+        for name in ('form:http500:onlyrefused', 'form:network:onlyrefused'):
+            with self.subTest(scenario=name):
+                self.assertAlertEmpty(self.scenario(name)['after'], msg=name)
+        self.assertAlertShows(self.scenario('form:http500:norefused')['after'], self.texts['serverFailureText'],
+                              msg='the host without the refusal text still shows the server error text')
+        self.assertAlertShows(self.scenario('form:network:norefused')['after'], self.texts['networkFailureText'],
+                              msg='the host without the refusal text still shows the connection text')
+
     def test_a_host_template_without_the_alert_parts_does_not_raise(self):
         # Robustez (sem ID): o que já vale hoje; nada lança e a consulta recusada libera a tela.
         for template in ('nospace', 'spaceonly'):
@@ -1637,6 +1743,14 @@ class DoubleAssumptionsTest(TestCase):
         texts = load_scenarios()['constants']['texts']
         self.assertEqual(panel.by_id['task-panel'].get('data-server-error-text'), texts['serverFailureText'])
         self.assertEqual(panel.by_id['task-panel'].get('data-network-error-text'), texts['networkFailureText'])
+
+    def test_the_double_publishes_the_refusal_text_the_template_publishes(self):
+        """AC-9016-2: a frase do texto de recusa que o painel da página publica é a mesma que o dublê de node usa nos cenários de recusa."""
+        self.client.force_login(self.user)
+        panel = ButtonCollector()
+        panel.feed(self.client.get(INDEX_URL).content.decode('utf-8'))
+        texts = load_scenarios()['constants']['texts']
+        self.assertEqual(panel.by_id['task-panel'].get('data-refused-text'), texts['refusedFailureText'])
 
     def test_the_workers_script_reaches_only_the_body_and_the_counter_of_the_notice(self):
         """AC-8969-3 (controle): dentro do aviso, o script da consulta de workers só alcança o corpo e o contador, então o título, o ícone e o botão de fechar ficam como o template os entrega."""

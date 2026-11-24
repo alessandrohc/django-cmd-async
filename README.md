@@ -295,17 +295,32 @@ cancels.
 The notice says that **the last command sent may still be running**, and to check before running it again: the status
 query only exists once the task was launched, and the released form offers only Execute. The page does not show the id
 of the task after the failure, so look in the task monitor or in the logs of the host. A `5xx` or no answer to the
-**submit** of the form shows the same two texts; the other failures of the submit (a `400` with the errors of the form,
-a `403`, a `429`...) keep their handling and show neither text.
+**submit** of the form shows the same two texts. A submit the server refuses (any `4xx`: the `403` of the CSRF check when
+the session has expired, a `429`, a `401`...) shows a third text, a different one because the command **was not run**:
+"The server refused the request, and the command was not run. If your session has expired, reload the page; otherwise try
+again in a moment, or check that you have permission to run commands." The bundled page publishes it in
+`data-refused-text` of `#task-panel` (in the catalog of the package, pt_BR included), next to the two others. A `400` with
+the errors of the form still marks each field and shows no text in the alert, and any other failure of the submit (a `2xx`
+that is not JSON, a `3xx`) releases the form and shows no text.
 
 A `400` that does not carry the errors of the form as JSON (`{"form": {"errors": {field: [messages]}}}`, which is what the
 server always answers) used to raise a `TypeError` in the page and leave the form stuck, with Execute disabled until the
 page was reloaded. Such a `400` comes from a layer in front of the view: the error page of a proxy or a firewall, or
 Django's own `400` page (a host that is not allowed, a body that is too big). jQuery only sets `xhr.responseJSON` when the
 body parsed as JSON, and the page now reads the errors as something that can be missing: it releases the form like for any
-other failure of the submit, marks no field and shows no text (the user is not told why yet, as with the other `4xx`).
+other failure of the submit, marks no field and shows the refusal text (the user would otherwise be told nothing).
 This holds in any template, the ones of a host included; the errors of a field that are not a list of messages (`null`)
 no longer raise either.
+
+A `400` that marks no field shows the refusal text whatever the reason: no errors at all, an empty `errors`, or errors
+only for fields the page does not have (a host with a template of its own may have no argument fields). The page counts a
+field as marked when an input it has gets the error, not by the name of the field.
+
+**A host with a template of its own** (or a page that does not use `commands_async/index.html`) has to publish
+`data-refused-text` on `#task-panel` to show the refusal text, as it publishes `data-server-error-text` and
+`data-network-error-text`. Without it nothing changes from before: the screen is released, no text is shown and no script
+error is raised, but the user is still not told that the submit was refused. Check the attribute before taking this
+version.
 
 A status query that gets no answer in `cmdasyncform.query_timeout` (30000 ms; `0` turns the cut off, as in jQuery) is
 cut and told as `network`. The workers probe reads the same property when each query goes out (the first one, when the

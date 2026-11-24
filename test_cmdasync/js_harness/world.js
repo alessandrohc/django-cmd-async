@@ -56,6 +56,8 @@ const TEXTS = {
     // esse nome é do texto que o SERVIDOR manda na revogação (`serverErrorText` das constantes do scenarios.js).
     serverFailureText: 'The server could not answer the request, and the last command sent may still be running: check before running it again.',
     networkFailureText: 'The connection to the server failed or took too long, and the last command sent may still be running: check before running it again.',
+    // O texto de recusa do #9016 (data-refused-text): o envio recusado com um 4xx; o teste do template confere a mesma frase (AC-9016-2).
+    refusedFailureText: 'The server refused the request, and the command was not run. If your session has expired, reload the page; otherwise try again in a moment, or check that you have permission to run commands.',
     // O que o toast.html do pacote publica em data-forbidden-text (o teste do template, AC-8954-4, confere o real).
     workersForbiddenText: 'Access denied: your session may have expired, or you do not have permission to see the Celery workers.',
 };
@@ -120,13 +122,15 @@ function createWorld(options) {
     // runningText: o texto de execução que o template publica em data-running-text (padrão TEXTS.runningText; um outro
     // texto prova que a página escreve o que o template publicou, e não o literal em inglês: a tradução, AC-8967-3);
     // failureTexts: quais dos dois textos de falha do #8961 o painel traz ('both' por padrão, 'none', 'server' ou 'network';
-    // `texts: false` tira também os três antigos); queryTimeout: o valor que um script do host atribui a
+    // `texts: false` tira também os três antigos); refusalText: se o painel traz o texto de recusa do #9016, o data-refused-text
+    // (verdadeiro por padrão; `texts: false` o tira também: um host sem os textos não o publica); queryTimeout: o valor que um script do host atribui a
     // `cmdasyncform.query_timeout` na carga, depois do cmdhandler.js e antes do DOM ready (AC-8961-5); argsVariants: quais variantes
     // dos campos de argumentos a página tem (#9019): 'both' (o template do pacote: a larga, `#task-args` e `#task-kwargs`, e a estreita,
-    // `#task-args-md` e `#task-kwargs-md`), 'wide' ou 'narrow' (um host de template próprio com uma variante só).
+    // `#task-args-md` e `#task-kwargs-md`), 'wide' ou 'narrow' (um host de template próprio com uma variante só) ou 'none' (um host sem
+    // nenhum campo de argumentos: o erro do 400 não tem onde ser posto, #9016).
     const opts = Object.assign({commandsList: false, alertSpace: true, texts: true, workers: false, toast: 'full', noFailureReason: false,
-        failureTexts: 'both', queryTimeout: undefined, argsVariants: 'both'}, options || {});
-    if (['both', 'wide', 'narrow'].indexOf(opts.argsVariants) < 0) throw new Error('harness: unknown argsVariants ' + opts.argsVariants);
+        failureTexts: 'both', refusalText: true, queryTimeout: undefined, argsVariants: 'both'}, options || {});
+    if (['both', 'wide', 'narrow', 'none'].indexOf(opts.argsVariants) < 0) throw new Error('harness: unknown argsVariants ' + opts.argsVariants);
     const world = {
         opts: opts,
         markupSinks: [],
@@ -192,6 +196,7 @@ function createWorld(options) {
         panelData['not-found-text'] = TEXTS.notFoundText;
         if (opts.failureTexts === 'both' || opts.failureTexts === 'server') panelData['server-error-text'] = TEXTS.serverFailureText;
         if (opts.failureTexts === 'both' || opts.failureTexts === 'network') panelData['network-error-text'] = TEXTS.networkFailureText;
+        if (opts.refusalText) panelData['refused-text'] = TEXTS.refusedFailureText;
     }
     add('#task-panel', new Node('panel', {data: panelData}));
 
@@ -217,9 +222,9 @@ function createWorld(options) {
     // `argsVariants` omite uma delas (o host de uma variante só).
     const fieldParents = {app_command: new Node('app command parent'), args: new Node('args parent'), kwargs: new Node('kwargs parent')};
     const narrowParents = {args: new Node('args parent (narrow)'), kwargs: new Node('kwargs parent (narrow)')};
-    const wideFields = opts.argsVariants === 'narrow' ? null
+    const wideFields = opts.argsVariants === 'narrow' || opts.argsVariants === 'none' ? null
         : {args: add('#task-args', new Node('args')), kwargs: add('#task-kwargs', new Node('kwargs'))};
-    const narrowFields = opts.argsVariants === 'wide' ? null
+    const narrowFields = opts.argsVariants === 'wide' || opts.argsVariants === 'none' ? null
         : {args: add('#task-args-md', new Node('args (narrow)')), kwargs: add('#task-kwargs-md', new Node('kwargs (narrow)'))};
     if (wideFields) {
         wideFields.args.parentNode = fieldParents.args;

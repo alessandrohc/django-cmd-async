@@ -65,6 +65,16 @@ msgstr ""
 "pode continuar em execução: confira antes de executá-lo de novo."
 
 #: templates/cmdasync/index.html:39
+msgid ""
+"The server refused the request, and the command was not run. If your session "
+"has expired, reload the page; otherwise try again in a moment, or check that "
+"you have permission to run commands."
+msgstr ""
+"O servidor recusou o pedido, e o comando não foi executado. Se a sessão "
+"expirou, recarregue a página; senão, tente de novo daqui a pouco ou confira "
+"se você tem permissão para executar comandos."
+
+#: templates/cmdasync/index.html:39
 msgid "Checking and updating environment"
 msgstr "Verificação e atualização de ambiente"
 

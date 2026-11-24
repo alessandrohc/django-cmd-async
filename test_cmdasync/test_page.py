@@ -189,6 +189,22 @@ class DataAttributeContractTest(TestCase):
         # would take it out of the catalog.
         self.assertIn('data-running-text="Running command..."', self.rendered())
 
+    def test_every_data_key_the_script_reads_is_published_by_the_page(self):
+        """AC-9016-2 (controle): cada chave que o cmdasync-page.js lê do painel (`$panel.data('<chave>')`) é um `data-<chave>` do #task-panel que a página do pacote publica, o `data-refused-text` do texto de recusa entre elas."""
+        # Sem isto, trocar a chave no script e no dublê de node ao mesmo tempo (os testes de node publicam a chave do dublê) deixa tudo
+        # verde, e a página real nunca mostra o texto: o dublê não lê o template (a frase dele tem o seu teste, o do AC-9016-2).
+        source = (STATIC / 'js' / 'cmdasync-page.js').read_text(encoding='utf-8')
+        keys = re.findall(r"\$panel\.data\(['\"]([a-z-]+)['\"]\)", source)
+        self.assertIn('refused-text', keys, msg='the script does not read the refusal text')
+        self.assertGreaterEqual(len(keys), 12, msg='the script reads fewer keys of the panel than it did')
+        index = TagIndex()
+        index.feed(self.rendered())
+        panel = index.by_id.get('task-panel')
+        self.assertIsNotNone(panel, msg='the page has no #task-panel')
+        for key in keys:
+            with self.subTest(key=key):
+                self.assertIn('data-' + key, panel, msg='the script reads "{0}" and the page does not publish it'.format(key))
+
 
 class TagIndex(HTMLParser):
     """Indexa, por id, os atributos das tags da página (o HTMLParser já desfaz o escape dos valores)."""
@@ -220,6 +236,11 @@ FAILURE_TEXTS_PT_BR = {
     'data-server-error-text': 'O servidor não conseguiu responder ao pedido, e o último comando enviado pode continuar em execução: confira antes de executá-lo de novo.',
     'data-network-error-text': 'A conexão com o servidor falhou ou demorou demais, e o último comando enviado pode continuar em execução: confira antes de executá-lo de novo.',
 }
+
+# O texto de recusa do #9016 (AC-9016-2), exatamente como o critério o diz: em inglês (sem tradução) e em português (o do .po pt_BR).
+REFUSAL_TEXT = ('data-refused-text',
+                'The server refused the request, and the command was not run. If your session has expired, reload the page; otherwise try again in a moment, or check that you have permission to run commands.')
+REFUSAL_TEXT_PT_BR = 'O servidor recusou o pedido, e o comando não foi executado. Se a sessão expirou, recarregue a página; senão, tente de novo daqui a pouco ou confira se você tem permissão para executar comandos.'
 
 
 class AlertContractTest(TestCase):
@@ -276,6 +297,18 @@ class AlertContractTest(TestCase):
                     self.assertEqual(translation.gettext(phrase), FAILURE_TEXTS_PT_BR[attribute],
                                      msg='the pt_BR catalog does not translate this phrase')
                     self.assertEqual(panel.get(attribute), FAILURE_TEXTS_PT_BR[attribute])
+
+    def test_the_page_publishes_the_refusal_text_untranslated(self):
+        """AC-9016-2: o painel publica o texto de recusa, exatamente na frase do critério, quando não há tradução."""
+        attribute, phrase = REFUSAL_TEXT
+        self.assertEqual(self.page()['task-panel'].get(attribute), phrase)
+
+    def test_the_page_publishes_the_refusal_text_in_pt_br(self):
+        """AC-9016-2: o texto de recusa chega em pt_BR, exatamente na frase do critério, quando o idioma é pt-br (o catálogo traduz a frase)."""
+        attribute, phrase = REFUSAL_TEXT
+        with translation.override('pt-br'):
+            self.assertEqual(translation.gettext(phrase), REFUSAL_TEXT_PT_BR, msg='the pt_BR catalog does not translate this phrase')
+            self.assertEqual(self.page()['task-panel'].get(attribute), REFUSAL_TEXT_PT_BR)
 
     def test_the_page_publishes_the_failure_texts_translated(self):
         """AC-8866-9: os textos da falha chegam traduzidos para o idioma do usuário quando há tradução."""

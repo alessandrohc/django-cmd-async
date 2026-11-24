@@ -78,12 +78,15 @@ const TEMPLATES = {
     spaceonly: {alertSpace: true, texts: false},
 };
 
-// Os modelos dos cenários de falha do #8961: os de sempre e os de um host que traz só parte dos dois textos novos
-// (oldtexts: o espaço do aviso e os três textos antigos, sem os novos; noserver: só o de conexão; nonetwork: só o de servidor).
+// Os modelos dos cenários de falha do #8961 e do #9016: os de sempre e os de um host que traz só parte dos textos novos
+// (oldtexts: o espaço do aviso e os três textos antigos, sem os novos; noserver: só o de conexão (e o de recusa); nonetwork: só o
+// de servidor (e o de recusa); norefused: os de erro de servidor e de conexão, sem o de recusa; onlyrefused: só o de recusa).
 const FAILURE_TEMPLATES = Object.assign({}, TEMPLATES, {
-    oldtexts: {failureTexts: 'none'},
+    oldtexts: {failureTexts: 'none', refusalText: false},
     noserver: {failureTexts: 'network'},
     nonetwork: {failureTexts: 'server'},
+    norefused: {refusalText: false},
+    onlyrefused: {failureTexts: 'none'},
 });
 
 // Envia o comando e passa por `waits` respostas "não pronta"; no fim há uma nova consulta AGENDADA (timer vivo).
@@ -726,7 +729,7 @@ const FORM_FAILURES = {
     network: {status: 0},
 };
 
-// AC-8961-4, -6, AC-9019-1 e AC-9017-1: o envio que falha, num modelo de template.
+// AC-9016-1, AC-8961-6, AC-9019-1 e AC-9017-1: o envio que falha, num modelo de template.
 function formFailure(kind, template) {
     const world = createWorld(FAILURE_TEMPLATES[template]);
     world.executeStart();
@@ -734,7 +737,7 @@ function formFailure(kind, template) {
     return {after: world.state()};
 }
 
-// AC-8961-4 e AC-9017-1: o 400 com os erros em JSON e todo status de 401 a 499, um mundo novo para cada: o aviso de cada um e a tela.
+// AC-9016-1 e AC-9017-1: o 400 com os erros em JSON e todo status de 401 a 499, um mundo novo para cada: o aviso de cada um e a tela.
 // (O 400 SEM os erros em JSON tem a sua varredura, `bad400`, abaixo.)
 function formSweep() {
     const statuses = [400];
@@ -749,7 +752,7 @@ function formSweep() {
     return {rows: rows};
 }
 
-// AC-8961-4: o Cancel ou a troca de comando com o envio em voo, e o envio falha depois.
+// AC-9016-1: o Cancel ou a troca de comando com o envio em voo, e o envio falha depois.
 function submitInterruptedFailure(trigger, kind) {
     const world = createWorld({commandsList: trigger === 'switch'});
     world.executeStart();
@@ -760,7 +763,7 @@ function submitInterruptedFailure(trigger, kind) {
     return result;
 }
 
-// #9017 (AC-9017-1 e -2): o 400 do envio cujo corpo NÃO traz os erros do formulário como o servidor os manda
+// #9017 (AC-9017-1) e #9016 (AC-9016-1): o 400 do envio cujo corpo NÃO traz os erros do formulário como o servidor os manda
 // (`{"form": {"errors": {campo: [mensagens]}}}`, `views.py:301-311`): a página de um proxy, de um WAF ou do próprio Django, ou um JSON de
 // outra forma. O `xhr` é montado como o jQuery o monta: o `responseJSON` SÓ existe se o corpo foi JSON (o `ajaxConvert` do
 // jquery-3.7.1.min.js atribui `responseJSON` depois da conversão `text json`, que lança para um corpo que não é JSON; o teste de fonte do
@@ -782,6 +785,9 @@ const BAD400_NOFIELD = {
     errors_null: {status: 400, responseJSON: {form: {errors: null}}},
     errors_string: {status: 400, responseJSON: {form: {errors: 'oops'}}},
     errors_array: {status: 400, responseJSON: {form: {errors: ['a']}}},
+    // #9016: o `errors` vazio e o que só traz campos que a tela não marca (o `JSON.parse` cria a chave `__proto__`; um literal mudaria o protótipo)
+    errors_empty: {status: 400, responseJSON: {form: {errors: {}}}},
+    errors_unmapped: {status: 400, responseJSON: JSON.parse('{"form": {"errors": {"ghost": ["no such field"], "constructor": ["inherited name"], "__proto__": ["proto name"]}}}')},
 };
 const BAD400_FIELD = {
     field_null: {status: 400, responseJSON: {form: {errors: {args: null}}}},
@@ -792,12 +798,14 @@ const BAD400_FIELD = {
 const BAD400_RESPONSES = Object.assign({}, BAD400_NOFIELD, BAD400_FIELD);
 // Onde o 400 chega: com o envio em voo (`fresh`), com o Cancel ou a troca de comando antes da resposta, e numa página de um host sem o
 // espaço do aviso nem os textos (`nospace`).
-const BAD400_CONTEXTS = ['fresh', 'cancel', 'switch', 'nospace'];
+// Mais, no #9016, `norefused`: um host com o espaço do aviso e os textos antigos, sem o de recusa.
+const BAD400_CONTEXTS = ['fresh', 'cancel', 'switch', 'nospace', 'norefused'];
 
-// AC-9017-1 e -2: o envio fica em voo (`before`), o Cancel ou a troca o interrompe (`afterAbort`) e chega o 400 (`after`).
+// AC-9017-1 e AC-9016-1: o envio fica em voo (`before`), o Cancel ou a troca o interrompe (`afterAbort`) e chega o 400 (`after`).
 function bad400(kind, context) {
     const interrupt = context === 'cancel' || context === 'switch' ? context : null;
-    const world = createWorld(Object.assign({commandsList: interrupt === 'switch'}, context === 'nospace' ? TEMPLATES.nospace : {}));
+    const world = createWorld(Object.assign({commandsList: interrupt === 'switch'},
+        context === 'nospace' ? TEMPLATES.nospace : context === 'norefused' ? FAILURE_TEMPLATES.norefused : {}));
     world.executeStart();
     const result = {before: world.state()};
     if (interrupt) {
@@ -831,6 +839,68 @@ function bad400Next(kind) {
         result.second = world.state();
     }
     return result;
+}
+
+// #9016 (AC-9016-1): o 400 de um erro de campo numa página que NÃO tem o campo (um host sem nenhum campo de argumentos): o erro não está
+// ao lado de campo nenhum, então a recusa aparece (a bandeira conta o campo que a página tem, e não o nome em `rel_inputs`).
+function bad400NoFieldOnPage() {
+    const world = createWorld({argsVariants: 'none'});
+    world.executeStart();
+    world.formError({status: 400, responseJSON: {form: {errors: {args: ['bad args']}}}});
+    return {after: world.state()};
+}
+
+// #9016 (AC-9016-1): todo status de 401 a 499 e o 400 com os erros, com o Cancel ou a troca de comando antes da resposta.
+function formSweepInterrupted(trigger) {
+    const statuses = [400];
+    for (let status = 401; status <= 499; status++) statuses.push(status);
+    const rows = statuses.map(function (status) {
+        const world = createWorld({commandsList: trigger === 'switch'});
+        world.executeStart();
+        clickTrigger(world, trigger);
+        world.formError(status === 400 ? FORM_FAILURES.http400 : {status: status});
+        const state = world.state();
+        return {status: status, alert: state.alert, execute: state.execute, cancel: state.cancel, revoke: state.revoke, uncaught: state.uncaught};
+    });
+    return {rows: rows};
+}
+
+// #9016 (AC-9016-1): o limite de baixo da recusa: todo status de 201 a 399 que o jQuery manda ao `error` do envio, um mundo novo para cada.
+// O 2xx chega ao `error` quando o corpo não é JSON (`parsererror`, com o status do próprio 2xx); o 3xx, quando o navegador não o segue
+// (o 300 e o 305, por exemplo). Ficam de fora o 200 (o login, `form:login200`), o 204 e o 304, que o jQuery trata como sucesso e nunca
+// chegam ao `error`.
+function formBelow400Sweep() {
+    const statuses = [];
+    for (let status = 201; status <= 399; status++) {
+        if (status !== 204 && status !== 304) statuses.push(status);
+    }
+    const rows = statuses.map(function (status) {
+        const world = createWorld();
+        world.executeStart();
+        world.formError({status: status});
+        const state = world.state();
+        return {status: status, alert: state.alert, execute: state.execute, cancel: state.cancel, revoke: state.revoke, uncaught: state.uncaught};
+    });
+    return {rows: rows};
+}
+
+// #9016 (AC-9016-1): o 202 com corpo que não é JSON no envio: o jQuery o manda ao `error` (`parsererror`) com o status 202.
+function formHtml202() {
+    const world = createWorld();
+    world.executeStart();
+    world.formError({status: 202, responseText: '<html>accepted</html>'});
+    return {after: world.state()};
+}
+
+// #9016 (AC-8866-12): o aviso da recusa (o 403 do envio) na tela; a ação seguinte do usuário o esconde (enviar de novo ou trocar de comando).
+function clearRefusal(trigger) {
+    const world = createWorld({commandsList: trigger === 'switch'});
+    world.executeStart();
+    world.formError(FORM_FAILURES.http403);
+    const before = world.state();
+    if (trigger === 'submit') world.executeStart();
+    else world.switchCommand(0);
+    return {before: before, after: world.state()};
 }
 
 // AC-8961-3 e -6: a 1ª consulta de estado sem resposta; o corte aos 30 s (o padrão do handler).
@@ -1181,7 +1251,7 @@ register('timeout:status:before-init', timeoutBeforeInit);
 ['cancel', 'switch'].forEach(function (trigger) {
     register('timeout:status:interrupted:' + trigger, function () { return timeoutInterrupted(trigger); });
 });
-// AC-8961-4, -6, AC-9019-1 e AC-9017-1: o envio que falha
+// AC-9016-1, AC-8961-6, AC-9019-1 e AC-9017-1: o envio que falha
 ['http500', 'http503', 'network', 'http400'].forEach(function (kind) {
     register('form:' + kind + ':full', function () { return formFailure(kind, 'full'); });
 });
@@ -1191,7 +1261,29 @@ register('timeout:status:before-init', timeoutBeforeInit);
     });
 });
 register('form:4xx-sweep', formSweep);
-// AC-9017-1 e -2 (#9017): o 400 sem os erros do formulário, cada forma em cada contexto; e a robustez sem ID
+// AC-9016-1 e -3 (#9016): a recusa em cada status, com o envio interrompido; o 202 que não é JSON; os modelos de host e o host sem campo
+['cancel', 'switch'].forEach(function (trigger) {
+    register('form:4xx-sweep:' + trigger, function () { return formSweepInterrupted(trigger); });
+});
+register('form:html202', formHtml202);
+register('form:below400-sweep', formBelow400Sweep);
+register('bad400:nofield-on-page', bad400NoFieldOnPage);
+// os modelos de host de AC-9016-3: sem o texto de recusa (a recusa solta a tela, sem texto) e só com ele
+['http403', 'http429'].forEach(function (kind) {
+    ['nospace', 'spaceonly', 'oldtexts', 'norefused'].forEach(function (template) {
+        register('form:' + kind + ':' + template, function () { return formFailure(kind, template); });
+    });
+});
+register('form:http403:onlyrefused', function () { return formFailure('http403', 'onlyrefused'); });
+['http500', 'network'].forEach(function (kind) {
+    ['norefused', 'onlyrefused'].forEach(function (template) {
+        register('form:' + kind + ':' + template, function () { return formFailure(kind, template); });
+    });
+});
+['submit', 'switch'].forEach(function (trigger) {
+    register('clear:refusal:' + trigger, function () { return clearRefusal(trigger); });
+});
+// AC-9017-1 (#9017) e AC-9016-1 (#9016): o 400 sem os erros do formulário, cada forma em cada contexto; e a robustez sem ID
 Object.keys(BAD400_RESPONSES).forEach(function (kind) {
     BAD400_CONTEXTS.forEach(function (context) {
         register('bad400:' + kind + ':' + context, function () { return bad400(kind, context); });
@@ -1202,7 +1294,7 @@ register('bad400:field-next', bad400FieldNext);
     register('bad400:next:' + kind, function () { return bad400Next(kind); });
 });
 ['cancel', 'switch'].forEach(function (trigger) {
-    ['http500', 'network'].forEach(function (kind) {
+    ['http500', 'network', 'http403'].forEach(function (kind) {
         register('submit:' + trigger + ':fail:' + kind, function () { return submitInterruptedFailure(trigger, kind); });
     });
 });
