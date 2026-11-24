@@ -185,9 +185,13 @@ $(document).ready(function () {
                     goToLogin();
                     break;
                 case 400:
-                    var data = xhr.responseJSON;
+                    // The server answers a refusal with {"form": {"errors": {field: [messages]}}}. A 400 that did not come from the view
+                    // (the page of a proxy or a WAF, Django's own 400 page) has no such body: jQuery only sets responseJSON when the body
+                    // parsed as JSON. Each step is read so that it can be missing: with no errors the loop below walks nothing, and the
+                    // screen is released like in any other failure (#9017).
+                    var errors = ((xhr.responseJSON || {}).form || {}).errors;
                     var $feedback = $('<div class="invalid-feedback"></div>');
-                    for (var name in data.form.errors) {
+                    for (var name in errors) {
                         // a field outside the map shows nothing (and is no loop over undefined)
                         var ids = Object.prototype.hasOwnProperty.call(rel_inputs, name) ? rel_inputs[name] : [];
                         ids.forEach(function (id) {
@@ -197,8 +201,8 @@ $(document).ready(function () {
                             // typed (ast.literal_eval puts the input in its error), so
                             // it must never be parsed as markup. One .clone() per input:
                             // appending the same element to two parents MOVES it, and
-                            // it would stay in the last one only.
-                            $input.parent().append($feedback.clone().text(data.form.errors[name][0]));
+                            // it would stay in the last one only. The messages of a field that is no list (null) read as none.
+                            $input.parent().append($feedback.clone().text((errors[name] || [])[0]));
                         });
                     }
                     break;

@@ -231,7 +231,7 @@ function createWorld(options) {
     }
     // os campos ocultos do formulário (`forms.py`: `HiddenInput`): o que o `change` preenche é o que vai com o comando
     const hiddenFields = {args: add('#id_args', new Node('hidden args')), kwargs: add('#id_kwargs', new Node('hidden kwargs'))};
-    add('input#id_app_command', new Node('hidden command'));
+    const hiddenCommand = add('input#id_app_command', new Node('hidden command'));
     add('#form-app_name', new Node('app name'));
     const appCommand = add('#task-app-command', new Node('app command'));
     appCommand.parentNode = fieldParents.app_command;
@@ -719,6 +719,9 @@ function createWorld(options) {
                 narrow: narrowFields ? {args: narrowFields.args.valueStr, kwargs: narrowFields.kwargs.valueStr} : null,
             },
             hiddenFields: {args: hiddenFields.args.valueStr, kwargs: hiddenFields.kwargs.valueStr},
+            // o campo oculto do comando: a troca de comando na lista o grava (cmdasync-page.js, o clique em `.dropdown-menu > a`), então é o que
+            // mostra, sem olhar o código, que a troca teve efeito (#9017: a precondição do contexto `switch` do AC-9017-1)
+            appCommandValue: hiddenCommand.valueStr,
             // o que o SCRIPT gravou em cada campo de argumentos por `.val(x)`, na ordem (null: a página não tem a variante)
             argumentWrites: {
                 wide: wideFields ? {args: wideFields.args.scriptWrites.slice(), kwargs: wideFields.kwargs.scriptWrites.slice()} : null,

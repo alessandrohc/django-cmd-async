@@ -726,7 +726,7 @@ const FORM_FAILURES = {
     network: {status: 0},
 };
 
-// AC-8961-4, -6, -9 e -12: o envio que falha, num modelo de template.
+// AC-8961-4, -6, AC-9019-1 e AC-9017-1: o envio que falha, num modelo de template.
 function formFailure(kind, template) {
     const world = createWorld(FAILURE_TEMPLATES[template]);
     world.executeStart();
@@ -734,7 +734,8 @@ function formFailure(kind, template) {
     return {after: world.state()};
 }
 
-// AC-8961-4 e -12: o 400 com os erros em JSON e todo status de 401 a 499, um mundo novo para cada: o aviso de cada um e a tela.
+// AC-8961-4 e AC-9017-1: o 400 com os erros em JSON e todo status de 401 a 499, um mundo novo para cada: o aviso de cada um e a tela.
+// (O 400 SEM os erros em JSON tem a sua varredura, `bad400`, abaixo.)
 function formSweep() {
     const statuses = [400];
     for (let status = 401; status <= 499; status++) statuses.push(status);
@@ -756,6 +757,79 @@ function submitInterruptedFailure(trigger, kind) {
     const result = {afterAbort: world.state()};
     world.formError(FORM_FAILURES[kind]);
     result.afterFail = world.state();
+    return result;
+}
+
+// #9017 (AC-9017-1 e -2): o 400 do envio cujo corpo NÃO traz os erros do formulário como o servidor os manda
+// (`{"form": {"errors": {campo: [mensagens]}}}`, `views.py:301-311`): a página de um proxy, de um WAF ou do próprio Django, ou um JSON de
+// outra forma. O `xhr` é montado como o jQuery o monta: o `responseJSON` SÓ existe se o corpo foi JSON (o `ajaxConvert` do
+// jquery-3.7.1.min.js atribui `responseJSON` depois da conversão `text json`, que lança para um corpo que não é JSON; o teste de fonte do
+// `DoubleAssumptionsTest` guarda isso), então o HTML, o corpo vazio e o texto não levam `responseJSON`.
+// `nofield`: o corpo não recusa campo nenhum (nenhum campo fica marcado nem recebe mensagem). `field`: um campo mapeado traz um erro que
+// não é uma lista com mensagem (o servidor não os manda; a tela solta e marca o campo recusado).
+const BAD400_NOFIELD = {
+    nojson: {status: 400},
+    emptybody: {status: 400, responseText: ''},
+    html: {status: 400, responseText: '<html><head><title>400 Bad Request</title></head><body><h1>Bad Request</h1></body></html>'},
+    json_null: {status: 400, responseJSON: null},
+    json_string: {status: 400, responseJSON: 'x'},
+    json_number: {status: 400, responseJSON: 5},
+    json_array: {status: 400, responseJSON: []},
+    json_noform: {status: 400, responseJSON: {detail: 'x'}},
+    form_null: {status: 400, responseJSON: {form: null}},
+    form_string: {status: 400, responseJSON: {form: 'x'}},
+    form_noerrors: {status: 400, responseJSON: {form: {}}},
+    errors_null: {status: 400, responseJSON: {form: {errors: null}}},
+    errors_string: {status: 400, responseJSON: {form: {errors: 'oops'}}},
+    errors_array: {status: 400, responseJSON: {form: {errors: ['a']}}},
+};
+const BAD400_FIELD = {
+    field_null: {status: 400, responseJSON: {form: {errors: {args: null}}}},
+    field_string: {status: 400, responseJSON: {form: {errors: {args: 'oops'}}}},
+    field_number: {status: 400, responseJSON: {form: {errors: {args: 5}}}},
+    field_empty: {status: 400, responseJSON: {form: {errors: {args: []}}}},
+};
+const BAD400_RESPONSES = Object.assign({}, BAD400_NOFIELD, BAD400_FIELD);
+// Onde o 400 chega: com o envio em voo (`fresh`), com o Cancel ou a troca de comando antes da resposta, e numa página de um host sem o
+// espaço do aviso nem os textos (`nospace`).
+const BAD400_CONTEXTS = ['fresh', 'cancel', 'switch', 'nospace'];
+
+// AC-9017-1 e -2: o envio fica em voo (`before`), o Cancel ou a troca o interrompe (`afterAbort`) e chega o 400 (`after`).
+function bad400(kind, context) {
+    const interrupt = context === 'cancel' || context === 'switch' ? context : null;
+    const world = createWorld(Object.assign({commandsList: interrupt === 'switch'}, context === 'nospace' ? TEMPLATES.nospace : {}));
+    world.executeStart();
+    const result = {before: world.state()};
+    if (interrupt) {
+        clickTrigger(world, interrupt);
+        result.afterAbort = world.state();
+    }
+    world.formError(BAD400_RESPONSES[kind]);
+    result.after = world.state();
+    return result;
+}
+
+// Robustez (sem ID): o erro nulo de `args` não esconde a mensagem de `kwargs` (o laço do 400 segue).
+function bad400FieldNext() {
+    const world = createWorld();
+    world.executeStart();
+    world.formError({status: 400, responseJSON: {form: {errors: {args: null, kwargs: ['bad kwargs']}}}});
+    return {after: world.state()};
+}
+
+// Robustez (sem ID): o comando enviado depois do 400 sem os erros é acompanhado até o fim.
+function bad400Next(kind) {
+    const world = createWorld();
+    world.executeStart();
+    world.formError(BAD400_RESPONSES[kind]);
+    const result = {afterFail: world.state()};
+    // com a tela presa (o 400 que lança) o dublê recusaria o envio seguinte e o cenário cairia por erro do harness, não pelo assert: o
+    // comando seguinte só sai com a tela solta, e o teste afirma que ela foi solta (`afterFail`) antes de ler o `second`
+    if (!result.afterFail.execute.disabled) {
+        world.execute('t2');
+        world.answerStatus(ready('SECOND OUTPUT'), 'last');
+        result.second = world.state();
+    }
     return result;
 }
 
@@ -1107,7 +1181,7 @@ register('timeout:status:before-init', timeoutBeforeInit);
 ['cancel', 'switch'].forEach(function (trigger) {
     register('timeout:status:interrupted:' + trigger, function () { return timeoutInterrupted(trigger); });
 });
-// AC-8961-4, -6, -9 e -12: o envio que falha
+// AC-8961-4, -6, AC-9019-1 e AC-9017-1: o envio que falha
 ['http500', 'http503', 'network', 'http400'].forEach(function (kind) {
     register('form:' + kind + ':full', function () { return formFailure(kind, 'full'); });
 });
@@ -1117,6 +1191,16 @@ register('timeout:status:before-init', timeoutBeforeInit);
     });
 });
 register('form:4xx-sweep', formSweep);
+// AC-9017-1 e -2 (#9017): o 400 sem os erros do formulário, cada forma em cada contexto; e a robustez sem ID
+Object.keys(BAD400_RESPONSES).forEach(function (kind) {
+    BAD400_CONTEXTS.forEach(function (context) {
+        register('bad400:' + kind + ':' + context, function () { return bad400(kind, context); });
+    });
+});
+register('bad400:field-next', bad400FieldNext);
+['nojson', 'html'].forEach(function (kind) {
+    register('bad400:next:' + kind, function () { return bad400Next(kind); });
+});
 ['cancel', 'switch'].forEach(function (trigger) {
     ['http500', 'network'].forEach(function (kind) {
         register('submit:' + trigger + ':fail:' + kind, function () { return submitInterruptedFailure(trigger, kind); });
@@ -1268,6 +1352,10 @@ process.stdout.write(JSON.stringify({
         // #9018: as formas de resposta sem tarefa (a lista é tirada daqui) e os contextos em que chegam
         noTaskKinds: Object.keys(NOTASK_RESPONSES),
         noTaskContexts: NOTASK_CONTEXTS,
+        // #9017: as formas do 400 sem os erros do formulário (a lista é tirada daqui: uma forma nova entra sozinha nos testes) e os contextos
+        bad400NoField: Object.keys(BAD400_NOFIELD),
+        bad400Field: Object.keys(BAD400_FIELD),
+        bad400Contexts: BAD400_CONTEXTS,
         translatedRunningText: TRANSLATED_RUNNING_TEXT,
         initialButtons: {
             execute: initial.execute.disabled,

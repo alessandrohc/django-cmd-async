@@ -298,6 +298,15 @@ of the task after the failure, so look in the task monitor or in the logs of the
 **submit** of the form shows the same two texts; the other failures of the submit (a `400` with the errors of the form,
 a `403`, a `429`...) keep their handling and show neither text.
 
+A `400` that does not carry the errors of the form as JSON (`{"form": {"errors": {field: [messages]}}}`, which is what the
+server always answers) used to raise a `TypeError` in the page and leave the form stuck, with Execute disabled until the
+page was reloaded. Such a `400` comes from a layer in front of the view: the error page of a proxy or a firewall, or
+Django's own `400` page (a host that is not allowed, a body that is too big). jQuery only sets `xhr.responseJSON` when the
+body parsed as JSON, and the page now reads the errors as something that can be missing: it releases the form like for any
+other failure of the submit, marks no field and shows no text (the user is not told why yet, as with the other `4xx`).
+This holds in any template, the ones of a host included; the errors of a field that are not a list of messages (`null`)
+no longer raise either.
+
 A status query that gets no answer in `cmdasyncform.query_timeout` (30000 ms; `0` turns the cut off, as in jQuery) is
 cut and told as `network`. The workers probe reads the same property when each query goes out (the first one, when the
 page loads, uses what the host assigned until then; an assignment later applies from the next query) and, when a query

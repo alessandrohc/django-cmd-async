@@ -105,20 +105,31 @@ class TaskFormViewPostTest(TestCase):
                                                 kwargs={'tag': 'x'},
                                                 priority=0)
 
+    def assert_field_error_is_a_list_of_messages(self, response, field):
+        """The 400 the bundled page reads (`errors[field][0]`, cmdasync-page.js): `{"form": {"errors": {field: [message, ...]}}}`."""
+        errors = json.loads(response.content)['form']['errors']
+        self.assertIn(field, errors)
+        self.assertIsInstance(errors[field], list, msg='the error of {0} is not a list of messages'.format(field))
+        self.assertTrue(errors[field], msg='the list of messages of {0} is empty'.format(field))
+        for message in errors[field]:
+            self.assertIsInstance(message, str, msg='a message of {0} is not a text'.format(field))
+
     def test_submit_with_unparsable_args_returns_a_field_error(self):
+        """AC-9017-3 (controle): `args` that cannot be read is refused with a 400 in JSON, `form.errors.args` a list with a message, and nothing is queued."""
         with mock.patch('commands_async.views.command_exec') as task:
             response = self.client.post(INDEX_URL, payload(args='"unterminated'), **AJAX)
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn('args', json.loads(response.content)['form']['errors'])
+        self.assert_field_error_is_a_list_of_messages(response, 'args')
         task.apply_async.assert_not_called()
 
     def test_submit_with_unparsable_kwargs_returns_a_field_error(self):
+        """AC-9017-3 (controle): `kwargs` that cannot be read is refused with a 400 in JSON, `form.errors.kwargs` a list with a message, and nothing is queued."""
         with mock.patch('commands_async.views.command_exec') as task:
             response = self.client.post(INDEX_URL, payload(kwargs='"tag": '), **AJAX)
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn('kwargs', json.loads(response.content)['form']['errors'])
+        self.assert_field_error_is_a_list_of_messages(response, 'kwargs')
         task.apply_async.assert_not_called()
 
     def test_broker_failure_returns_a_field_error_and_is_logged(self):

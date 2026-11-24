@@ -327,7 +327,7 @@ class StatusTimeoutTest(ScenarioTestCase):
 
 
 class FormFailureTest(ScenarioTestCase):
-    """O envio do formulário que falha: o texto de cada falha e a tela (AC-8961-4, -9 e -12, #8961)."""
+    """O envio do formulário que falha: o texto de cada falha e a tela (AC-8961-4, AC-9019-1 e AC-9017-1, #8961, #9019 e #9017)."""
 
     def test_a_submit_that_fails_with_a_server_error_or_no_answer_tells_why(self):
         """AC-8961-4: o envio que falha por 5xx mostra o texto de erro de servidor, e o que falha sem resposta, o de falha de conexão."""
@@ -372,7 +372,7 @@ class FormFailureTest(ScenarioTestCase):
             self.assertTrue(after['invalidFields'][field], msg='the field {0} was not marked invalid'.format(field))
 
     def test_every_failed_submit_releases_the_screen(self):
-        """AC-8961-12 (controle): toda falha do envio (o 400 com os erros em JSON, os outros 4xx, o 5xx, a falta de resposta e o login) libera a tela."""
+        """AC-9017-1 (controle): toda falha do envio (o 400 com os erros em JSON, os outros 4xx, o 5xx, a falta de resposta e o login) libera a tela."""
         rows = self.scenario('form:4xx-sweep')['rows']
         self.assertEqual(len(rows), 100, msg='the sweep changed size')
         for row in rows:
@@ -382,6 +382,111 @@ class FormFailureTest(ScenarioTestCase):
         for name in ('form:http500:full', 'form:http503:full', 'form:network:full', 'form:login200'):
             with self.subTest(scenario=name):
                 self.assertAtRest(self.scenario(name)['after'], msg=name)
+
+
+# As classes de corpo que o AC-9017-1 enumera e a forma do harness (`BAD400_RESPONSES`) que prova cada uma.
+BAD400_CLASSES = {
+    'no body': ('nojson', 'emptybody'),
+    'a body that is no JSON': ('html',),
+    'JSON that is no object': ('json_null', 'json_string', 'json_number', 'json_array'),
+    'no form object with an errors object': ('json_noform', 'form_null', 'form_string', 'form_noerrors', 'errors_null',
+                                             'errors_string', 'errors_array'),
+    'a field error that is no list with a message': ('field_null', 'field_string', 'field_number', 'field_empty'),
+}
+
+
+class BadFormErrorsTest(ScenarioTestCase):
+    """O 400 do envio cujo corpo não traz os erros do formulário como o servidor os manda (AC-9017-1 e -2, #9017).
+
+    O `xhr` de cada forma é montado como o jQuery o monta: o `responseJSON` só existe se o corpo foi JSON (o teste de fonte
+    `DoubleAssumptionsTest` confere isso no jQuery entregue), então a página de um proxy, o corpo vazio e o texto não o levam.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.nofield = cls.constants['bad400NoField']
+        cls.field = cls.constants['bad400Field']
+        cls.kinds = cls.nofield + cls.field
+        cls.contexts = cls.constants['bad400Contexts']
+
+    def assertSweepCoversEveryClass(self):
+        for body_class, kinds in BAD400_CLASSES.items():
+            for kind in kinds:
+                self.assertIn(kind, self.kinds, msg='the sweep lost a form of the class "{0}"'.format(body_class))
+        self.assertEqual(set(self.contexts), {'fresh', 'cancel', 'switch', 'nospace'}, msg='the contexts of the sweep changed')
+
+    def test_a_400_without_the_form_errors_releases_the_screen(self):
+        """AC-9017-1: o 400 cujo corpo não traz os erros do formulário como o servidor os manda (sem corpo, não JSON, JSON de outra forma, erro de campo que não é lista) solta a tela sem erro de script, com o envio em voo, com o Cancel ou a troca antes da resposta e num template sem o espaço do aviso."""
+        self.assertSweepCoversEveryClass()
+        for kind in self.kinds:
+            for context in self.contexts:
+                name = 'bad400:{0}:{1}'.format(kind, context)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.assertTrue(found['before']['execute']['disabled'], msg='precondition: the submit is in flight. ' + name)
+                    if context == 'cancel':
+                        # sem isto o contexto seria uma cópia do `fresh` se o clique no Cancel deixasse de fazer efeito
+                        self.assertFalse(found['before']['cancel']['disabled'], msg='precondition: the Cancel is available. ' + name)
+                        self.assertTrue(found['afterAbort']['cancel']['disabled'], msg='precondition: the Cancel took effect. ' + name)
+                    if context == 'switch':
+                        self.assertNotEqual(found['afterAbort']['appCommandValue'], found['before']['appCommandValue'],
+                                            msg='precondition: the switch of command took effect. ' + name)
+                    if context in ('cancel', 'switch'):
+                        self.assertTrue(found['afterAbort']['execute']['disabled'],
+                                        msg='precondition: the submit is still in flight after the interruption. ' + name)
+                    self.assertEqual(found['after']['uncaught'], [], msg='the page raised a script error. ' + name)
+                    self.assertAtRest(found['after'], msg=name)
+
+    def test_a_400_without_the_form_errors_shows_no_text_in_the_alert(self):
+        """AC-9017-2 (controle): o 400 cujo corpo não traz os erros do formulário não mostra texto no aviso (o espaço do aviso fica vazio e escondido)."""
+        self.assertSweepCoversEveryClass()
+        # a mesma página mostra o texto de servidor para o 5xx: sem isso, «vazio» valeria também para uma página sem o aviso
+        self.assertAlertShows(self.scenario('form:http500:full')['after'], self.texts['serverFailureText'],
+                              msg='precondition: the alert space works')
+        # o `nospace` fica de fora: sem o espaço do aviso não há o que ler (o `alert` é nulo), e «vazio» valeria à toa
+        for kind in self.kinds:
+            for context in ('fresh', 'cancel', 'switch'):
+                name = 'bad400:{0}:{1}'.format(kind, context)
+                with self.subTest(scenario=name):
+                    after = self.scenario(name)['after']
+                    self.assertIsNotNone(after['alert'], msg='precondition: the page has the alert space. ' + name)
+                    self.assertAlertEmpty(after, msg=name)
+
+    def test_a_400_that_refuses_no_field_marks_and_writes_nothing_next_to_the_fields(self):
+        """AC-9019-5, AC-9019-9 (controle): o 400 cujo corpo não recusa campo nenhum não marca nem escreve mensagem ao lado do campo do comando nem dos argumentos, nas duas variantes."""
+        refused = self.scenario('form:http400:full')['after']
+        for field in ('app_command', 'args', 'kwargs'):
+            self.assertTrue(refused['invalidFields'][field],
+                            msg='precondition: a 400 with the form errors marks the field {0}'.format(field))
+            self.assertTrue(refused['fieldErrors'][field], msg='precondition: and writes its message next to the field')
+        self.assertTrue(self.nofield, msg='the sweep has no form that refuses no field')
+        for kind in self.nofield:
+            name = 'bad400:{0}:fresh'.format(kind)
+            with self.subTest(scenario=name):
+                after = self.scenario(name)['after']
+                self.assertEqual(after['fieldErrors'], {'app_command': [], 'args': [], 'kwargs': []}, msg=name)
+                self.assertEqual(after['invalidFields'], {'app_command': False, 'args': False, 'kwargs': False}, msg=name)
+                self.assertEqual(after['fieldErrorsNarrow'], {'args': [], 'kwargs': []}, msg=name)
+                self.assertEqual(after['invalidFieldsNarrow'], {'args': False, 'kwargs': False}, msg=name)
+
+    # Robustez (sem ID): o texto de nenhum critério a diz; o que a conferência do campo promete além de «sem erro de script».
+    def test_a_field_error_that_is_no_list_does_not_hide_the_next_field(self):
+        after = self.scenario('bad400:field-next')['after']
+        self.assertEqual(after['uncaught'], [], msg='the page raised a script error')
+        self.assertEqual(after['fieldErrors']['kwargs'], ['bad kwargs'], msg='the null error of args hid the message of kwargs')
+        self.assertTrue(after['invalidFields']['kwargs'], msg='the field kwargs was not marked')
+        self.assertAtRest(after)
+
+    def test_the_command_sent_after_a_400_without_the_form_errors_is_followed_to_its_end(self):
+        for kind in ('nojson', 'html'):
+            with self.subTest(kind=kind):
+                found = self.scenario('bad400:next:' + kind)
+                self.assertAtRest(found['afterFail'], msg='precondition: the 400 released the screen')
+                second = found['second']
+                self.assertEqual(second['uncaught'], [])
+                self.assertEqual(second['output'], 'SECOND OUTPUT', msg='the next command was not followed to its end')
+                self.assertAtRest(second, msg='the next command did not release the screen')
 
 
 class FailureReasonTest(ScenarioTestCase):
@@ -1470,6 +1575,33 @@ class DoubleAssumptionsTest(TestCase):
         source = (STATIC_CMDASYNC / 'js' / 'jquery-3.7.1.min.js').read_text(encoding='utf-8')
         self.assertRegex(source, r'204===\w+\|\|"HEAD"===\w+\.type\?\w+="nocontent":304===\w+\?\w+="notmodified":\(\w+=\w+\.state,\w+=\w+\.data,',
                          msg='the vendored jQuery no longer resolves a 304 as success with no data (notmodified)')
+
+    def test_the_vendored_jquery_sets_response_json_only_after_the_json_conversion_succeeds(self):
+        # O 400 sem corpo, com HTML ou com texto chega ao `error` do envio sem `xhr.responseJSON`: o `ajaxConvert` atribui
+        # `jqXHR[responseFields[tipo]]` no COMEÇO de cada volta do laço dos tipos, e a conversão `text json` (`JSON.parse`) acontece entre
+        # a volta de `text` e a de `json`; quando ela lança, o `ajaxConvert` devolve `parsererror` sem entrar na volta de `json`. O
+        # harness monta o `xhr` assim (scenarios.js, `BAD400_RESPONSES`). Lido na fonte entregue (jquery-3.7.1.min.js); se a
+        # versão mudar, este teste obriga a conferir o que o harness supõe (#9017).
+        source = (STATIC_CMDASYNC / 'js' / 'jquery-3.7.1.min.js').read_text(encoding='utf-8')
+        self.assertRegex(source, r'responseFields:\{xml:"responseXML",text:"responseText",json:"responseJSON"\}',
+                         msg='the vendored jQuery no longer names the response fields the way the harness assumes')
+        self.assertRegex(source, r'"text json":JSON\.parse', msg='the vendored jQuery no longer converts a JSON answer by JSON.parse')
+        loop = re.compile(r'while\((\w+)\)if\(\w+\.responseFields\[\1\]&&\(\w+\[\w+\.responseFields\[\1\]\]=\w+\).*?'
+                          r'try\{\w+=\w+\(\w+\)\}catch\(\w+\)\{return\{state:"parsererror"', flags=re.S)
+        self.assertRegex(source, loop,
+                         msg='the vendored jQuery no longer sets each response field at the top of the loop, before the conversion that can fail')
+
+    def test_the_vendored_jquery_text_with_no_value_changes_nothing_as_the_double_does(self):
+        # O erro nulo de um campo chega ao `.text()` da página como `undefined` (`(errors[name] || [])[0]`); o dublê (world.js, `text`)
+        # trata `.text(undefined)` como o getter-setter do jQuery: sem valor, nada muda. No jQuery entregue (jquery-3.7.1.min.js) o `text`
+        # passa o `arguments.length` ao `access`, que só chama o setter quando o valor não é `undefined` e, senão, devolve o objeto
+        # (`return i?e:…`). Se a versão mudar, este teste obriga a conferir o que o dublê supõe (#9017).
+        source = (STATIC_CMDASYNC / 'js' / 'jquery-3.7.1.min.js').read_text(encoding='utf-8')
+        self.assertRegex(source, r'text:function\(\w+\)\{return \w+\(this,function\(\w+\)\{return void 0===\w+\?\w+\.text\(this\):this\.empty\(\)'
+                                 r'\.each\(function\(\)\{[^}]*textContent=\w+\)\}\)\},null,\w+,arguments\.length\)\}',
+                         msg='the vendored jQuery no longer passes arguments.length to access() from text()')
+        access = re.compile(r'else if\(void 0!==\w+&&\(\w+=!0,.*?return \w+\?\w+:\w+\?\w+\.call\(\w+\):', flags=re.S)
+        self.assertRegex(source, access, msg='the vendored jQuery no longer skips the setter and returns the object for an undefined value')
 
     def test_the_wide_variant_of_the_arguments_shows_above_768_px(self):
         """AC-9019-7 (controle): a regra entregue esconde a variante larga dos argumentos até 768 px e a estreita acima de 768 px, e cada template traz a classe da sua variante."""
