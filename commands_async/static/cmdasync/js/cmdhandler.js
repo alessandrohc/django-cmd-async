@@ -10,6 +10,23 @@ function cmdasyncTextNode(value) {
     return document.createTextNode(value === null || value === undefined ? '' : String(value));
 }
 
+/**
+ * Tells the `task` of a status answer that can be followed from one that cannot.
+ *
+ * What follows an answer reads two fields of its task: `id` builds the next query (`status/<id>`) and `ready` decides
+ * whether to ask again. The server sends `async_result.id` (a text) and `async_result.ready()` (a boolean), so anything
+ * else is not its task. Read by the truth of its value, a `task` with no `ready` (or a null one) keeps the screen in
+ * queries that never end, a `ready` that is a text, a number, a list or an object releases the screen while the task still
+ * runs, and a `task` with no text `id` asks for `status/undefined`, `status/null` or `status/5`.
+ *
+ * The `typeof` and `Array.isArray` clauses repeat what the `id` clause already refuses (a boolean, a text, a number or a
+ * list has no text `id`); they only say what a task is: a JSON object.
+ */
+function cmdasyncIsTask(task) {
+    return !!task && typeof task === 'object' && !Array.isArray(task)
+        && typeof task.id === 'string' && task.id !== '' && typeof task.ready === 'boolean';
+}
+
 cmdasyncform = {
     // How long (ms) a status query, and the workers probe, waits for an answer before it is cut and told as a network
     // failure ('network'); 0 turns the cut off, as in jQuery. The default lives here and not in init(): a host that
@@ -100,9 +117,10 @@ cmdasyncform = {
         req.done(function (data, textStatus, xhr) {
             var task = data && data.task;
             // A response with no task cannot be followed: a 204 or a 304 (jQuery resolves them as a success with no data), or
-            // JSON whose `task` is missing or is not a JSON object, which a layer in front of the server can answer. It ends the
-            // query as the failure `server`: before `updating` (it is no «not ready» answer) and with no new query scheduled.
-            if (!task || typeof task !== 'object' || Array.isArray(task)) {
+            // JSON whose `task` is missing, is not a JSON object, or is an object with no text `id` or no boolean `ready` (see
+            // cmdasyncIsTask), which a layer in front of the server can answer. It ends the query as the failure `server`: before
+            // `updating` (it is no «not ready» answer) and with no new query scheduled.
+            if (!cmdasyncIsTask(task)) {
                 self.query_failed(xhr, textStatus);
                 return;
             }
@@ -178,7 +196,8 @@ cmdasyncform = {
         if (xhr.status === 0)
             return 'network';
         // any other failure: an HTTP error (400, 401, 405, 429, a 5xx, an HTML error page), a 2xx with a body that is not JSON,
-        // or a response that carries no task (a 204 or a 304, or JSON whose `task` is missing or is not an object: see .done).
+        // or a response that carries no task (a 204 or a 304, or JSON whose `task` is missing, is not an object, or has no text
+        // `id` or no boolean `ready`: see .done).
         // The user needs the same thing for all of them, so the reason is not told by status
         return 'server';
     },

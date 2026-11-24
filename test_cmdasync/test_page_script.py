@@ -200,13 +200,13 @@ class StatusFailureTest(ScenarioTestCase):
 
 
 class StatusFailureTextTest(ScenarioTestCase):
-    """O aviso da consulta de estado que falha por erro de servidor ou de rede (AC-9018-1, AC-8961-2, #8961 e #9018)."""
+    """O aviso da consulta de estado que falha por erro de servidor ou de rede (AC-9107-1, AC-8961-2, #8961, #9018 e #9107)."""
 
     # os erros HTTP que não são 403, 404 nem o 200 que não é JSON; o `html202` é um 2xx com corpo HTML (o que o jQuery real manda ao `.fail`)
     SERVER_KINDS = ('http400', 'http401', 'http405', 'http429', 'http500', 'http503', 'html502', 'html202')
 
     def test_a_status_query_that_fails_with_an_http_error_tells_the_server_could_not_answer(self):
-        """AC-9018-1 (controle): o erro HTTP da consulta de estado que não é 403, 404 nem o login mostra o texto de erro de servidor (a metade que já valia; a resposta sem tarefa é o `NoTaskResponseTest`)."""
+        """AC-9107-1 (controle): o erro HTTP da consulta de estado que não é 403, 404 nem o login mostra o texto de erro de servidor (a metade que já valia; a resposta sem tarefa é o `NoTaskResponseTest`)."""
         self.assertNotEqual(self.texts['serverFailureText'], self.texts['networkFailureText'], msg='precondition: the two texts differ')
         for kind in self.SERVER_KINDS:
             with self.subTest(failure=kind):
@@ -230,7 +230,7 @@ class StatusFailureTextTest(ScenarioTestCase):
         self.assertEqual(found['later']['statusRequests'], 1, msg='a new query went out after the failure')
 
     def test_the_notice_also_shows_when_the_follow_up_was_interrupted(self):
-        """AC-9018-1 (controle), AC-8961-2: com o acompanhamento interrompido (Cancel ou troca de comando), a consulta em voo que falha mostra o mesmo aviso (a metade que já valia)."""
+        """AC-9107-1 (controle), AC-8961-2: com o acompanhamento interrompido (Cancel ou troca de comando), a consulta em voo que falha mostra o mesmo aviso (a metade que já valia)."""
         cases = []
         for trigger in ('cancel', 'switch'):
             for waits in (2, 3):
@@ -553,10 +553,10 @@ class BadFormErrorsTest(ScenarioTestCase):
 
 
 class FailureReasonTest(ScenarioTestCase):
-    """O motivo que o handler avisa no evento `update-failed` (AC-9018-2 e AC-8961-10, #8961 e #9018)."""
+    """O motivo que o handler avisa no evento `update-failed` (AC-9107-2 e AC-8961-10, #8961, #9018 e #9107)."""
 
     def test_the_handler_tells_a_server_or_a_network_reason_before_it_releases_the_screen(self):
-        """AC-9018-2 (controle): a consulta de estado que falha por erro HTTP avisa o motivo `server`, a que falha sem resposta ou por tempo, `network`, e o `update-failed` sai antes do `update-finish`."""
+        """AC-9107-2 (controle): a consulta de estado que falha por erro HTTP avisa o motivo `server`, a que falha sem resposta ou por tempo, `network`, e o `update-failed` sai antes do `update-finish`."""
         for kind, reason in (('http400', 'server'), ('http429', 'server'), ('http500', 'server'), ('html502', 'server'),
                              ('html202', 'server'), ('network', 'network'), ('timeout', 'network')):
             with self.subTest(failure=kind):
@@ -894,7 +894,7 @@ class FailureMidwayTest(ScenarioTestCase):
 
 
 class NoTaskResponseTest(ScenarioTestCase):
-    """A consulta de estado que recebe uma resposta sem tarefa (o 204, o 304, um 2xx com JSON sem um objeto `task`) termina como a falha `server` (AC-9018-1 a -4, #9018)."""
+    """A consulta de estado que recebe uma resposta sem tarefa (o 204, o 304, um 2xx com JSON sem um objeto `task` com `id` em texto não vazio e `ready` booleano) termina como a falha `server` (AC-9107-1 a -4 e -8, #9018 e #9107)."""
 
     def following(self, before, context, msg=''):
         """A precondição de cada caso: a consulta que vai receber a resposta está em voo, a tela segue presa e, na 2ª e na 3ª consulta ativas, o painel guardava o texto de execução."""
@@ -908,8 +908,12 @@ class NoTaskResponseTest(ScenarioTestCase):
         """Cada forma de resposta sem tarefa em cada contexto (a lista vem do harness), com a precondição conferida; `check(nome, contexto, cenário)` afirma."""
         kinds = self.constants['noTaskKinds']
         contexts = self.constants['noTaskContexts']
-        self.assertEqual(len(kinds), 11, msg='precondition: the eleven forms of a response with no task')
-        for form in ('s204', 's304', 'json_taskarray', 'json_taskstring', 'json_tasknumber', 'json_null'):
+        self.assertEqual(len(kinds), 28, msg='precondition: the eleven forms of #9018 and the seventeen of #9107 (a task that is an object but not the one the server sends)')
+        for form in ('s204', 's304', 'json_taskarray', 'json_taskstring', 'json_tasknumber', 'json_null',
+                     'json_taskempty', 'json_taskbool_true', 'json_taskbool_false', 'json_task_noid', 'json_task_idnull', 'json_task_idempty',
+                     'json_task_idnumber', 'json_task_idbool', 'json_task_idlist', 'json_task_idobject', 'json_task_noready',
+                     'json_task_readynull', 'json_task_readystring', 'json_task_readynumber', 'json_task_readylist',
+                     'json_task_readyobject', 'json_task_terminal_noid'):
             self.assertIn(form, kinds, msg='precondition: the sweep has the form {0}'.format(form))
         self.assertEqual(len(contexts), 7, msg='precondition: three active contexts and four interrupted ones')
         for kind in kinds:
@@ -921,7 +925,7 @@ class NoTaskResponseTest(ScenarioTestCase):
                     check(name, context, found)
 
     def test_a_response_with_no_task_tells_the_server_could_not_answer(self):
-        """AC-9018-1: a consulta de estado que recebe uma resposta sem tarefa (o 204, o 304, ou um 2xx com JSON cujo `task` falta ou não é um objeto) mostra o texto de erro de servidor, com o acompanhamento ativo ou interrompido com a consulta em voo."""
+        """AC-9107-1: a consulta de estado que recebe uma resposta sem tarefa (o 204, o 304, ou um 2xx com JSON cujo `task` falta, não é um objeto ou é um objeto sem `id` em texto não vazio ou sem `ready` booleano) mostra o texto de erro de servidor, com o acompanhamento ativo ou interrompido com a consulta em voo (um caso por forma e por contexto)."""
         def check(name, context, found):
             self.assertEqual(found['after']['uncaught'], [], msg='the status callback raised. {0}'.format(name))
             self.assertAlertEmpty(found['before'], msg='precondition: no notice before the response. {0}'.format(name))
@@ -929,14 +933,14 @@ class NoTaskResponseTest(ScenarioTestCase):
         self.sweep(check)
 
     def test_a_response_with_no_task_tells_the_reason_before_it_releases_the_screen(self):
-        """AC-9018-2: a consulta de estado que recebe uma resposta sem tarefa avisa o `update-failed` com o motivo `server` e depois o `update-finish`."""
+        """AC-9107-2: a consulta de estado que recebe uma resposta sem tarefa avisa o `update-failed` com o motivo `server` e depois o `update-finish`."""
         def check(name, context, found):
             self.assertEqual(found['after']['uncaught'], [], msg='the status callback raised. {0}'.format(name))
             self.assertEqual(found['log'], ['failed:server', 'finish'], msg=name)
         self.sweep(check)
 
     def test_a_response_with_no_task_stops_the_query_and_releases_the_screen_with_an_empty_panel(self):
-        """AC-9018-3: a consulta de estado que recebe uma resposta sem tarefa para de consultar e solta a tela, com o painel de saída vazio e o Copy escondido."""
+        """AC-9107-3: a consulta de estado que recebe uma resposta sem tarefa para de consultar e solta a tela, com o painel de saída vazio e o Copy escondido (nos casos sem ouvinte de host que escreva no painel: o texto de host é outro critério)."""
         def check(name, context, found):
             after, later = found['after'], found['later']
             self.assertEqual(after['uncaught'], [], msg='the status callback raised. {0}'.format(name))
@@ -953,7 +957,7 @@ class NoTaskResponseTest(ScenarioTestCase):
         self.sweep(check)
 
     def test_a_response_with_no_task_does_not_notify_updating(self):
-        """AC-9018-4: a consulta de estado que recebe uma resposta sem tarefa, com o acompanhamento ativo, não avisa os ouvintes do `updating`."""
+        """AC-9107-4: a consulta de estado que recebe uma resposta sem tarefa, com o acompanhamento ativo, não avisa os ouvintes do `updating`."""
         checked = []
 
         def check(name, context, found):
@@ -964,7 +968,7 @@ class NoTaskResponseTest(ScenarioTestCase):
             self.assertEqual(found['before']['updatingCalls'], waits, msg='precondition: one notification per answered query. {0}'.format(name))
             self.assertEqual(found['after']['updatingCalls'], waits, msg='updating was notified for a response with no task. {0}'.format(name))
         self.sweep(check)
-        self.assertEqual(len(checked), 33, msg='precondition: eleven forms in the three active contexts')
+        self.assertEqual(len(checked), 84, msg='precondition: twenty-eight forms in the three active contexts')
 
     def test_a_host_listener_that_raises_does_not_keep_the_screen_stuck_on_a_response_with_no_task(self):
         # Robustez (sem ID; o sem-tarefa passa pelo mesmo caminho da falha, que guarda isso no AC-9005-3): o ouvinte de host de `update-failed`
@@ -979,21 +983,30 @@ class NoTaskResponseTest(ScenarioTestCase):
                 self.assertEqual(found['log'], ['failed:server', 'finish'], msg=name)
 
     def test_the_text_a_host_listener_writes_in_the_panel_stays_on_a_response_with_no_task(self):
-        # Robustez (sem ID; o AC-9005-2 guarda isso para a falha): o texto que um ouvinte de host de `update-failed` ou de `update-finish`
-        # escreve no painel fica quando a tela é solta.
-        for host in ('writes-failed', 'writes-finish'):
-            name = 'notask:s204:active:2:{0}'.format(host)
-            with self.subTest(scenario=name):
-                found = self.scenario(name)
-                self.following(found['before'], 'active:2', name)
-                after = found['after']
-                self.assertEqual(after['uncaught'], [], msg=name)
-                self.assertAtRest(after, msg=name)
-                self.assertEqual(after['output'], self.constants['midwayHostText'], msg='the text the host wrote in the panel was erased. {0}'.format(name))
+        """AC-9107-8: o texto que um ouvinte de host de `update-failed` ou de `update-finish` escreve no painel fica quando a consulta de estado, com o acompanhamento ativo, recebe uma resposta sem tarefa e a tela é solta (o painel é esvaziado antes dos ouvintes). Um caso por tipo de resposta, por consulta ativa e por ouvinte."""
+        kinds = self.constants['noTaskHostKinds']
+        contexts = self.constants['activeContexts']
+        self.assertEqual(sorted(kinds), ['json_empty', 'json_task_noid', 'json_task_noready', 's204'],
+                         msg='precondition: the 204, JSON with no task, a task with no id and a task with no ready')
+        self.assertEqual(contexts, ['active:0', 'active:1', 'active:2'], msg='precondition: the three active queries')
+        checked = []
+        for kind in kinds:
+            for context in contexts:
+                for host in ('writes-failed', 'writes-finish'):
+                    name = 'notask:{0}:{1}:{2}'.format(kind, context, host)
+                    checked.append(name)  # antes dos asserts: a conta dos casos não pode depender de eles passarem
+                    with self.subTest(scenario=name):
+                        found = self.scenario(name)
+                        self.following(found['before'], context, name)
+                        after = found['after']
+                        self.assertEqual(after['uncaught'], [], msg=name)
+                        self.assertAtRest(after, msg=name)
+                        self.assertEqual(after['output'], self.constants['midwayHostText'], msg='the text the host wrote in the panel was erased. {0}'.format(name))
+        self.assertEqual(len(checked), 24, msg='precondition: four kinds, three active queries and two listeners')
 
     def test_the_command_sent_after_a_response_with_no_task_is_followed_to_the_end(self):
         # Robustez (sem ID; o AC-9005-4 guarda isso para a falha): depois da resposta sem tarefa o comando seguinte mostra a saída e solta a tela.
-        for kind in ('s204', 's304', 'json_empty', 'json_taskarray'):
+        for kind in ('s204', 's304', 'json_empty', 'json_taskarray', 'json_taskempty'):
             name = 'notask:{0}:active:2:next'.format(kind)
             with self.subTest(scenario=name):
                 found = self.scenario(name)
@@ -1025,6 +1038,83 @@ class NoTaskResponseTest(ScenarioTestCase):
         self.assertEqual(after['locations'], [self.login_target])
         self.assertAtRest(after, msg='the screen was left stuck: update-finish never fired')
         self.assertAlertEmpty(after, msg='the login redirect must not show the server notice')
+
+
+class WellFormedTaskTest(ScenarioTestCase):
+    """A resposta da consulta de estado que É a tarefa (`task` com `id` em texto não vazio e `ready` booleano, como o servidor manda) continua sendo a tarefa, e não a falha `server` (AC-9107-5, -6 e -7, #9107).
+
+    São `SHALL CONTINUE TO` (controles): passam no código de antes do #9107 e a mutação prova que discriminam: a conferência que exige `failed` ou
+    `output` falha nas formas mínimas, a consulta seguinte com o `id` da consulta anterior falha no `other-9` e a resposta bem formada
+    interrompida que vai ao `query_failed` mostra o aviso.
+    """
+
+    # a precondição é a mesma da varredura da resposta sem tarefa (a consulta que recebe a resposta está em voo e a tela segue presa)
+    following = NoTaskResponseTest.following
+
+    def test_a_response_that_is_a_task_is_not_the_failure_server_while_following(self):
+        """AC-9107-5 (controle): com o acompanhamento ativo, o `task` com `id` em texto não vazio e `ready` booleano, com ou sem `failed`, `output`, `traceback` e outros campos, é a tarefa: a não pronta segue acompanhada, a pronta mostra a saída (ou o traceback) e solta a tela, e nenhuma delas mostra o aviso de erro de servidor nem avisa `update-failed`."""
+        expected_output = {'min_ready': '', 'full_ready': 'OUT', 'extra_ready': 'OUT', 'failed_task': 'TB'}
+        kinds = self.constants['wellFormedKinds']
+        self.assertEqual(sorted(kinds), sorted(['min_notready', 'extra_notready', 'other_id', 'other_id_extra', 'min_ready', 'full_ready', 'extra_ready', 'failed_task']),
+                         msg='precondition: the well-formed forms of the harness')
+        checked = []
+        for kind in kinds:
+            for context in self.constants['activeContexts']:
+                name = 'wellformed:{0}:{1}'.format(kind, context)
+                checked.append(name)  # antes dos asserts: a conta dos casos não pode depender de eles passarem
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.following(found['before'], context, name)
+                    after = found['after']
+                    waits = int(context.split(':')[1])
+                    self.assertEqual(after['uncaught'], [], msg='the status callback raised. {0}'.format(name))
+                    self.assertAlertEmpty(after, msg='the server notice was shown for a task. {0}'.format(name))
+                    if kind in expected_output:
+                        self.assertAtRest(after, msg='a finished task did not release the screen. {0}'.format(name))
+                        self.assertEqual(after['output'], expected_output[kind], msg='the output of the task was not shown. {0}'.format(name))
+                        self.assertEqual(found['log'], ['finish'], msg='a task that finished notified update-failed. {0}'.format(name))
+                    else:
+                        self.assertTrue(after['execute']['disabled'], msg='a task that is not ready released the screen. {0}'.format(name))
+                        self.assertEqual(after['output'], self.texts['runningText'], msg='the running text was lost. {0}'.format(name))
+                        self.assertEqual(after['updatingCalls'], waits + 1, msg='the answer was not followed as a task. {0}'.format(name))
+                        self.assertEqual(found['log'], [], msg='a task that is not ready notified an event of the end. {0}'.format(name))
+        self.assertEqual(len(checked), 24, msg='precondition: eight forms and three active queries')
+
+    def test_the_next_query_asks_for_the_id_the_response_carried(self):
+        """AC-9107-6 (controle): com o acompanhamento ativo, a resposta com `ready` falso e `id` em texto não vazio é seguida da consulta de `status/` com o `id` que ela trouxe, e não com o da consulta anterior."""
+        for kind in ('other_id', 'other_id_extra'):
+            for context in self.constants['activeContexts']:
+                name = 'wellformed:{0}:{1}'.format(kind, context)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.following(found['before'], context, name)
+                    asked_before, asked = found['statusUrlsBefore'], found['statusUrls']
+                    self.assertEqual(set(asked_before), {'status/t1'}, msg='precondition: the earlier queries asked for the task of the form. {0}'.format(name))
+                    self.assertEqual(asked[:len(asked_before)], asked_before, msg=name)
+                    self.assertEqual(asked[len(asked_before):], ['status/other-9'],
+                                     msg='the next query did not ask for the id the response carried. {0}'.format(name))
+                    self.assertEqual(found['later']['uncaught'], [], msg=name)
+
+    def test_a_response_that_is_a_task_after_the_follow_up_was_interrupted_shows_no_notice_and_no_failure(self):
+        """AC-9107-7 (controle): com o acompanhamento interrompido (Cancel ou troca de comando, com a 1ª ou a 2ª consulta em voo), a resposta que é a tarefa, pronta ou não, solta a tela sem o aviso de erro de servidor e sem avisar `update-failed` (só o `update-finish`)."""
+        interrupted = [context for context in self.constants['noTaskContexts'] if not context.startswith('active:')]
+        self.assertEqual(interrupted, ['cancel:first', 'cancel:second', 'switch:first', 'switch:second'],
+                         msg='precondition: Cancel and the command switch, with the first and the second query in flight')
+        checked = []
+        for kind in ('min_notready', 'full_ready'):
+            for context in interrupted:
+                name = 'wellformed:{0}:{1}'.format(kind, context)
+                checked.append(name)  # antes dos asserts: a conta dos casos não pode depender de eles passarem
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.following(found['before'], context, name)
+                    after = found['after']
+                    self.assertEqual(after['uncaught'], [], msg=name)
+                    self.assertAtRest(after, msg='the interrupted follow-up did not release the screen. {0}'.format(name))
+                    self.assertEqual(after['output'], '', msg='the panel kept a text after the interruption. {0}'.format(name))
+                    self.assertAlertEmpty(after, msg='the server notice was shown for a task after the interruption. {0}'.format(name))
+                    self.assertEqual(found['log'], ['finish'], msg='the release notified update-failed or did not notify update-finish. {0}'.format(name))
+        self.assertEqual(len(checked), 8, msg='precondition: two answers, two ways to interrupt and two queries in flight')
 
 
 class RevokeWindowTest(ScenarioTestCase):

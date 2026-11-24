@@ -29,7 +29,7 @@ const STATUS_FAILURES = {
     http429: {status: 429, body: 'Too Many Requests'},
     http500: {status: 500, body: '<html>boom</html>'},
     network: {status: 0, body: ''},
-    // #8961 (AC-8961-1, hoje AC-9018-1): as outras falhas HTTP da consulta; o `html202` é um 2xx que não é 200 nem 204 com corpo que não é JSON
+    // #8961 (AC-8961-1, hoje AC-9107-1): as outras falhas HTTP da consulta; o `html202` é um 2xx que não é 200 nem 204 com corpo que não é JSON
     // (o que o jQuery manda ao `.fail` como `parsererror`; o 204 e o 304 são sucesso no jQuery e chegam ao `.done` sem `task`: estão em
     // `NOTASK_RESPONSES`, abaixo, e não nesta lista, #9018)
     http400: jsonResponse(400, {task: null}),
@@ -39,10 +39,17 @@ const STATUS_FAILURES = {
     html202: {status: 202, body: '<html>accepted</html>'},
 };
 
-// #9018 (AC-9018-1 a -4): as respostas da consulta de estado que o navegador entrega como SUCESSO e que não trazem a tarefa (o `task` falta
-// ou não é um objeto JSON). Ficam fora de STATUS_FAILURES de propósito: o `.done` as recebe, não o `.fail`, e o AC-9005-5 (`SHALL CONTINUE
-// TO` não avisar `updating`) só vale para as falhas. `{"task": "abc"}`, `{"task": 5}` e `{"task": []}` (um texto, um número e uma lista,
-// como o AC-9018-1 os enumera) provam que a conferência é «não é um objeto JSON», e não só «é falso» nem «não é um texto».
+// #9018 e #9107 (AC-9107-1 a -4, que substituem AC-9018-1 a -4): as respostas da consulta de estado que o navegador entrega como SUCESSO e
+// que não trazem a tarefa: o `task` falta, não é um objeto JSON, ou é um objeto sem `id` em texto não vazio ou sem `ready` booleano (o que
+// o servidor manda: `views.py:492-495`). Ficam fora de STATUS_FAILURES de propósito: o `.done` as recebe, não o `.fail`, e o AC-9005-5
+// (`SHALL CONTINUE TO` não avisar `updating`) só vale para as falhas.
+// As 11 primeiras são as do #9018. Com o predicado do #9107 (`cmdasyncIsTask`), só o `!task` (o `null` lança em `null.id` sem ele) e a
+// conferência do `id` e do `ready` decidem sozinhos: `{"task": true}`, um texto, um número e uma lista também têm `id` indefinido, então o
+// `typeof task !== 'object'` e o `Array.isArray` do #9018 ficam como cláusulas explícitas e redundantes (mutantes equivalentes m17b e m17c do
+// plano): esses casos são controles do texto do AC-9107-1 (passam no código de antes e no de depois), não provam a cláusula.
+// As 17 novas, do #9107, um caso por tipo que o AC-9107-1 nomeia: `{"task": {}}` (o do ticket); `task` booleano; `id` ausente, nulo, vazio,
+// número, booleano, lista e objeto (com `ready: false`); `ready` ausente, nulo, texto, número, lista e objeto (com `id: 't1'`; os de
+// `ready` «verdadeiro» levam `output`, que torna visível a tela solta com a tarefa rodando); e a terminal sem `id`, que funcionava antes.
 const NOTASK_RESPONSES = {
     s204: {status: 204},
     s304: {status: 304},
@@ -55,7 +62,42 @@ const NOTASK_RESPONSES = {
     json_null: {status: 200, body: 'null'},
     json_array: {status: 200, body: '[]'},
     json202: {status: 202, body: {}},
+    // #9107: o `task` é um objeto (ou um booleano), mas não é a tarefa que o servidor manda
+    json_taskempty: {status: 200, body: {task: {}}},
+    json_taskbool_true: {status: 200, body: {task: true}},
+    json_taskbool_false: {status: 200, body: {task: false}},
+    json_task_noid: {status: 200, body: {task: {ready: false}}},
+    json_task_idnull: {status: 200, body: {task: {id: null, ready: false}}},
+    json_task_idempty: {status: 200, body: {task: {id: '', ready: false}}},
+    json_task_idnumber: {status: 200, body: {task: {id: 5, ready: false}}},
+    json_task_idbool: {status: 200, body: {task: {id: true, ready: false}}},
+    json_task_idlist: {status: 200, body: {task: {id: ['t1'], ready: false}}},
+    json_task_idobject: {status: 200, body: {task: {id: {}, ready: false}}},
+    json_task_noready: {status: 200, body: {task: {id: 't1'}}},
+    json_task_readynull: {status: 200, body: {task: {id: 't1', ready: null}}},
+    json_task_readystring: {status: 200, body: {task: {id: 't1', ready: 'false', output: 'OUT'}}},
+    json_task_readynumber: {status: 200, body: {task: {id: 't1', ready: 1, output: 'OUT'}}},
+    json_task_readylist: {status: 200, body: {task: {id: 't1', ready: [], output: 'OUT'}}},
+    json_task_readyobject: {status: 200, body: {task: {id: 't1', ready: {}, output: 'OUT'}}},
+    json_task_terminal_noid: {status: 200, body: {task: {ready: true, failed: false, output: 'OUT'}}},
 };
+// #9107 (AC-9107-5, -6 e -7): as respostas que SÃO a tarefa (`id` em texto não vazio e `ready` booleano), nas formas que o servidor manda
+// (`views.py:492-495`: com `failed` e `output` ou `traceback`) e nas mínimas ou com campos a mais, que a conferência tem de continuar
+// aceitando. `other_id` traz o `id` de OUTRA tarefa para provar que a consulta seguinte usa o `id` da resposta (e não o da anterior, `t1`).
+const WELLFORMED_RESPONSES = {
+    min_notready: {status: 200, body: {task: {id: 't1', ready: false}}},
+    extra_notready: {status: 200, body: {task: {id: 't1', ready: false, foo: 1}}},
+    other_id: {status: 200, body: {task: {id: 'other-9', ready: false}}},
+    other_id_extra: {status: 200, body: {task: {id: 'other-9', ready: false, foo: 1, command: {name: 'x'}}}},
+    min_ready: {status: 200, body: {task: {id: 't1', ready: true}}},
+    full_ready: {status: 200, body: {task: {id: 't1', ready: true, failed: false, output: 'OUT'}}},
+    extra_ready: {status: 200, body: {task: {id: 't1', ready: true, failed: false, output: 'OUT', foo: 1, command: {name: 'x'}}}},
+    failed_task: {status: 200, body: {task: {id: 't1', ready: true, failed: true, traceback: 'TB'}}},
+};
+// Os tipos de resposta sem tarefa em que o texto de um ouvinte de host fica no painel (AC-9107-8): o 204, o JSON sem `task`, o `task` sem
+// `id` e o `task` sem `ready`; só com o acompanhamento ativo (como o AC-9005-2).
+const NOTASK_HOST_KINDS = ['s204', 'json_empty', 'json_task_noid', 'json_task_noready'];
+const ACTIVE_CONTEXTS = ['active:0', 'active:1', 'active:2'];
 // Onde a resposta sem tarefa chega: com o acompanhamento ativo (a consulta que a recebe é a 1ª, a 2ª ou a 3ª) e interrompido (Cancel ou
 // troca de comando) com a 1ª ou a 2ª consulta em voo.
 const NOTASK_CONTEXTS = ['active:0', 'active:1', 'active:2', 'cancel:first', 'cancel:second', 'switch:first', 'switch:second'];
@@ -199,7 +241,7 @@ function midwayFailure(kind, waits, options) {
     return result;
 }
 
-// Conta os avisos do evento `updating` (AC-9018-5, AC-8967-5 e AC-9018-4) com um ouvinte de host registrado DEPOIS do da página;
+// Conta os avisos do evento `updating` (AC-9018-5, AC-8967-5 e AC-9107-4) com um ouvinte de host registrado DEPOIS do da página;
 // toda `world.state()` passa a trazer `updatingCalls`, a contagem até aquele momento.
 function countUpdating(world) {
     let calls = 0;
@@ -291,8 +333,13 @@ function followNext(world, result) {
 // consulta em voo). `before` é a tela logo antes da resposta (nos interrompidos, depois do clique), `after` logo depois e `later` 5 s depois;
 // `log` é a ordem dos eventos `update-failed` e `update-finish` que um ouvinte de host registrou; `options.world` são as opções do mundo,
 // `options.host` registra um ouvinte de host ('throws', 'writes-failed' ou 'writes-finish') e `options.next` envia o comando seguinte.
+// #9107: `kind` também pode ser uma forma de WELLFORMED_RESPONSES (a resposta que É a tarefa, AC-9107-5 a -7: o mesmo roteiro, com o
+// acompanhamento ativo ou interrompido); `statusUrlsBefore` e `statusUrls` são os endereços das consultas de estado até a resposta e
+// até 5 s depois dela (AC-9107-6: a consulta seguinte usa o `id` da resposta).
 function noTaskResponse(kind, context, options) {
     options = options || {};
+    const answer = NOTASK_RESPONSES[kind] || WELLFORMED_RESPONSES[kind];
+    if (!answer) throw new Error('harness: unknown response kind ' + kind);
     const parts = context.split(':');
     const interrupt = parts[0] === 'cancel' || parts[0] === 'switch' ? parts[0] : null;
     const world = createWorld(Object.assign({commandsList: interrupt === 'switch'}, options.world));
@@ -316,10 +363,12 @@ function noTaskResponse(kind, context, options) {
         world.advance(1000); // a consulta que vai receber a resposta sai (a 1ª já está em voo desde o envio)
     }
     const result = {before: world.state()};
-    world.answerStatus(NOTASK_RESPONSES[kind]);
+    result.statusUrlsBefore = world.statusRequests().map(function (request) { return request.url; });
+    world.answerStatus(answer);
     result.after = world.state();
     world.advance(5000);
     result.later = world.state();
+    result.statusUrls = world.statusRequests().map(function (request) { return request.url; });
     result.log = log;
     // o comando seguinte só se envia com a tela liberada (o botão Execute habilitado): numa tela presa o clique não faz nada e o teste
     // lê `after` para dizer isso, em vez de o harness lançar «nenhuma consulta em voo»
@@ -981,7 +1030,7 @@ function timeoutInterrupted(trigger) {
     return result;
 }
 
-// AC-9018-2 (antes AC-8961-8) e AC-8961-10: os ouvintes de um host veem o motivo e, depois dele, o `update-finish`.
+// AC-9107-2 (antes AC-9018-2 e AC-8961-8) e AC-8961-10: os ouvintes de um host veem o motivo e, depois dele, o `update-finish`.
 function failureReasons(kind) {
     const world = createWorld();
     const log = [];
@@ -1098,20 +1147,33 @@ register('midway:2:http500:writes-finish', function () { return midwayFailure('h
 });
 register('midway:2:http500:nospace', function () { return midwayFailure('http500', 2, {world: TEMPLATES.nospace}); });
 
-// #9018: a resposta sem tarefa, de cada forma de NOTASK_RESPONSES em cada um dos NOTASK_CONTEXTS (AC-9018-1 a -4)
+// #9018 e #9107: a resposta sem tarefa, de cada forma de NOTASK_RESPONSES em cada um dos NOTASK_CONTEXTS (AC-9107-1 a -4)
 Object.keys(NOTASK_RESPONSES).forEach(function (kind) {
     NOTASK_CONTEXTS.forEach(function (context) {
         register('notask:' + kind + ':' + context, function () { return noTaskResponse(kind, context); });
     });
 });
-// ... com o ouvinte de host que lança e com os que escrevem no painel (o que a falha promete, herdado por construção, sem ID), com o comando
-// seguinte e com o template sem o espaço do aviso (robustez, sem ID)
+// #9107 (AC-9107-5, -6 e -7): a resposta que É a tarefa, de cada forma de WELLFORMED_RESPONSES em cada um dos NOTASK_CONTEXTS: com o
+// acompanhamento ativo (AC-9107-5 e -6) e interrompido com a consulta em voo (AC-9107-7)
+Object.keys(WELLFORMED_RESPONSES).forEach(function (kind) {
+    NOTASK_CONTEXTS.forEach(function (context) {
+        register('wellformed:' + kind + ':' + context, function () { return noTaskResponse(kind, context); });
+    });
+});
+// ... com o ouvinte de host que lança (robustez, sem ID: o sem-tarefa passa pelo mesmo caminho da falha, que guarda isso no AC-9005-3)
 register('notask:s204:active:2:throws', function () { return noTaskResponse('s204', 'active:2', {host: 'throws'}); });
 register('notask:json_empty:cancel:second:throws', function () { return noTaskResponse('json_empty', 'cancel:second', {host: 'throws'}); });
-['writes-failed', 'writes-finish'].forEach(function (host) {
-    register('notask:s204:active:2:' + host, function () { return noTaskResponse('s204', 'active:2', {host: host}); });
+// ... com os ouvintes de host que escrevem no painel (AC-9107-8: o texto fica; um caso por tipo de resposta sem tarefa em NOTASK_HOST_KINDS,
+// nas três consultas ativas e com os dois ouvintes)
+NOTASK_HOST_KINDS.forEach(function (kind) {
+    ACTIVE_CONTEXTS.forEach(function (context) {
+        ['writes-failed', 'writes-finish'].forEach(function (host) {
+            register('notask:' + kind + ':' + context + ':' + host, function () { return noTaskResponse(kind, context, {host: host}); });
+        });
+    });
 });
-['s204', 's304', 'json_empty', 'json_taskarray'].forEach(function (kind) {
+// ... com o comando seguinte e com o template sem o espaço do aviso (robustez, sem ID)
+['s204', 's304', 'json_empty', 'json_taskarray', 'json_taskempty'].forEach(function (kind) {
     register('notask:' + kind + ':active:2:next', function () { return noTaskResponse(kind, 'active:2', {next: true}); });
 });
 register('notask:s204:active:2:nospace', function () { return noTaskResponse('s204', 'active:2', {world: TEMPLATES.nospace}); });
@@ -1298,7 +1360,7 @@ register('bad400:field-next', bad400FieldNext);
         register('submit:' + trigger + ':fail:' + kind, function () { return submitInterruptedFailure(trigger, kind); });
     });
 });
-// AC-9018-2 (antes AC-8961-8) e AC-8961-10: o motivo que os ouvintes do evento recebem
+// AC-9107-2 (antes AC-9018-2 e AC-8961-8) e AC-8961-10: o motivo que os ouvintes do evento recebem
 ['http400', 'http429', 'http500', 'html502', 'html202', 'network', 'timeout', 'http403', 'http404', 'html200'].forEach(function (kind) {
     register('reasons:' + kind, function () { return failureReasons(kind); });
 });
@@ -1441,9 +1503,13 @@ process.stdout.write(JSON.stringify({
         statusFailureKinds: Object.keys(STATUS_FAILURES),
         midwayKinds: MIDWAY_KINDS,
         midwayHostText: MIDWAY_HOST_TEXT,
-        // #9018: as formas de resposta sem tarefa (a lista é tirada daqui) e os contextos em que chegam
+        // #9018 e #9107: as formas de resposta sem tarefa (a lista é tirada daqui), os contextos em que chegam, as formas que SÃO a tarefa
+        // (AC-9107-5 a -7) e os tipos de resposta sem tarefa do texto de host (AC-9107-8)
         noTaskKinds: Object.keys(NOTASK_RESPONSES),
         noTaskContexts: NOTASK_CONTEXTS,
+        wellFormedKinds: Object.keys(WELLFORMED_RESPONSES),
+        noTaskHostKinds: NOTASK_HOST_KINDS,
+        activeContexts: ACTIVE_CONTEXTS,
         // #9017: as formas do 400 sem os erros do formulário (a lista é tirada daqui: uma forma nova entra sozinha nos testes) e os contextos
         bad400NoField: Object.keys(BAD400_NOFIELD),
         bad400Field: Object.keys(BAD400_FIELD),

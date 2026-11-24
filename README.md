@@ -256,7 +256,8 @@ released the form with no text, and the user could not tell the failure from a t
 `forbidden` (`403`), `not-found` (`404`), `network` (no answer at all: the network failed, or the query was cut at
 `query_timeout`) and `server` (any other failure: a `400`, `401`, `405`, `429`, a `5xx`, an HTML error page, a `2xx`
 with a body that is not JSON, or a response that carries no task: a `204` or a `304`, or a `2xx` whose JSON has no `task`
-object, which only a layer in front of the server, a proxy or a CDN, can answer). A host with a page of its own that
+object, or whose `task` object has no text `id` or no boolean `ready`, which only a layer in front of the server, a proxy
+or a CDN, or a host with a route of its own, can answer). A host with a page of its own that
 tells the reason by `if`/`else` should handle `server` and `network` too. The bundled page shows the text it publishes in `data-server-error-text` and
 `data-network-error-text` of `#task-panel` (in the catalog of the package, pt_BR included); a template that does not
 publish a text shows none, and the page still releases the form.
@@ -278,19 +279,25 @@ not get the change: collect the static files again.
 as a success with no data, and the handler used to read `data.task` on them and raise a `TypeError`, which left the
 screen stuck; a `2xx` whose JSON has no `task` object (`{}`, `null`, a list, `{"task": null}`, `{"task": "text"}`,
 `{"task": 5}`, `{"task": []}`) fired `updating` and then either raised a `TypeError` too or was read as a task that was
-not ready and went on asking for `status/undefined`. Now the handler tells such a response from a task (the `task` field must be a JSON object), and for any other
+not ready and went on asking for `status/undefined`. A `task` object that is not the one the server sends was read by the
+truth of its fields, so it did the same: with no `ready` (or a null one) the page asked again every second with no end,
+with no text `id` it asked for `status/undefined`, `status/null`, `status/` or `status/5`, and a `ready` that was a text,
+a number, a list or an object (`"false"`, `1`) released the screen while the task was still running. Now the handler
+tells such a response from a task (the `task` field must be a JSON object with a **text `id` that is not empty** and a
+**boolean `ready`**, which is what the server sends, with or without `failed`, `output`, `traceback` and any other field), and for any other
 one it does what it does for a failed query: it stops asking, empties the output panel, tells `update-failed` with the
 reason `server` and then `update-finish`, and does not fire `updating`. The bundled page shows the server notice, with
 the follow-up active or interrupted (an interrupted follow-up used to be released with no notice when the answer was
-JSON with no `task`). A host with a page of its own that listens to `update-failed` now receives `server` in these cases,
-where the screen used to stay stuck with no event. Two details for such a host: `failure_reason(xhr, textStatus)` is
+JSON with no `task`, or a `task` that was not one). A host with a page of its own that listens to `update-failed` now
+receives `server` in these cases, where the screen used to stay stuck with no event. A host with a route of its own for the
+status query that answers it with another shape of task (a `ready` that is not a boolean, an `id` that is not a text, or a
+terminal answer with no `id`) now gets the same notice: have it answer `{"task": {"id": "<text>", "ready": <true|false>, …}}`.
+Two details for such a host: `failure_reason(xhr, textStatus)` is
 now also called with the `xhr` of a success (a `2xx` or a `304`; `textStatus` is `success`, `nocontent` or `notmodified`),
 so an override that assumes a failure status should not trust `xhr.status`; and `query_failed(xhr, textStatus)`, the
 method that ends the query for a failure and for a response with no task, is a new public method of `cmdasyncform`. An
 empty `200` (no body) is **not** one of these: with `dataType` json jQuery sends it to the failure handler as a
-`parsererror` with status `200`, as it does for any `200` that is not JSON, so it still goes to the login. A task with
-a `task` object that has no `id` or `ready` is not covered either: the page asks for `status/undefined` until the user
-cancels.
+`parsererror` with status `200`, as it does for any `200` that is not JSON, so it still goes to the login.
 
 The notice says that **the last command sent may still be running**, and to check before running it again: the status
 query only exists once the task was launched, and the released form offers only Execute. The page does not show the id
