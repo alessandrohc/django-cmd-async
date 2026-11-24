@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-cmd-async"
-version = "2.3.0"
+version = "2.4.0"
 description = "Web execution of Django management commands asynchronously, through Celery."
 readme = "README.md"
 requires-python = ">=3.10"
