@@ -1,0 +1,1766 @@
+'use strict';
+/**
+ * Cenários da tela de comandos em node: cada um monta um mundo novo (world.js), conduz o usuário e as
+ * respostas do servidor e devolve o que a tela mostra. A saída é UM JSON na última linha do stdout;
+ * o teste de Python (test_page_script.py) afirma sobre ele, um método por critério.
+ *
+ * Uso: node scenarios.js
+ */
+const {createWorld, TEXTS, PAGE} = require('./world.js');
+
+const NOT_READY = {status: 200, body: {task: {id: 't1', ready: false, failed: false}}};
+const ready = function (output) {
+    return {status: 200, body: {task: {id: 't1', ready: true, failed: false, output: output}}};
+};
+const failedTask = function (traceback) {
+    return {status: 200, body: {task: {id: 't1', ready: true, failed: true, traceback: traceback}}};
+};
+const jsonResponse = function (status, body) {
+    return {status: status, body: body};
+};
+// O navegador segue o 302 do login_required e entrega o HTML do login com 200.
+const LOGIN_PAGE = {status: 200, body: '<html><title>Login</title></html>'};
+
+const STATUS_FAILURES = {
+    html200: LOGIN_PAGE,
+    html502: {status: 502, body: '<html>Bad Gateway</html>'},
+    http403: jsonResponse(403, {task: null}),
+    http404: jsonResponse(404, {task: null}),
+    http429: {status: 429, body: 'Too Many Requests'},
+    http500: {status: 500, body: '<html>boom</html>'},
+    network: {status: 0, body: ''},
+    // #8961 (AC-8961-1, hoje AC-9107-1): as outras falhas HTTP da consulta; o `html202` é um 2xx que não é 200 nem 204 com corpo que não é JSON
+    // (o que o jQuery manda ao `.fail` como `parsererror`; o 204 e o 304 são sucesso no jQuery e chegam ao `.done` sem `task`: estão em
+    // `NOTASK_RESPONSES`, abaixo, e não nesta lista, #9018)
+    http400: jsonResponse(400, {task: null}),
+    http401: {status: 401, body: ''},
+    http405: {status: 405, body: ''},
+    http503: jsonResponse(503, {task: null}),
+    html202: {status: 202, body: '<html>accepted</html>'},
+};
+
+// #9018 e #9107 (AC-9107-1 a -4, que substituem AC-9018-1 a -4): as respostas da consulta de estado que o navegador entrega como SUCESSO e
+// que não trazem a tarefa: o `task` falta, não é um objeto JSON, ou é um objeto sem `id` em texto não vazio ou sem `ready` booleano (o que
+// o servidor manda: `views.py:492-495`). Ficam fora de STATUS_FAILURES de propósito: o `.done` as recebe, não o `.fail`, e o AC-9005-5
+// (`SHALL CONTINUE TO` não avisar `updating`) só vale para as falhas.
+// As 11 primeiras são as do #9018. Com o predicado do #9107 (`cmdasyncIsTask`), só o `!task` (o `null` lança em `null.id` sem ele) e a
+// conferência do `id` e do `ready` decidem sozinhos: `{"task": true}`, um texto, um número e uma lista também têm `id` indefinido, então o
+// `typeof task !== 'object'` e o `Array.isArray` do #9018 ficam como cláusulas explícitas e redundantes (mutantes equivalentes m17b e m17c do
+// plano): esses casos são controles do texto do AC-9107-1 (passam no código de antes e no de depois), não provam a cláusula.
+// As 17 novas, do #9107, um caso por tipo que o AC-9107-1 nomeia: `{"task": {}}` (o do ticket); `task` booleano; `id` ausente, nulo, vazio,
+// número, booleano, lista e objeto (com `ready: false`); `ready` ausente, nulo, texto, número, lista e objeto (com `id: 't1'`; os de
+// `ready` «verdadeiro» levam `output`, que torna visível a tela solta com a tarefa rodando); e a terminal sem `id`, que funcionava antes.
+const NOTASK_RESPONSES = {
+    s204: {status: 204},
+    s304: {status: 304},
+    json_empty: {status: 200, body: {}},
+    json_other: {status: 200, body: {status: 'ok'}},
+    json_tasknull: {status: 200, body: {task: null}},
+    json_taskarray: {status: 200, body: {task: []}},
+    json_taskstring: {status: 200, body: {task: 'abc'}},
+    json_tasknumber: {status: 200, body: {task: 5}},
+    json_null: {status: 200, body: 'null'},
+    json_array: {status: 200, body: '[]'},
+    json202: {status: 202, body: {}},
+    // #9107: o `task` é um objeto (ou um booleano), mas não é a tarefa que o servidor manda
+    json_taskempty: {status: 200, body: {task: {}}},
+    json_taskbool_true: {status: 200, body: {task: true}},
+    json_taskbool_false: {status: 200, body: {task: false}},
+    json_task_noid: {status: 200, body: {task: {ready: false}}},
+    json_task_idnull: {status: 200, body: {task: {id: null, ready: false}}},
+    json_task_idempty: {status: 200, body: {task: {id: '', ready: false}}},
+    json_task_idnumber: {status: 200, body: {task: {id: 5, ready: false}}},
+    json_task_idbool: {status: 200, body: {task: {id: true, ready: false}}},
+    json_task_idlist: {status: 200, body: {task: {id: ['t1'], ready: false}}},
+    json_task_idobject: {status: 200, body: {task: {id: {}, ready: false}}},
+    json_task_noready: {status: 200, body: {task: {id: 't1'}}},
+    json_task_readynull: {status: 200, body: {task: {id: 't1', ready: null}}},
+    json_task_readystring: {status: 200, body: {task: {id: 't1', ready: 'false', output: 'OUT'}}},
+    json_task_readynumber: {status: 200, body: {task: {id: 't1', ready: 1, output: 'OUT'}}},
+    json_task_readylist: {status: 200, body: {task: {id: 't1', ready: [], output: 'OUT'}}},
+    json_task_readyobject: {status: 200, body: {task: {id: 't1', ready: {}, output: 'OUT'}}},
+    json_task_terminal_noid: {status: 200, body: {task: {ready: true, failed: false, output: 'OUT'}}},
+};
+// #9107 (AC-9107-5, -6 e -7): as respostas que SÃO a tarefa (`id` em texto não vazio e `ready` booleano), nas formas que o servidor manda
+// (`views.py:492-495`: com `failed` e `output` ou `traceback`) e nas mínimas ou com campos a mais, que a conferência tem de continuar
+// aceitando. `other_id` traz o `id` de OUTRA tarefa para provar que a consulta seguinte usa o `id` da resposta (e não o da anterior, `t1`).
+const WELLFORMED_RESPONSES = {
+    min_notready: {status: 200, body: {task: {id: 't1', ready: false}}},
+    extra_notready: {status: 200, body: {task: {id: 't1', ready: false, foo: 1}}},
+    other_id: {status: 200, body: {task: {id: 'other-9', ready: false}}},
+    other_id_extra: {status: 200, body: {task: {id: 'other-9', ready: false, foo: 1, command: {name: 'x'}}}},
+    min_ready: {status: 200, body: {task: {id: 't1', ready: true}}},
+    full_ready: {status: 200, body: {task: {id: 't1', ready: true, failed: false, output: 'OUT'}}},
+    extra_ready: {status: 200, body: {task: {id: 't1', ready: true, failed: false, output: 'OUT', foo: 1, command: {name: 'x'}}}},
+    failed_task: {status: 200, body: {task: {id: 't1', ready: true, failed: true, traceback: 'TB'}}},
+};
+// Os tipos de resposta sem tarefa em que o texto de um ouvinte de host fica no painel (AC-9107-8): o 204, o JSON sem `task`, o `task` sem
+// `id` e o `task` sem `ready`; só com o acompanhamento ativo (como o AC-9005-2).
+const NOTASK_HOST_KINDS = ['s204', 'json_empty', 'json_task_noid', 'json_task_noready'];
+const ACTIVE_CONTEXTS = ['active:0', 'active:1', 'active:2'];
+// Onde a resposta sem tarefa chega: com o acompanhamento ativo (a consulta que a recebe é a 1ª, a 2ª ou a 3ª) e interrompido (Cancel ou
+// troca de comando) com a 1ª ou a 2ª consulta em voo.
+const NOTASK_CONTEXTS = ['active:0', 'active:1', 'active:2', 'cancel:first', 'cancel:second', 'switch:first', 'switch:second'];
+
+const SERVER_ERROR_TEXT = 'Server said: <b>no</b>';
+const REVOKE_FAILURES = {
+    http403: jsonResponse(403, {task: null}),
+    http404: jsonResponse(404, {task: null}),
+    http500: {status: 500, body: '<html>boom</html>'},
+    html200: LOGIN_PAGE,
+    falseWithError: jsonResponse(200, {status: false, error: SERVER_ERROR_TEXT}),
+    falseNoError: jsonResponse(200, {status: false}),
+};
+
+// full = o template do pacote; nospace = um host sem o espaço do aviso nem os textos;
+// spaceonly = com o espaço, sem os textos do cliente.
+const TEMPLATES = {
+    full: {},
+    nospace: {alertSpace: false, texts: false},
+    spaceonly: {alertSpace: true, texts: false},
+};
+
+// Os modelos dos cenários de falha do #8961 e do #9016: os de sempre e os de um host que traz só parte dos textos novos
+// (oldtexts: o espaço do aviso e os três textos antigos, sem os novos; noserver: só o de conexão (e o de recusa); nonetwork: só o
+// de servidor (e o de recusa); norefused: os de erro de servidor e de conexão, sem o de recusa; onlyrefused: só o de recusa).
+const FAILURE_TEMPLATES = Object.assign({}, TEMPLATES, {
+    oldtexts: {failureTexts: 'none', refusalText: false},
+    noserver: {failureTexts: 'network'},
+    nonetwork: {failureTexts: 'server'},
+    norefused: {refusalText: false},
+    onlyrefused: {failureTexts: 'none'},
+});
+
+// Envia o comando e passa por `waits` respostas "não pronta"; no fim há uma nova consulta AGENDADA (timer vivo).
+function trackWaits(world, waits) {
+    world.execute('t1');
+    for (let i = 0; i < waits; i++) {
+        world.answerStatus(NOT_READY);
+        if (i < waits - 1) world.advance(1000);
+    }
+}
+
+function revokeFailure(kind, template, phase) {
+    const world = createWorld(TEMPLATES[template]);
+    const result = {};
+    trackWaits(world, 1);
+    result.before = world.state();
+    world.click('#btn-task-revoke');
+    result.clicked = world.state(); // o botão Revoke desabilitado, com o indicador, à espera do servidor
+    if (phase === 'late') {
+        // a tela é liberada (a tarefa terminou) antes de a falha da revogação chegar
+        world.advance(1000);
+        world.answerStatus(ready('done'));
+        result.released = world.state();
+    }
+    world.answerRevoke(REVOKE_FAILURES[kind]);
+    result.after = world.state();
+    return result;
+}
+
+function revokeAccepted() {
+    const world = createWorld();
+    trackWaits(world, 1);
+    const result = {before: world.state()};
+    world.click('#btn-task-revoke');
+    world.answerRevoke(jsonResponse(200, {status: true}));
+    result.afterAccepted = world.state();
+    world.advance(1000);
+    world.answerStatus(ready('done'));
+    result.afterRelease = world.state();
+    return result;
+}
+
+function statusFailure(kind, template) {
+    const world = createWorld(FAILURE_TEMPLATES[template]);
+    world.execute('t1');
+    world.answerStatus(STATUS_FAILURES[kind]);
+    const result = {after: world.state()};
+    world.advance(5000);
+    result.later = world.state();
+    return result;
+}
+
+// Um callback de update-failed de outro código (um host) que lança: a tela tem de ser liberada mesmo assim.
+function throwingCallback() {
+    const world = createWorld();
+    world.cmdasyncform.add_event_callback('update-failed', function () {
+        throw new Error('host callback raised');
+    });
+    world.execute('t1');
+    world.answerStatus(STATUS_FAILURES.http403);
+    return {after: world.state()};
+}
+
+// A sessão expira no meio do acompanhamento: a consulta que sai do timer, depois de respostas "não pronta", recebe o login.
+function statusFailureMidway(kind) {
+    const world = createWorld();
+    trackWaits(world, 2);
+    world.advance(1000); // a 3ª consulta sai
+    world.answerStatus(STATUS_FAILURES[kind]);
+    const result = {after: world.state()};
+    world.advance(5000);
+    result.later = world.state();
+    return result;
+}
+
+// Os tipos de falha da consulta que chegam ao `.fail` do handler (AC-8967-1).
+const FAILURE_KINDS = ['html200', 'http403', 'http404', 'http500', 'network'];
+
+// #9005 (AC-9005-1 a -5): a consulta de estado FALHA no meio do acompanhamento, sem interrupção: depois de `waits` respostas «não pronta»
+// a consulta seguinte sai (a 2ª com waits = 1, a 3ª com waits = 2; a 1ª, com waits = 0, só o AC-9005-5 a usa) e falha. `kind` é um
+// tipo de STATUS_FAILURES ou 'cut', o corte real:
+// a consulta fica sem resposta e o `$.ajax` a corta aos 30 s (o caminho do timer, outro que o da resposta `status: 0` do tipo `network`).
+// `options.world` são as opções do mundo (o texto de execução traduzido, o template sem o aviso); `options.host` registra um ouvinte
+// de host ('throws', 'writes-failed' ou 'writes-finish'); `options.next` envia o comando seguinte, que tem de ser acompanhado até o fim.
+// A tela traz `updatingCalls` (os avisos de `updating` até aquele momento).
+const MIDWAY_HOST_TEXT = 'HOST TEXT';
+const TRANSLATED_RUNNING_TEXT = 'Executando comando...';
+const MIDWAY_KINDS = Object.keys(STATUS_FAILURES).concat(['cut']);
+
+function hostWritesInPanel(world, event) {
+    world.cmdasyncform.add_event_callback(event, function () {
+        world.cmdasyncform.$output.text(MIDWAY_HOST_TEXT);
+    });
+}
+
+function midwayFailure(kind, waits, options) {
+    options = options || {};
+    const world = createWorld(options.world);
+    countUpdating(world);
+    if (options.host === 'throws') hostFailsOnUpdateFailed(world);
+    else if (options.host === 'writes-failed') hostWritesInPanel(world, 'update-failed');
+    else if (options.host === 'writes-finish') hostWritesInPanel(world, 'update-finish');
+    trackWaits(world, waits);
+    world.advance(1000); // a consulta que vai falhar sai
+    const result = {before: world.state()};
+    if (kind === 'cut') world.advance(30000);
+    else world.answerStatus(STATUS_FAILURES[kind]);
+    result.after = world.state();
+    if (options.next) followNext(world, result);
+    return result;
+}
+
+// Conta os avisos do evento `updating` (AC-9018-5, AC-8967-5 e AC-9107-4) com um ouvinte de host registrado DEPOIS do da página;
+// toda `world.state()` passa a trazer `updatingCalls`, a contagem até aquele momento.
+function countUpdating(world) {
+    let calls = 0;
+    world.cmdasyncform.add_event_callback('updating', function () { calls += 1; });
+    const state = world.state;
+    world.state = function () {
+        return Object.assign(state(), {updatingCalls: calls});
+    };
+}
+
+// Um ouvinte de host de `update-failed` que lança: a ordem do `empty()` do `.fail` em relação a ele (AC-8967-1).
+function hostFailsOnUpdateFailed(world) {
+    world.cmdasyncform.add_event_callback('update-failed', function () {
+        throw new Error('host callback raised');
+    });
+}
+
+// A resposta da consulta de estado: 'ready' (pronta, com a saída), 'notready' ou um tipo de STATUS_FAILURES.
+function answerAs(world, answer) {
+    if (answer === 'ready') world.answerStatus(ready('TASK OUTPUT'));
+    else if (answer === 'notready') world.answerStatus(NOT_READY);
+    else if (STATUS_FAILURES[answer]) world.answerStatus(STATUS_FAILURES[answer]);
+    else throw new Error('harness: unknown answer ' + answer);
+}
+
+// `answer` só vale com a consulta em voo (padrão 'ready', como antes); `hostFails` registra o ouvinte que lança.
+function abort(trigger, waits, flight, answer, hostFails) {
+    const world = createWorld({commandsList: trigger === 'switch'});
+    countUpdating(world);
+    if (hostFails) hostFailsOnUpdateFailed(world);
+    trackWaits(world, waits);
+    if (flight) world.advance(1000); // a consulta saiu e a resposta ainda não veio
+    const result = {before: world.state()};
+    if (trigger === 'cancel') world.click('#btn-task-cancel');
+    else world.switchCommand(0);
+    result.afterAbort = world.state();
+    if (flight) {
+        answerAs(world, answer || 'ready');
+        result.afterAnswer = world.state();
+    } else {
+        world.advance(5000);
+        result.afterAdvance = world.state();
+        // o comando seguinte tem de ser acompanhado até o fim
+        world.execute('t2');
+        world.answerStatus(ready('SECOND OUTPUT'), 'last');
+        result.second = world.state();
+    }
+    return result;
+}
+
+// `runningText` (opcional): o texto de execução que o template publica, como uma tradução (AC-8967-3).
+function noAbortControl(waits, runningText) {
+    const world = createWorld(runningText ? {runningText: runningText} : undefined);
+    countUpdating(world);
+    trackWaits(world, waits);
+    const result = {before: world.state()};
+    world.advance(1000);
+    result.after = world.state();
+    return result;
+}
+
+// AC-9018-5 (controle): sem interrupção, uma resposta «não pronta» e depois a pronta; cada uma avisa o `updating` uma vez.
+function followReady() {
+    const world = createWorld();
+    countUpdating(world);
+    world.execute('t1');
+    world.answerStatus(NOT_READY);
+    const result = {afterNotReady: world.state()};
+    world.advance(1000);
+    world.answerStatus(ready('TASK OUTPUT'));
+    result.afterReady = world.state();
+    return result;
+}
+
+function clickTrigger(world, trigger) {
+    if (trigger === 'cancel') world.click('#btn-task-cancel');
+    else world.switchCommand(0);
+}
+
+// A resposta de um comando seguinte, para provar que ele é acompanhado até o fim.
+function followNext(world, result) {
+    world.execute('t2');
+    world.answerStatus(ready('SECOND OUTPUT'), 'last');
+    result.second = world.state();
+}
+
+// #9018: a consulta de estado recebe uma resposta SEM tarefa (`kind` de NOTASK_RESPONSES) em um dos NOTASK_CONTEXTS: 'active:<waits>'
+// (acompanhamento ativo, depois de `waits` respostas «não pronta») ou '<cancel|switch>:<first|second>' (interrompido, com a 1ª ou a 2ª
+// consulta em voo). `before` é a tela logo antes da resposta (nos interrompidos, depois do clique), `after` logo depois e `later` 5 s depois;
+// `log` é a ordem dos eventos `update-failed` e `update-finish` que um ouvinte de host registrou; `options.world` são as opções do mundo,
+// `options.host` registra um ouvinte de host ('throws', 'writes-failed' ou 'writes-finish') e `options.next` envia o comando seguinte.
+// #9107: `kind` também pode ser uma forma de WELLFORMED_RESPONSES (a resposta que É a tarefa, AC-9107-5 a -7: o mesmo roteiro, com o
+// acompanhamento ativo ou interrompido); `statusUrlsBefore` e `statusUrls` são os endereços das consultas de estado até a resposta e
+// até 5 s depois dela (AC-9107-6: a consulta seguinte usa o `id` da resposta).
+function noTaskResponse(kind, context, options) {
+    options = options || {};
+    const answer = NOTASK_RESPONSES[kind] || WELLFORMED_RESPONSES[kind];
+    if (!answer) throw new Error('harness: unknown response kind ' + kind);
+    const parts = context.split(':');
+    const interrupt = parts[0] === 'cancel' || parts[0] === 'switch' ? parts[0] : null;
+    const world = createWorld(Object.assign({commandsList: interrupt === 'switch'}, options.world));
+    countUpdating(world);
+    const log = [];
+    world.cmdasyncform.add_event_callback('update-failed', function (reason) { log.push('failed:' + reason); });
+    world.cmdasyncform.add_event_callback('update-finish', function () { log.push('finish'); });
+    if (options.host === 'throws') hostFailsOnUpdateFailed(world);
+    else if (options.host === 'writes-failed') hostWritesInPanel(world, 'update-failed');
+    else if (options.host === 'writes-finish') hostWritesInPanel(world, 'update-finish');
+    if (interrupt) {
+        if (parts[1] === 'first') {
+            world.execute('t1'); // a 1ª consulta está em voo
+        } else {
+            trackWaits(world, 1);
+            world.advance(1000); // a 2ª consulta está em voo
+        }
+        clickTrigger(world, interrupt);
+    } else {
+        trackWaits(world, Number(parts[1]));
+        world.advance(1000); // a consulta que vai receber a resposta sai (a 1ª já está em voo desde o envio)
+    }
+    const result = {before: world.state()};
+    result.statusUrlsBefore = world.statusRequests().map(function (request) { return request.url; });
+    world.answerStatus(answer);
+    result.after = world.state();
+    world.advance(5000);
+    result.later = world.state();
+    result.statusUrls = world.statusRequests().map(function (request) { return request.url; });
+    result.log = log;
+    // o comando seguinte só se envia com a tela liberada (o botão Execute habilitado): numa tela presa o clique não faz nada e o teste
+    // lê `after` para dizer isso, em vez de o harness lançar «nenhuma consulta em voo»
+    if (options.next && !result.after.execute.disabled) followNext(world, result);
+    return result;
+}
+
+// AC-8955-1: interromper (Cancel ou troca de comando) com o formulário em voo, antes da resposta do servidor.
+// `interrupt` false é o controle: sem a interrupção o mesmo envio consulta.
+function abortDuringSubmit(trigger, interrupt) {
+    const world = createWorld({commandsList: trigger === 'switch'});
+    world.executeStart(); // o formulário está em voo
+    const result = {before: world.state()};
+    if (interrupt) clickTrigger(world, trigger);
+    result.afterAbort = world.state();
+    world.formValid('t1'); // o servidor aceitou a tarefa
+    result.afterAnswer = world.state();
+    world.advance(5000);
+    result.afterAdvance = world.state();
+    if (interrupt) followNext(world, result);
+    return result;
+}
+
+// AC-8955-2: interromper com a 1ª consulta de estado em voo; `answer` é a resposta que ela recebe
+// ('ready', 'notready' ou um tipo de falha de STATUS_FAILURES, AC-8967-1).
+function abortFirstInFlight(trigger, answer) {
+    const world = createWorld({commandsList: trigger === 'switch'});
+    countUpdating(world);
+    world.execute('t1'); // a 1ª consulta está em voo
+    const result = {before: world.state()};
+    clickTrigger(world, trigger);
+    result.afterAbort = world.state();
+    answerAs(world, answer);
+    result.afterAnswer = world.state();
+    world.advance(5000);
+    result.afterAdvance = world.state();
+    followNext(world, result);
+    return result;
+}
+
+// ---------------------------------------------------------------- #9106: o envio e a revogação respondidos com sucesso e sem o campo que leem
+// O envio respondido com SUCESSO e sem tarefa (AC-9106-1 a -4 e -9): o 204 e o 304 (o jQuery os entrega ao sucesso sem `data`), um 2xx com JSON
+// cujo corpo não é um objeto (nulo, lista, texto, número, verdadeiro, falso), o 202 e o 200 com um objeto cujo `task` falta, não é um objeto ou
+// é um objeto sem `id` em texto não vazio. O corpo que não é objeto vai como TEXTO JSON, que `world.formAnswer` converte como o jQuery (`dataType:
+// 'json'`): `'null'` vira `null`, `'"abc"'` vira o texto `abc`. A lista é tirada daqui pelo teste: uma forma nova entra sozinha.
+const SUBMIT_NOTASK = {
+    s204: {status: 204},
+    s304: {status: 304},
+    body_null: {status: 200, body: 'null'},
+    body_list: {status: 200, body: '[]'},
+    body_text: {status: 200, body: '"abc"'},
+    body_number: {status: 200, body: '5'},
+    body_true: {status: 200, body: 'true'},
+    body_false: {status: 200, body: 'false'},
+    json202: {status: 202, body: {}},
+    json_empty: {status: 200, body: {}},
+    json_other: {status: 200, body: {status: 'ok'}},
+    task_null: {status: 200, body: {task: null}},
+    task_true: {status: 200, body: {task: true}},
+    task_false: {status: 200, body: {task: false}},
+    task_text: {status: 200, body: {task: 'abc'}},
+    task_number: {status: 200, body: {task: 5}},
+    task_list: {status: 200, body: {task: []}},
+    task_empty: {status: 200, body: {task: {}}},
+    task_noid: {status: 200, body: {task: {command: {name: 'x'}}}},
+    id_null: {status: 200, body: {task: {id: null}}},
+    id_empty: {status: 200, body: {task: {id: ''}}},
+    id_number: {status: 200, body: {task: {id: 5}}},
+    id_bool: {status: 200, body: {task: {id: true}}},
+    id_list: {status: 200, body: {task: {id: ['t1']}}},
+    id_object: {status: 200, body: {task: {id: {}}}},
+};
+// A resposta que É a tarefa (AC-9106-7 e -8): o que o servidor manda (`views.py:346-351`, o `id` e o `command`) e as formas que a conferência
+// tem de continuar aceitando (sem `command`, com campos a mais). `other_id` traz o `id` de OUTRA tarefa, para provar que a 1ª consulta usa o
+// `id` que a resposta trouxe.
+const SUBMIT_TASK = {
+    ok: {status: 200, body: {task: {id: 't1', command: {name: 'cmdasync_echo'}}}},
+    nocommand: {status: 200, body: {task: {id: 't1'}}},
+    extra: {status: 200, body: {task: {id: 't1', command: {name: 'cmdasync_echo'}, ready: false, foo: 1}}},
+    other_id: {status: 200, body: {task: {id: 'other-9', command: {name: 'cmdasync_echo'}}}},
+};
+// Onde a resposta chega: com o acompanhamento ativo e interrompido, com o envio em voo, pelo Cancel ou pela troca de comando (AC-8955-1).
+const SUBMIT_CONTEXTS = ['active', 'cancel', 'switch'];
+
+// O envio em voo (`before`: depois do clique que interrompe, nos contextos interrompidos), a resposta (`after`) e 5 s depois (`later`).
+// `log` é a ordem dos eventos `update-failed` e `update-finish` que um ouvinte de host registrou, e `formValidCalls` quantas vezes um ouvinte de
+// host do `form-valid`, registrado À FRENTE da lista (o `on_form_valid` lança com uma resposta sem tarefa e pularia um registrado depois),
+// foi avisado. `statusUrls` são os endereços das consultas de estado que saíram. `options.world` são as opções do mundo (o template sem o
+// espaço do aviso nem os textos) e `options.priorRefusal` põe antes um 400 com os erros do formulário: as marcas e as mensagens ao lado dos
+// campos (`marked`), que a resposta seguinte tem de não deixar (AC-9106-9).
+// Nas formas de SUBMIT_TASK o roteiro segue: a 1ª consulta de estado recebe «não pronta» (`afterNotReady`), e não há `later`.
+function submitAnswer(kind, context, options) {
+    options = options || {};
+    const answer = SUBMIT_NOTASK[kind] || SUBMIT_TASK[kind];
+    if (!answer) throw new Error('harness: unknown submit answer ' + kind);
+    const world = createWorld(Object.assign({commandsList: context === 'switch'}, options.world));
+    const log = [];
+    const formValid = [];
+    world.cmdasyncform.add_event_callback('update-failed', function (reason) { log.push('failed:' + reason); });
+    world.cmdasyncform.add_event_callback('update-finish', function () { log.push('finish'); });
+    world.hostFormValidFirst(function () { formValid.push('notified'); });
+    const result = {};
+    if (options.priorRefusal) {
+        world.executeStart();
+        world.formError(FORM_FAILURES.http400);
+        result.marked = world.state();
+    }
+    world.executeStart(); // o envio está em voo
+    if (context !== 'active') clickTrigger(world, context);
+    result.before = world.state();
+    world.formAnswer(answer);
+    result.after = world.state();
+    result.formValidCalls = formValid.length;
+    result.statusUrls = world.statusRequests().map(function (request) { return request.url; });
+    result.log = log;
+    if (SUBMIT_TASK[kind]) {
+        world.answerStatus({status: 200, body: {task: {id: answer.body.task.id, ready: false}}});
+        result.afterNotReady = world.state();
+        return result;
+    }
+    world.advance(5000);
+    result.later = world.state();
+    return result;
+}
+
+// AC-9106-5: o pedido de revogação respondido com sucesso e sem um objeto JSON com o campo `status`. As três primeiras formas LANÇAM hoje
+// (`data` indefinido no 204 e no 304, `null` no JSON nulo); as outras já falham como o AC-8866-1 manda (`!undefined`) e são controles que travam
+// o que um guarda só com `!data` estragaria. `revoke-failed` é o evento que o handler avisa; `phase`: 'tracking' (o acompanhamento ativo) ou 'late'
+// (a tela já liberada quando a resposta chega).
+const REVOKE_NOBODY = {
+    s204: {status: 204},
+    s304: {status: 304},
+    body_null: {status: 200, body: 'null'},
+    body_list: {status: 200, body: '[]'},
+    body_text: {status: 200, body: '"abc"'},
+    body_number: {status: 200, body: '5'},
+    body_true: {status: 200, body: 'true'},
+    body_false: {status: 200, body: 'false'},
+    json_empty: {status: 200, body: {}},
+    json_other: {status: 200, body: {foo: 1}},
+};
+
+function revokeNobody(kind, phase) {
+    const world = createWorld();
+    const failed = [];
+    world.cmdasyncform.add_event_callback('revoke-failed', function (error) { failed.push(error); });
+    const result = {};
+    trackWaits(world, 1);
+    result.before = world.state();
+    world.click('#btn-task-revoke');
+    result.clicked = world.state(); // o botão Revoke desabilitado, com o indicador, à espera do servidor
+    if (phase === 'late') {
+        // a tela é liberada (a tarefa terminou) antes de a resposta da revogação chegar
+        world.advance(1000);
+        world.answerStatus(ready('done'));
+        result.released = world.state();
+    }
+    world.answerRevoke(REVOKE_NOBODY[kind]);
+    result.after = world.state();
+    result.failed = failed;
+    return result;
+}
+
+// ---------------------------------------------------------------- #8968: o host que chama o ajax() mais de uma vez
+const TASK_FORM = 'form#taskform';
+
+// As chamadas a mais do `ajax()` depois do boot da página (que já o chamou uma vez): 'new' (um objeto de opções novo a cada
+// chamada), 'same' (o objeto que a chamada anterior devolveu) ou 'mixed' (novo, o devolvido, novo).
+function callAjaxAgain(world, kind, calls) {
+    for (let i = 0; i < calls; i++) {
+        const returned = world.ajaxForm; // o objeto que a chamada anterior deixou no ajaxForm do dublê
+        const options = (kind === 'same' || (kind === 'mixed' && i === 1)) ? returned : {};
+        world.cmdasyncform.ajax(TASK_FORM, options);
+    }
+}
+
+// O acompanhamento de uma tarefa pelo caminho do envio: o form-valid, uma resposta «não pronta», o timer, a resposta pronta e a espera.
+function followOneTask(world) {
+    const result = {};
+    world.execute('t1');
+    result.afterFormValid = world.state();
+    world.answerStatus(NOT_READY);
+    result.afterNotReady = world.state();
+    world.advance(1000);
+    result.afterTimer = world.state();
+    world.answerStatus(ready('TASK OUTPUT'));
+    result.afterReady = world.state();
+    world.advance(5000);
+    result.afterLater = world.state();
+    return result;
+}
+
+// AC-8968-1: o host chama o `ajax()` de novo, desde o último `init()`.
+function againChain(kind, calls) {
+    const world = createWorld();
+    callAjaxAgain(world, kind, calls);
+    return followOneTask(world);
+}
+
+// AC-8968-1 e -3: o `init()` refaz a lista de ouvintes; `calls` chamadas do `ajax()` depois dele (o boot da página já chamou uma antes).
+function reinitChain(calls) {
+    const world = createWorld();
+    world.cmdasyncform.init('#task-output');
+    for (let i = 0; i < calls; i++) world.cmdasyncform.ajax(TASK_FORM, {});
+    return followOneTask(world);
+}
+
+// AC-8968-2: a interrupção durante o envio com o `ajax()` chamado de novo com o objeto que a página passou (o do `ajaxForm()`).
+function againInterrupt(trigger) {
+    const world = createWorld({commandsList: trigger === 'switch'});
+    world.cmdasyncform.ajax(TASK_FORM, world.ajaxForm);
+    world.executeStart(); // o formulário está em voo
+    const result = {before: world.state()};
+    result.clicked = trigger === 'cancel' ? world.click('#btn-task-cancel') : world.switchCommand(0);
+    result.afterAbort = world.state();
+    world.formValid('t1'); // o servidor aceitou a tarefa
+    result.afterAnswer = world.state();
+    world.advance(5000);
+    result.afterAdvance = world.state();
+    followNext(world, result);
+    return result;
+}
+
+// Robustez (sem ID): o host troca o `on_form_valid` depois do `init()` e antes do `ajax()`: o que ele pôs é o que roda.
+function reinitOverride() {
+    const world = createWorld();
+    const calls = [];
+    world.cmdasyncform.init('#task-output');
+    world.cmdasyncform.on_form_valid = function (data) { calls.push(data.task.id); };
+    world.cmdasyncform.ajax(TASK_FORM, {});
+    world.formValid('t1');
+    return {calls: calls, after: world.state()};
+}
+
+// Robustez (sem ID): o `init()` sem o `ajax()` não liga o acompanhamento (um form-valid à mão não consulta).
+function initWithoutAjax() {
+    const world = createWorld();
+    world.cmdasyncform.init('#task-output');
+    world.cmdasyncform.exc_event_callbacks('form-valid', {task: {id: 't1', command: {name: 'cmdasync_echo'}}});
+    return {after: world.state()};
+}
+
+function revokeUrls(world) {
+    return world.revokeRequests().map(function (request) { return request.url; });
+}
+
+// Chama o revoke_task() como um script faria (a página só o chama pelo botão, desabilitado na janela do envio).
+function scriptRevoke(world) {
+    try {
+        world.cmdasyncform.revoke_task();
+        return null;
+    } catch (error) {
+        return String(error);
+    }
+}
+
+// AC-8955-3: o Revoke na janela do envio (a 1ª execução e a 2ª, depois de uma tarefa pronta) e depois da resposta.
+function revokeWindow(run) {
+    const world = createWorld();
+    if (run === 'second') {
+        world.execute('t1');
+        world.answerStatus(ready('first'));
+    }
+    world.executeStart();
+    const result = {inWindow: world.state()};
+    result.clicked = world.click('#btn-task-revoke'); // false: o botão está desabilitado
+    result.afterClick = world.state();
+    result.scriptThrew = scriptRevoke(world); // a guarda e o aviso
+    result.afterScript = world.state();
+    world.formValid(run === 'second' ? 't2' : 't1');
+    result.afterAnswer = world.state();
+    return result;
+}
+
+// AC-8955-3: a falha tardia da revogação da execução anterior chega na janela do envio seguinte.
+function revokeLateFailureInWindow() {
+    const world = createWorld();
+    trackWaits(world, 1);
+    world.click('#btn-task-revoke'); // o POST fica em voo
+    world.advance(1000);
+    world.answerStatus(ready('done')); // a tela é liberada pela conclusão
+    const result = {released: world.state()};
+    world.executeStart(); // novo envio: o Execute desabilitado, nenhuma tarefa aceita
+    result.inWindow = world.state();
+    world.answerRevoke(REVOKE_FAILURES.http500); // a falha da execução anterior chega agora
+    result.afterFailure = world.state();
+    return result;
+}
+
+// AC-8955-4: o clique no Revoke depois da resposta pede a tarefa dessa execução, e não a anterior.
+function revokeAfterAnswer() {
+    const world = createWorld();
+    world.execute('t1');
+    world.answerStatus(ready('first'));
+    world.execute('t2');
+    const result = {afterAnswer: world.state()};
+    result.clicked = world.click('#btn-task-revoke');
+    result.afterClick = world.state();
+    result.revokeUrls = revokeUrls(world);
+    return result;
+}
+
+// AC-8955-5: o revoke_task() por script sem tarefa aceita na execução em curso.
+function scriptRevokeWithoutTask(kind, template) {
+    const world = createWorld(TEMPLATES[template]);
+    if (kind === 'second-window' || kind === 'refused') {
+        world.execute('t1');
+        world.answerStatus(ready('first')); // t1 terminou
+    }
+    if (kind !== 'before-any-submit') world.executeStart();
+    if (kind === 'refused') world.formError({status: 400, responseJSON: {form: {errors: {}}}}); // o servidor recusou
+    const result = {before: world.state()};
+    result.threw = scriptRevoke(world);
+    result.after = world.state();
+    result.revokeUrls = revokeUrls(world);
+    return result;
+}
+
+// Robustez (sem ID): o envio duplicado que a página recusa (o Execute está desabilitado) não mexe no acompanhamento.
+function duplicateSubmit(window) {
+    const world = createWorld();
+    const result = {};
+    if (window === 'after-cancel') {
+        world.executeStart();
+        world.click('#btn-task-cancel');
+        result.duplicateProceeded = world.executeStart(); // false: a página o recusa
+        world.formValid('t1');
+        result.afterAnswer = world.state();
+    } else {
+        world.execute('t1');
+        world.answerStatus(NOT_READY);
+        result.duplicateProceeded = world.executeStart();
+        result.click = world.click('#btn-task-revoke');
+        result.revokeUrls = revokeUrls(world);
+        result.afterClick = world.state();
+    }
+    return result;
+}
+
+// Robustez (sem ID): interrompe no envio, o servidor recusa (400), troca de comando, e o comando seguinte é acompanhado.
+function refusedAfterInterrupt() {
+    const world = createWorld({commandsList: true});
+    world.executeStart();
+    world.switchCommand(0);
+    world.formError({status: 400, responseJSON: {form: {errors: {}}}});
+    const result = {afterRefusal: world.state()};
+    world.switchCommand(0); // a tela ociosa
+    followNext(world, result);
+    return result;
+}
+
+// Robustez (sem ID): um host que dispara o form-valid sem o ajax() do handler (sem begin()), depois de uma interrupção.
+function hostWithoutBegin() {
+    const world = createWorld();
+    world.executeStart();
+    world.click('#btn-task-cancel');
+    world.formValid('t1'); // a tela liberada pela interrupção: running e update falsos
+    const result = {released: world.state()};
+    world.cmdasyncform.on_form_valid({task: {id: 't2', command: {name: 'cmdasync_echo'}}});
+    result.afterDirect = world.state();
+    world.answerStatus(ready('HOST OUTPUT'), 'last');
+    result.afterAnswer = world.state();
+    return result;
+}
+
+// Robustez (sem ID): a tela liberada por uma interrupção no envio segue pedindo a última tarefa (a fronteira do AC-8955-5).
+function releasedBoundary() {
+    const world = createWorld();
+    world.executeStart();
+    world.click('#btn-task-cancel');
+    world.formValid('t1');
+    const result = {released: world.state()};
+    result.threw = scriptRevoke(world);
+    result.after = world.state();
+    result.revokeUrls = revokeUrls(world);
+    return result;
+}
+
+// Robustez (sem ID): o ajax() chamado com um objeto sem beforeSubmit.
+function ajaxWithoutBeforeSubmit() {
+    const world = createWorld();
+    const options = world.cmdasyncform.ajax('form#taskform', {});
+    const result = {beforeSubmitType: typeof options.beforeSubmit};
+    if (typeof options.beforeSubmit === 'function') {
+        try {
+            result.returnedType = typeof options.beforeSubmit([], null, options);
+        } catch (error) {
+            result.threw = String(error);
+        }
+    }
+    world.cmdasyncform.update_abort(); // o envio está em curso (o begin() rodou)
+    world.cmdasyncform.on_form_valid({task: {id: 't9', command: {name: 'cmdasync_echo'}}});
+    result.afterFormValid = world.state();
+    return result;
+}
+
+function clearAlert(trigger) {
+    const world = createWorld({commandsList: trigger === 'switch'});
+    let before;
+    if (trigger === 'submit') {
+        world.execute('t1');
+        world.answerStatus(jsonResponse(404, {task: null})); // o aviso «Task not found.» e a tela liberada
+        before = world.state();
+        world.executeStart();
+    } else {
+        trackWaits(world, 1);
+        world.click('#btn-task-revoke');
+        world.answerRevoke(REVOKE_FAILURES.http403); // o aviso da falha, com o acompanhamento em curso
+        before = world.state();
+        if (trigger === 'cancel') world.click('#btn-task-cancel');
+        else if (trigger === 'switch') world.switchCommand(0);
+        else if (trigger === 'revoke') world.click('#btn-task-revoke');
+    }
+    return {before: before, after: world.state()};
+}
+
+function done(kind) {
+    const world = createWorld();
+    world.execute('t1');
+    world.answerStatus(kind === 'output' ? ready('<b>bold</b> output') : failedTask('Traceback <i>x</i>'));
+    return {after: world.state()};
+}
+
+function formLogin() {
+    const world = createWorld();
+    world.executeStart();
+    world.formError({status: 200}); // o ajaxForm (dataType json) recebeu o HTML do login: cai no error
+    // o dataType que o cmdasyncform.ajax() entregou ao ajaxForm: é ele que manda o HTML do login ao error
+    return {after: world.state(), dataType: world.ajaxForm.dataType || null};
+}
+
+function boot(commandsList) {
+    const world = createWorld({commandsList: commandsList});
+    return {state: world.state(), boot: world.boot()};
+}
+
+// ---------------------------------------------------------------- a consulta de workers (celery.workers.status.js, #8954)
+const WORKERS_FORBIDDEN = jsonResponse(403, {status: false, workers: []});
+const WORKERS_NOBODY = jsonResponse(200, {status: false, workers: [], message: 'no Celery worker answered'});
+const WORKERS_LISTED = jsonResponse(200, {status: true, workers: ['celery@w1', '<b>w2</b>']});
+const WORKERS_FAILURES = {
+    nobody: WORKERS_NOBODY,
+    network: {status: 0, body: ''},
+    http500: {status: 500, body: '<html>boom</html>'},
+    http502: {status: 502, body: '<html>Bad Gateway</html>'},
+};
+
+// As falhas que a consulta recebe antes da recusa: a sessão pode cair no meio do acompanhamento.
+function workersPrior(world, prior) {
+    (prior === 'first' ? [] : prior.split('+')).forEach(function (kind) {
+        world.answerWorkers(WORKERS_FAILURES[kind]);
+        world.advance(5000); // a consulta refeita sai
+    });
+}
+
+// AC-8954-1 e -2: o 403, na 1ª consulta ou depois de consultas que falharam ou não acharam worker.
+function workersForbidden(prior, options) {
+    const world = createWorld(Object.assign({workers: 'page'}, options || {}));
+    workersPrior(world, prior);
+    const result = {beforeForbidden: world.state()};
+    world.answerWorkers(WORKERS_FORBIDDEN);
+    result.afterForbidden = world.state();
+    world.advance(30000);
+    result.later = world.state();
+    return result;
+}
+
+// AC-8954-3 e -8: o 200 que não é JSON (a tela de login), na 1ª consulta ou depois de uma falha.
+function workersLogin(prior) {
+    const world = createWorld({workers: 'page'});
+    workersPrior(world, prior);
+    const result = {beforeLogin: world.state()};
+    world.answerWorkers(LOGIN_PAGE);
+    result.afterLogin = world.state();
+    world.advance(30000);
+    result.later = world.state();
+    return result;
+}
+
+// AC-8954-8 e o controle do AC-8954-6: a consulta chamada sem argumento (o setting desligado: a página não a abre).
+function workersWithoutArgument(response) {
+    const world = createWorld({workers: 'manual'});
+    const result = {before: world.state()};
+    world.workersCheck();
+    result.asked = world.state();
+    world.answerWorkers(response);
+    result.afterAnswer = world.state();
+    world.advance(4999);
+    result.at4999 = world.state();
+    world.advance(1);
+    result.at5000 = world.state();
+    return result;
+}
+
+// AC-8954-6: a falha que refaz a consulta 5 s depois; `how`: a página, a chamada sem argumento ou o handler sem `failure_reason`.
+function workersRetry(kind, how) {
+    const options = how === 'page' ? {workers: 'page'} : (how === 'noarg' ? {workers: 'manual'} : {workers: 'page', noFailureReason: true});
+    const world = createWorld(options);
+    if (how === 'noarg') world.workersCheck();
+    world.answerWorkers(WORKERS_FAILURES[kind]);
+    const result = {afterAnswer: world.state()};
+    world.advance(4999);
+    result.at4999 = world.state();
+    world.advance(1);
+    result.at5000 = world.state();
+    return result;
+}
+
+// AC-8954-7: o resultado no aviso (a lista como texto, ou a `message` do `status` falso).
+function workersResult(kind) {
+    const world = createWorld({workers: 'page'});
+    world.answerWorkers(kind === 'listed' ? WORKERS_LISTED : WORKERS_NOBODY);
+    const result = {afterAnswer: world.state()};
+    world.advance(30000);
+    result.later = world.state();
+    return result;
+}
+
+// #9106 (AC-9106-6 e -10): a consulta de workers respondida com sucesso e sem a forma que o servidor manda. O 204, o 304 e o JSON `null` lançam em
+// `data.status`; um objeto com `status` verdadeiro e `workers` que não é lista (ausente, nulo, texto, número, booleano, objeto) lança em `.length`
+// ou no `$.each` (o `true_workers_object` lança só no dublê, `world.js`: o `$.each` do jQuery real percorre um objeto, e o que o prova no verde é o
+// guarda, que o recusa); o JSON que não é objeto (lista, texto, número, verdadeiro, falso) e o objeto sem `status` não lançam e abrem o aviso com um
+// corpo vazio. A lista é tirada daqui pelo teste.
+const WORKERS_NOSHAPE = {
+    s204: {status: 204},
+    s304: {status: 304},
+    body_null: {status: 200, body: 'null'},
+    body_list: {status: 200, body: '[]'},
+    body_text: {status: 200, body: '"abc"'},
+    body_number: {status: 200, body: '5'},
+    body_true: {status: 200, body: 'true'},
+    body_false: {status: 200, body: 'false'},
+    json_empty: {status: 200, body: {}},
+    json_other: {status: 200, body: {foo: 1}},
+    true_noworkers: {status: 200, body: {status: true}},
+    true_workers_null: {status: 200, body: {status: true, workers: null}},
+    true_workers_text: {status: 200, body: {status: true, workers: 'abc'}},
+    true_workers_number: {status: 200, body: {status: true, workers: 5}},
+    true_workers_bool: {status: 200, body: {status: true, workers: true}},
+    true_workers_object: {status: 200, body: {status: true, workers: {}}},
+};
+// Os controles: as formas que o servidor manda, que seguem como eram (a lista mostra os nomes e não refaz; a lista vazia é lista: mostra 0 e não
+// refaz; `status` falso com `message` mostra a mensagem e refaz em 5 s).
+const WORKERS_CONTROLS = {
+    listed: jsonResponse(200, {status: true, workers: ['w1', 'w2']}),
+    emptylist: jsonResponse(200, {status: true, workers: []}),
+    nobody: jsonResponse(200, {status: false, workers: [], message: 'no worker'}),
+};
+
+// A consulta chamada à mão (o setting desligado: a página não a abre) e respondida; o aviso estava FECHADO. `afterAnswer` é a tela logo depois e
+// `at4999` e `at5000` as de 4999 ms e de 5000 ms depois (a consulta refeita aos 5 s, e não antes).
+function workersNoShape(kind) {
+    const world = createWorld({workers: 'manual'});
+    world.workersCheck();
+    const result = {asked: world.state()};
+    world.answerWorkers(WORKERS_NOSHAPE[kind] || WORKERS_CONTROLS[kind]);
+    result.afterAnswer = world.state();
+    world.advance(4999);
+    result.at4999 = world.state();
+    world.advance(1);
+    result.at5000 = world.state();
+    return result;
+}
+
+// O aviso ABERTO (uma 1ª resposta com os dois nomes: o corpo com os nomes, o contador em 2) e o host chama a consulta de novo, à mão; a resposta
+// sem a forma chega: o aviso fica como estava (o corpo, o contador e o número de aberturas) e a consulta é refeita aos 5 s.
+function workersKeepNotice(kind) {
+    const world = createWorld({workers: 'manual'});
+    world.workersCheck();
+    world.answerWorkers(WORKERS_LISTED);
+    const result = {opened: world.state()};
+    world.workersCheck(); // o host pergunta de novo, à mão
+    result.asked = world.state();
+    world.answerWorkers(WORKERS_NOSHAPE[kind]);
+    result.afterAnswer = world.state();
+    world.advance(4999);
+    result.at4999 = world.state();
+    world.advance(1);
+    result.at5000 = world.state();
+    return result;
+}
+
+// A sonda aberta PELA PÁGINA (`workers: 'page'`: o setting ligado, e a página passa `{onLogin}`): a resposta sem a forma refaz a consulta com as
+// MESMAS opções, então a sessão que cai depois dela leva ao login (o AC-8954-3, «depois de consultas que falharam»). Uma sonda refeita sem as
+// opções perderia o `onLogin` e deixaria o usuário na tela sem aviso.
+function workersNoShapePage(kind) {
+    const world = createWorld({workers: 'page'});
+    world.answerWorkers(WORKERS_NOSHAPE[kind]);
+    const result = {afterAnswer: world.state()};
+    world.advance(5000); // a consulta refeita sai
+    result.asked = world.state();
+    world.answerWorkers(LOGIN_PAGE);
+    result.afterLogin = world.state();
+    world.advance(30000);
+    result.later = world.state();
+    return result;
+}
+
+// ---------------------------------------------------------------- #8961: o motivo da falha, o aviso e o tempo limite
+// As falhas do envio do formulário (o `error` do ajaxForm recebe o jqXHR; o 400 traz os erros do formulário em JSON).
+const FIELD_ERRORS_400 = {app_command: ['bad command'], args: ['bad args'], kwargs: ['bad kwargs']};
+const FORM_FAILURES = {
+    http400: {status: 400, responseJSON: {form: {errors: FIELD_ERRORS_400}}},
+    http401: {status: 401},
+    http403: {status: 403},
+    http413: {status: 413},
+    http429: {status: 429},
+    http500: {status: 500},
+    http503: {status: 503},
+    network: {status: 0},
+};
+
+// AC-9016-1, AC-8961-6, AC-9019-1 e AC-9017-1: o envio que falha, num modelo de template.
+function formFailure(kind, template) {
+    const world = createWorld(FAILURE_TEMPLATES[template]);
+    world.executeStart();
+    world.formError(FORM_FAILURES[kind]);
+    return {after: world.state()};
+}
+
+// AC-9016-1 e AC-9017-1: o 400 com os erros em JSON e todo status de 401 a 499, um mundo novo para cada: o aviso de cada um e a tela.
+// (O 400 SEM os erros em JSON tem a sua varredura, `bad400`, abaixo.)
+function formSweep() {
+    const statuses = [400];
+    for (let status = 401; status <= 499; status++) statuses.push(status);
+    const rows = statuses.map(function (status) {
+        const world = createWorld();
+        world.executeStart();
+        world.formError(status === 400 ? FORM_FAILURES.http400 : {status: status});
+        const state = world.state();
+        return {status: status, alert: state.alert, execute: state.execute, cancel: state.cancel, revoke: state.revoke, uncaught: state.uncaught};
+    });
+    return {rows: rows};
+}
+
+// AC-9016-1: o Cancel ou a troca de comando com o envio em voo, e o envio falha depois.
+function submitInterruptedFailure(trigger, kind) {
+    const world = createWorld({commandsList: trigger === 'switch'});
+    world.executeStart();
+    clickTrigger(world, trigger);
+    const result = {afterAbort: world.state()};
+    world.formError(FORM_FAILURES[kind]);
+    result.afterFail = world.state();
+    return result;
+}
+
+// #9017 (AC-9017-1) e #9016 (AC-9016-1): o 400 do envio cujo corpo NÃO traz os erros do formulário como o servidor os manda
+// (`{"form": {"errors": {campo: [mensagens]}}}`, `views.py:301-311`): a página de um proxy, de um WAF ou do próprio Django, ou um JSON de
+// outra forma. O `xhr` é montado como o jQuery o monta: o `responseJSON` SÓ existe se o corpo foi JSON (o `ajaxConvert` do
+// jquery-3.7.1.min.js atribui `responseJSON` depois da conversão `text json`, que lança para um corpo que não é JSON; o teste de fonte do
+// `DoubleAssumptionsTest` guarda isso), então o HTML, o corpo vazio e o texto não levam `responseJSON`.
+// `nofield`: o corpo não recusa campo nenhum (nenhum campo fica marcado nem recebe mensagem). `field`: um campo mapeado traz um erro que
+// não é uma lista com mensagem (o servidor não os manda; a tela solta e marca o campo recusado).
+const BAD400_NOFIELD = {
+    nojson: {status: 400},
+    emptybody: {status: 400, responseText: ''},
+    html: {status: 400, responseText: '<html><head><title>400 Bad Request</title></head><body><h1>Bad Request</h1></body></html>'},
+    json_null: {status: 400, responseJSON: null},
+    json_string: {status: 400, responseJSON: 'x'},
+    json_number: {status: 400, responseJSON: 5},
+    json_array: {status: 400, responseJSON: []},
+    json_noform: {status: 400, responseJSON: {detail: 'x'}},
+    form_null: {status: 400, responseJSON: {form: null}},
+    form_string: {status: 400, responseJSON: {form: 'x'}},
+    form_noerrors: {status: 400, responseJSON: {form: {}}},
+    errors_null: {status: 400, responseJSON: {form: {errors: null}}},
+    errors_string: {status: 400, responseJSON: {form: {errors: 'oops'}}},
+    errors_array: {status: 400, responseJSON: {form: {errors: ['a']}}},
+    // #9016: o `errors` vazio e o que só traz campos que a tela não marca (o `JSON.parse` cria a chave `__proto__`; um literal mudaria o protótipo)
+    errors_empty: {status: 400, responseJSON: {form: {errors: {}}}},
+    errors_unmapped: {status: 400, responseJSON: JSON.parse('{"form": {"errors": {"ghost": ["no such field"], "constructor": ["inherited name"], "__proto__": ["proto name"]}}}')},
+};
+const BAD400_FIELD = {
+    field_null: {status: 400, responseJSON: {form: {errors: {args: null}}}},
+    field_string: {status: 400, responseJSON: {form: {errors: {args: 'oops'}}}},
+    field_number: {status: 400, responseJSON: {form: {errors: {args: 5}}}},
+    field_empty: {status: 400, responseJSON: {form: {errors: {args: []}}}},
+};
+const BAD400_RESPONSES = Object.assign({}, BAD400_NOFIELD, BAD400_FIELD);
+// Onde o 400 chega: com o envio em voo (`fresh`), com o Cancel ou a troca de comando antes da resposta, e numa página de um host sem o
+// espaço do aviso nem os textos (`nospace`).
+// Mais, no #9016, `norefused`: um host com o espaço do aviso e os textos antigos, sem o de recusa.
+const BAD400_CONTEXTS = ['fresh', 'cancel', 'switch', 'nospace', 'norefused'];
+
+// AC-9017-1 e AC-9016-1: o envio fica em voo (`before`), o Cancel ou a troca o interrompe (`afterAbort`) e chega o 400 (`after`).
+function bad400(kind, context) {
+    const interrupt = context === 'cancel' || context === 'switch' ? context : null;
+    const world = createWorld(Object.assign({commandsList: interrupt === 'switch'},
+        context === 'nospace' ? TEMPLATES.nospace : context === 'norefused' ? FAILURE_TEMPLATES.norefused : {}));
+    world.executeStart();
+    const result = {before: world.state()};
+    if (interrupt) {
+        clickTrigger(world, interrupt);
+        result.afterAbort = world.state();
+    }
+    world.formError(BAD400_RESPONSES[kind]);
+    result.after = world.state();
+    return result;
+}
+
+// Robustez (sem ID): o erro nulo de `args` não esconde a mensagem de `kwargs` (o laço do 400 segue).
+function bad400FieldNext() {
+    const world = createWorld();
+    world.executeStart();
+    world.formError({status: 400, responseJSON: {form: {errors: {args: null, kwargs: ['bad kwargs']}}}});
+    return {after: world.state()};
+}
+
+// Robustez (sem ID): o comando enviado depois do 400 sem os erros é acompanhado até o fim.
+function bad400Next(kind) {
+    const world = createWorld();
+    world.executeStart();
+    world.formError(BAD400_RESPONSES[kind]);
+    const result = {afterFail: world.state()};
+    // com a tela presa (o 400 que lança) o dublê recusaria o envio seguinte e o cenário cairia por erro do harness, não pelo assert: o
+    // comando seguinte só sai com a tela solta, e o teste afirma que ela foi solta (`afterFail`) antes de ler o `second`
+    if (!result.afterFail.execute.disabled) {
+        world.execute('t2');
+        world.answerStatus(ready('SECOND OUTPUT'), 'last');
+        result.second = world.state();
+    }
+    return result;
+}
+
+// #9016 (AC-9016-1): o 400 de um erro de campo numa página que NÃO tem o campo (um host sem nenhum campo de argumentos): o erro não está
+// ao lado de campo nenhum, então a recusa aparece (a bandeira conta o campo que a página tem, e não o nome em `rel_inputs`).
+function bad400NoFieldOnPage() {
+    const world = createWorld({argsVariants: 'none'});
+    world.executeStart();
+    world.formError({status: 400, responseJSON: {form: {errors: {args: ['bad args']}}}});
+    return {after: world.state()};
+}
+
+// #9016 (AC-9016-1): todo status de 401 a 499 e o 400 com os erros, com o Cancel ou a troca de comando antes da resposta.
+function formSweepInterrupted(trigger) {
+    const statuses = [400];
+    for (let status = 401; status <= 499; status++) statuses.push(status);
+    const rows = statuses.map(function (status) {
+        const world = createWorld({commandsList: trigger === 'switch'});
+        world.executeStart();
+        clickTrigger(world, trigger);
+        world.formError(status === 400 ? FORM_FAILURES.http400 : {status: status});
+        const state = world.state();
+        return {status: status, alert: state.alert, execute: state.execute, cancel: state.cancel, revoke: state.revoke, uncaught: state.uncaught};
+    });
+    return {rows: rows};
+}
+
+// #9016 (AC-9016-1): o limite de baixo da recusa: todo status de 201 a 399 que o jQuery manda ao `error` do envio, um mundo novo para cada.
+// O 2xx chega ao `error` quando o corpo não é JSON (`parsererror`, com o status do próprio 2xx); o 3xx, quando o navegador não o segue
+// (o 300 e o 305, por exemplo). Ficam de fora o 200 (o login, `form:login200`), o 204 e o 304, que o jQuery trata como sucesso e nunca
+// chegam ao `error`.
+function formBelow400Sweep() {
+    const statuses = [];
+    for (let status = 201; status <= 399; status++) {
+        if (status !== 204 && status !== 304) statuses.push(status);
+    }
+    const rows = statuses.map(function (status) {
+        const world = createWorld();
+        world.executeStart();
+        world.formError({status: status});
+        const state = world.state();
+        return {status: status, alert: state.alert, execute: state.execute, cancel: state.cancel, revoke: state.revoke, uncaught: state.uncaught};
+    });
+    return {rows: rows};
+}
+
+// #9016 (AC-9016-1): o 202 com corpo que não é JSON no envio: o jQuery o manda ao `error` (`parsererror`) com o status 202.
+function formHtml202() {
+    const world = createWorld();
+    world.executeStart();
+    world.formError({status: 202, responseText: '<html>accepted</html>'});
+    return {after: world.state()};
+}
+
+// #9016 (AC-8866-12): o aviso da recusa (o 403 do envio) na tela; a ação seguinte do usuário o esconde (enviar de novo ou trocar de comando).
+function clearRefusal(trigger) {
+    const world = createWorld({commandsList: trigger === 'switch'});
+    world.executeStart();
+    world.formError(FORM_FAILURES.http403);
+    const before = world.state();
+    if (trigger === 'submit') world.executeStart();
+    else world.switchCommand(0);
+    return {before: before, after: world.state()};
+}
+
+// AC-8961-3 e -6: a 1ª consulta de estado sem resposta; o corte aos 30 s (o padrão do handler).
+function timeoutFirst(template) {
+    const world = createWorld(FAILURE_TEMPLATES[template]);
+    world.execute('t1');
+    const result = {start: world.state()};
+    world.advance(29999);
+    result.at29999 = world.state();
+    world.advance(1);
+    result.at30000 = world.state();
+    world.advance(60000);
+    result.later = world.state();
+    return result;
+}
+
+// AC-8961-3: a 2ª consulta (sai em t = 1000, depois de uma resposta «não pronta») tem o limite dela, contado do envio dela.
+// Aqui não se afirma o painel: o que a falha da 2ª consulta em diante deixa nele (e o corte aos 30 s) é o AC-9005-1 (`FailureMidwayTest`).
+function timeoutSecond() {
+    const world = createWorld();
+    world.execute('t1');
+    world.answerStatus(NOT_READY);
+    world.advance(1000);
+    const result = {start: world.state()};
+    world.advance(29999);
+    result.at29999 = world.state();
+    world.advance(1);
+    result.at30000 = world.state();
+    return result;
+}
+
+// AC-8961-3 (controle): a consulta respondida a tempo não é cortada.
+function timeoutAnswered() {
+    const world = createWorld();
+    world.execute('t1');
+    world.advance(29999);
+    world.answerStatus(ready('done'));
+    const result = {afterAnswer: world.state()};
+    world.advance(120000);
+    result.later = world.state();
+    return result;
+}
+
+// AC-8961-3: o valor que o host atribui DEPOIS do init() (a página já o chamou): 5000 corta aos 5 s, e 0 desliga o corte.
+function timeoutValue(value) {
+    const world = createWorld();
+    world.cmdasyncform.query_timeout = value;
+    world.execute('t1');
+    const result = {start: world.state()};
+    world.advance(value === 0 ? 120000 : value - 1);
+    result.beforeCut = world.state();
+    if (value > 0) {
+        world.advance(1);
+        result.afterCut = world.state();
+    }
+    return result;
+}
+
+// AC-8961-3: o valor que o host atribui ANTES do init() sobrevive a ele, e a consulta seguinte o leva.
+function timeoutBeforeInit() {
+    const world = createWorld();
+    world.cmdasyncform.query_timeout = 5000;
+    world.cmdasyncform.init('#task-output');
+    const result = {afterInit: world.cmdasyncform.query_timeout};
+    world.cmdasyncform.request({id: 't9'});
+    result.afterRequest = world.state();
+    return result;
+}
+
+// AC-8961-3: o Cancel ou a troca de comando com a consulta em voo, e o corte aos 30 s depois deles.
+function timeoutInterrupted(trigger) {
+    const world = createWorld({commandsList: trigger === 'switch'});
+    world.execute('t1');
+    clickTrigger(world, trigger);
+    const result = {afterAbort: world.state()};
+    world.advance(30000);
+    result.afterCut = world.state();
+    return result;
+}
+
+// AC-9107-2 (antes AC-9018-2 e AC-8961-8) e AC-8961-10: os ouvintes de um host veem o motivo e, depois dele, o `update-finish`.
+function failureReasons(kind) {
+    const world = createWorld();
+    const log = [];
+    world.cmdasyncform.add_event_callback('update-failed', function (reason) { log.push('failed:' + reason); });
+    world.cmdasyncform.add_event_callback('update-finish', function () { log.push('finish'); });
+    world.execute('t1');
+    if (kind === 'timeout') world.advance(30000);
+    else world.answerStatus(STATUS_FAILURES[kind]);
+    return {log: log, after: world.state()};
+}
+
+// AC-8961-5: o corte da consulta de workers. 'default': a página (30 s); 'custom': o host atribui 5000 antes da consulta
+// (modo manual); 'hostload': um script do host atribui 5000 na carga e a 1ª consulta da página usa o valor; 'zero': o corte desligado.
+function workersTimeout(how) {
+    const world = how === 'default' ? createWorld({workers: 'page'})
+        : how === 'hostload' ? createWorld({workers: 'page', queryTimeout: 5000})
+            : createWorld({workers: 'manual'});
+    if (how === 'custom') world.cmdasyncform.query_timeout = 5000;
+    if (how === 'zero') world.cmdasyncform.query_timeout = 0;
+    if (how === 'custom' || how === 'zero') world.workersCheck();
+    const result = {start: world.state()};
+    if (how === 'zero') {
+        world.advance(120000);
+        result.later = world.state();
+        return result;
+    }
+    const limit = how === 'default' ? 30000 : 5000;
+    world.advance(limit - 1);
+    result.beforeCut = world.state();
+    world.advance(1);
+    result.atCut = world.state();
+    world.advance(4999);
+    result.beforeAgain = world.state();
+    world.advance(1);
+    result.again = world.state();
+    return result;
+}
+
+// AC-8961-5: o valor que o host atribui DEPOIS da 1ª consulta é o limite da consulta seguinte (a sonda lê a propriedade a cada
+// rodada, e não a guarda na 1ª): a 1ª leva o padrão e é cortada aos 30 s, e a 2ª, que sai 5 s depois, leva o valor novo.
+function workersTimeoutLater() {
+    const world = createWorld({workers: 'page'});
+    const result = {start: world.state()};
+    world.cmdasyncform.query_timeout = 5000;
+    world.advance(30000);
+    result.atFirstCut = world.state();
+    world.advance(5000);
+    result.secondSent = world.state();
+    world.advance(4999);
+    result.beforeSecondCut = world.state();
+    world.advance(1);
+    result.atSecondCut = world.state();
+    return result;
+}
+
+// AC-8961-11 (`SHALL CONTINUE TO`): a revogação em voo não é cortada por tempo, qualquer que seja o `query_timeout`
+// ('default', '5000' ou 'zero'); o `ajaxForm` do envio não leva `timeout` (o estado traz `formTimeout`).
+function outOfScope(how) {
+    const world = createWorld();
+    if (how === '5000') world.cmdasyncform.query_timeout = 5000;
+    if (how === 'zero') world.cmdasyncform.query_timeout = 0;
+    trackWaits(world, 1);
+    world.click('#btn-task-revoke');
+    const result = {inFlight: world.state()};
+    world.advance(120000);
+    result.later = world.state();
+    return result;
+}
+
+const scenarios = {};
+function register(name, fn) {
+    try {
+        scenarios[name] = fn();
+    } catch (error) {
+        scenarios[name] = {harnessError: error && error.stack ? error.stack : String(error)};
+    }
+}
+
+Object.keys(REVOKE_FAILURES).forEach(function (kind) {
+    Object.keys(TEMPLATES).forEach(function (template) {
+        register('revoke:' + kind + ':' + template + ':tracking', function () { return revokeFailure(kind, template, 'tracking'); });
+    });
+    register('revoke:' + kind + ':full:late', function () { return revokeFailure(kind, 'full', 'late'); });
+});
+register('revoke:accepted', revokeAccepted);
+
+Object.keys(STATUS_FAILURES).forEach(function (kind) {
+    Object.keys(TEMPLATES).forEach(function (template) {
+        register('status:' + kind + ':' + template, function () { return statusFailure(kind, template); });
+    });
+});
+
+register('status:callback-throws', throwingCallback);
+
+register('status:html200:midway', function () { return statusFailureMidway('html200'); });
+
+// #9005: a falha da consulta no meio do acompanhamento, de cada tipo e do corte aos 30 s, na 2ª e na 3ª consulta (AC-9005-1, -5) e, só
+// para o AC-9005-5, na 1ª (waits = 0)
+[0, 1, 2].forEach(function (waits) {
+    MIDWAY_KINDS.forEach(function (kind) {
+        register('midway:' + waits + ':' + kind, function () { return midwayFailure(kind, waits); });
+    });
+});
+// ... com o texto de execução traduzido (AC-9005-1), com o ouvinte de host que lança (AC-9005-1, -3) e com os que escrevem no painel
+// (AC-9005-2), com o comando seguinte (AC-9005-4) e com o template sem o espaço do aviso (robustez, sem ID)
+register('midway:1:http500:translated', function () {
+    return midwayFailure('http500', 1, {world: {runningText: TRANSLATED_RUNNING_TEXT}});
+});
+register('midway:2:http403:throws', function () { return midwayFailure('http403', 2, {host: 'throws'}); });
+register('midway:2:http500:writes-failed', function () { return midwayFailure('http500', 2, {host: 'writes-failed'}); });
+register('midway:2:http500:writes-finish', function () { return midwayFailure('http500', 2, {host: 'writes-finish'}); });
+['html200', 'http500', 'network', 'cut'].forEach(function (kind) {
+    register('midway:2:' + kind + ':next', function () { return midwayFailure(kind, 2, {next: true}); });
+});
+register('midway:2:http500:nospace', function () { return midwayFailure('http500', 2, {world: TEMPLATES.nospace}); });
+
+// #9018 e #9107: a resposta sem tarefa, de cada forma de NOTASK_RESPONSES em cada um dos NOTASK_CONTEXTS (AC-9107-1 a -4)
+Object.keys(NOTASK_RESPONSES).forEach(function (kind) {
+    NOTASK_CONTEXTS.forEach(function (context) {
+        register('notask:' + kind + ':' + context, function () { return noTaskResponse(kind, context); });
+    });
+});
+// #9107 (AC-9107-5, -6 e -7): a resposta que É a tarefa, de cada forma de WELLFORMED_RESPONSES em cada um dos NOTASK_CONTEXTS: com o
+// acompanhamento ativo (AC-9107-5 e -6) e interrompido com a consulta em voo (AC-9107-7)
+Object.keys(WELLFORMED_RESPONSES).forEach(function (kind) {
+    NOTASK_CONTEXTS.forEach(function (context) {
+        register('wellformed:' + kind + ':' + context, function () { return noTaskResponse(kind, context); });
+    });
+});
+// ... com o ouvinte de host que lança (robustez, sem ID: o sem-tarefa passa pelo mesmo caminho da falha, que guarda isso no AC-9005-3)
+register('notask:s204:active:2:throws', function () { return noTaskResponse('s204', 'active:2', {host: 'throws'}); });
+register('notask:json_empty:cancel:second:throws', function () { return noTaskResponse('json_empty', 'cancel:second', {host: 'throws'}); });
+// ... com os ouvintes de host que escrevem no painel (AC-9107-8: o texto fica; um caso por tipo de resposta sem tarefa em NOTASK_HOST_KINDS,
+// nas três consultas ativas e com os dois ouvintes)
+NOTASK_HOST_KINDS.forEach(function (kind) {
+    ACTIVE_CONTEXTS.forEach(function (context) {
+        ['writes-failed', 'writes-finish'].forEach(function (host) {
+            register('notask:' + kind + ':' + context + ':' + host, function () { return noTaskResponse(kind, context, {host: host}); });
+        });
+    });
+});
+// ... com o comando seguinte e com o template sem o espaço do aviso (robustez, sem ID)
+['s204', 's304', 'json_empty', 'json_taskarray', 'json_taskempty'].forEach(function (kind) {
+    register('notask:' + kind + ':active:2:next', function () { return noTaskResponse(kind, 'active:2', {next: true}); });
+});
+register('notask:s204:active:2:nospace', function () { return noTaskResponse('s204', 'active:2', {world: TEMPLATES.nospace}); });
+register('notask:json_empty:cancel:second:nospace', function () { return noTaskResponse('json_empty', 'cancel:second', {world: TEMPLATES.nospace}); });
+// o 200 sem corpo (`body: ''`, a forma fiel ao jQuery: `parsererror` com status 200) continua levando ao login, como todo 200 que não é JSON
+register('status:empty200', function () {
+    const world = createWorld();
+    world.execute('t1');
+    world.answerStatus({status: 200, body: ''});
+    return {after: world.state()};
+});
+
+['cancel', 'switch'].forEach(function (trigger) {
+    [1, 2, 3].forEach(function (waits) {
+        register('abort:' + trigger + ':' + waits + ':timer', function () { return abort(trigger, waits, false); });
+    });
+    [2, 3].forEach(function (waits) {
+        register('abort:' + trigger + ':' + waits + ':flight', function () { return abort(trigger, waits, true); });
+    });
+});
+register('abort:none:2', function () { return noAbortControl(2); });
+register('abort:none:1', function () { return noAbortControl(1); });
+// AC-8967-3: o template publica o texto de execução traduzido; é ele que fica no painel enquanto o acompanhamento segue
+register('abort:none:1:translated', function () { return noAbortControl(1, 'Executando comando...'); });
+
+// AC-8967-1: a consulta em voo que termina depois da interrupção por resposta «não pronta» ou por falha
+['cancel', 'switch'].forEach(function (trigger) {
+    [2, 3].forEach(function (waits) {
+        register('abort:' + trigger + ':' + waits + ':flight:notready', function () { return abort(trigger, waits, true, 'notready'); });
+        FAILURE_KINDS.forEach(function (kind) {
+            register('abort:' + trigger + ':' + waits + ':flight:fail:' + kind, function () { return abort(trigger, waits, true, kind); });
+        });
+    });
+    FAILURE_KINDS.forEach(function (kind) {
+        register('first:' + trigger + ':fail:' + kind, function () { return abortFirstInFlight(trigger, kind); });
+    });
+});
+// ... com um ouvinte de host de `update-failed` que lança: o painel já está vazio quando ele lança
+register('abort:cancel:2:flight:fail:callback-throws', function () { return abort('cancel', 2, true, 'http403', true); });
+// AC-9018-5 (controle): sem interrupção, um aviso de `updating` por resposta
+register('follow:ready', followReady);
+
+// AC-8955-1 e -2
+['cancel', 'switch'].forEach(function (trigger) {
+    register('submit:' + trigger, function () { return abortDuringSubmit(trigger, true); });
+    ['notready', 'ready'].forEach(function (answer) {
+        register('first:' + trigger + ':' + answer, function () { return abortFirstInFlight(trigger, answer); });
+    });
+});
+register('submit:none', function () { return abortDuringSubmit('cancel', false); });
+
+// #8968, AC-8968-1 a -3: o host que chama o ajax() mais de uma vez, e o init() no meio
+register('ajax:again:new', function () { return againChain('new', 1); });
+register('ajax:again:same', function () { return againChain('same', 1); });
+register('ajax:again:many', function () { return againChain('new', 3); });
+register('ajax:again:mixed', function () { return againChain('mixed', 3); });
+register('ajax:reinit:many', function () { return reinitChain(2); });
+register('ajax:reinit', function () { return reinitChain(1); });
+['cancel', 'switch'].forEach(function (trigger) {
+    register('ajax:again:same:interrupt:' + trigger, function () { return againInterrupt(trigger); });
+});
+// Robustez (sem ID)
+register('ajax:reinit:override', reinitOverride);
+register('robust:init-without-ajax', initWithoutAjax);
+
+// AC-8955-3, -4 e -5
+['first', 'second'].forEach(function (run) {
+    register('revoke-window:' + run, function () { return revokeWindow(run); });
+});
+register('revoke-window:late-failure', revokeLateFailureInWindow);
+register('revoke:after-answer', revokeAfterAnswer);
+['before-any-submit', 'first-window', 'second-window', 'refused'].forEach(function (kind) {
+    register('script-revoke:' + kind + ':full', function () { return scriptRevokeWithoutTask(kind, 'full'); });
+});
+register('script-revoke:first-window:nospace', function () { return scriptRevokeWithoutTask('first-window', 'nospace'); });
+
+// Robustez (sem ID)
+register('robust:duplicate:after-cancel', function () { return duplicateSubmit('after-cancel'); });
+register('robust:duplicate:following', function () { return duplicateSubmit('following'); });
+register('robust:refused-after-interrupt', refusedAfterInterrupt);
+register('robust:host-without-begin', hostWithoutBegin);
+register('robust:released-boundary', releasedBoundary);
+register('robust:ajax-without-before-submit', ajaxWithoutBeforeSubmit);
+
+['submit', 'cancel', 'switch', 'revoke', 'none'].forEach(function (trigger) {
+    register('clear:' + trigger, function () { return clearAlert(trigger); });
+});
+
+register('done:output', function () { return done('output'); });
+register('done:traceback', function () { return done('traceback'); });
+register('form:login200', formLogin);
+register('boot:list', function () { return boot(true); });
+register('boot:text', function () { return boot(false); });
+
+// AC-8954-1, -2 (o 403) e -3 (a tela de login): na 1ª consulta e depois de falhas
+['first', 'network', 'nobody', 'nobody+network'].forEach(function (prior) {
+    register('workers:forbidden:' + prior, function () { return workersForbidden(prior); });
+    register('workers:login:' + prior, function () { return workersLogin(prior); });
+});
+// AC-8954-5: o host sem a frase, sem o plugin de toast e sem o #popup-msg
+['nophrase', 'noplugin', 'none'].forEach(function (toast) {
+    register('workers:host:' + toast, function () { return workersForbidden('first', {toast: toast}); });
+});
+// AC-8954-8 (o login sem destino) e o controle do AC-8954-6 (a chamada sem argumento)
+register('workers:noarg:login', function () { return workersWithoutArgument(LOGIN_PAGE); });
+register('workers:noarg:network', function () { return workersWithoutArgument(WORKERS_FAILURES.network); });
+// AC-8954-6: refaz em 5 s
+Object.keys(WORKERS_FAILURES).forEach(function (kind) {
+    register('workers:retry:' + kind, function () { return workersRetry(kind, 'page'); });
+});
+register('workers:retry:network:noreason', function () { return workersRetry('network', 'noreason'); });
+// AC-8954-7: o resultado no aviso
+register('workers:result:listed', function () { return workersResult('listed'); });
+register('workers:result:nobody', function () { return workersResult('nobody'); });
+
+// #9106 (AC-9106-1 a -10): o envio, a revogação e a sonda respondidos com sucesso e sem o campo que leem. Cada forma em cada contexto, um mundo
+// novo para cada; os controles (as formas que o servidor manda) ao lado.
+Object.keys(SUBMIT_NOTASK).forEach(function (kind) {
+    SUBMIT_CONTEXTS.forEach(function (context) {
+        register('submitnotask:' + kind + ':' + context, function () { return submitAnswer(kind, context); });
+        // AC-9106-9: o mesmo, depois de um 400 com os erros do formulário
+        register('marks:' + kind + ':' + context, function () { return submitAnswer(kind, context, {priorRefusal: true}); });
+    });
+});
+Object.keys(SUBMIT_TASK).forEach(function (kind) {
+    register('submittask:' + kind, function () { return submitAnswer(kind, 'active'); });
+});
+// AC-9106-3: um host com template próprio, sem o espaço do aviso nem os textos (`nospace`): a tela é solta, em silêncio, sem erro de script
+['s204', 'task_noid'].forEach(function (kind) {
+    register('submitnotask:' + kind + ':nospace', function () { return submitAnswer(kind, 'active', {world: TEMPLATES.nospace}); });
+});
+Object.keys(REVOKE_NOBODY).forEach(function (kind) {
+    ['tracking', 'late'].forEach(function (phase) {
+        register('revokenobody:' + kind + ':' + phase, function () { return revokeNobody(kind, phase); });
+    });
+});
+Object.keys(WORKERS_NOSHAPE).forEach(function (kind) {
+    register('workersnoshape:' + kind, function () { return workersNoShape(kind); });
+    register('workerskeep:' + kind, function () { return workersKeepNotice(kind); });
+    register('workerspage:' + kind, function () { return workersNoShapePage(kind); });
+});
+Object.keys(WORKERS_CONTROLS).forEach(function (kind) {
+    register('workersnoshape:control:' + kind, function () { return workersNoShape(kind); });
+});
+// AC-8954-9: a tela com a consulta de workers ligada
+register('boot:workers', function () {
+    const world = createWorld({workers: 'page'});
+    return {state: world.state(), boot: world.boot()};
+});
+
+// #8961: o motivo da falha, o aviso e o tempo limite
+// AC-8961-6: o host que traz só parte dos textos novos (os modelos de FAILURE_TEMPLATES que não são os de sempre)
+['http500', 'http429', 'html502', 'network'].forEach(function (kind) {
+    ['oldtexts', 'noserver', 'nonetwork'].forEach(function (template) {
+        register('status:' + kind + ':' + template, function () { return statusFailure(kind, template); });
+    });
+});
+// AC-8961-3 e -6: o corte da 1ª consulta (o modelo de cada host), o da 2ª, o da respondida a tempo (controle), o valor do host
+['full', 'nospace', 'spaceonly', 'oldtexts'].forEach(function (template) {
+    register('timeout:status:first:' + template, function () { return timeoutFirst(template); });
+});
+register('timeout:status:second', timeoutSecond);
+register('timeout:status:answered', timeoutAnswered);
+register('timeout:status:value:5000', function () { return timeoutValue(5000); });
+register('timeout:status:value:zero', function () { return timeoutValue(0); });
+register('timeout:status:before-init', timeoutBeforeInit);
+['cancel', 'switch'].forEach(function (trigger) {
+    register('timeout:status:interrupted:' + trigger, function () { return timeoutInterrupted(trigger); });
+});
+// AC-9016-1, AC-8961-6, AC-9019-1 e AC-9017-1: o envio que falha
+['http500', 'http503', 'network', 'http400'].forEach(function (kind) {
+    register('form:' + kind + ':full', function () { return formFailure(kind, 'full'); });
+});
+['http500', 'network'].forEach(function (kind) {
+    ['nospace', 'spaceonly', 'oldtexts'].forEach(function (template) {
+        register('form:' + kind + ':' + template, function () { return formFailure(kind, template); });
+    });
+});
+register('form:4xx-sweep', formSweep);
+// AC-9016-1 e -3 (#9016): a recusa em cada status, com o envio interrompido; o 202 que não é JSON; os modelos de host e o host sem campo
+['cancel', 'switch'].forEach(function (trigger) {
+    register('form:4xx-sweep:' + trigger, function () { return formSweepInterrupted(trigger); });
+});
+register('form:html202', formHtml202);
+register('form:below400-sweep', formBelow400Sweep);
+register('bad400:nofield-on-page', bad400NoFieldOnPage);
+// os modelos de host de AC-9016-3: sem o texto de recusa (a recusa solta a tela, sem texto) e só com ele
+['http403', 'http429'].forEach(function (kind) {
+    ['nospace', 'spaceonly', 'oldtexts', 'norefused'].forEach(function (template) {
+        register('form:' + kind + ':' + template, function () { return formFailure(kind, template); });
+    });
+});
+register('form:http403:onlyrefused', function () { return formFailure('http403', 'onlyrefused'); });
+['http500', 'network'].forEach(function (kind) {
+    ['norefused', 'onlyrefused'].forEach(function (template) {
+        register('form:' + kind + ':' + template, function () { return formFailure(kind, template); });
+    });
+});
+['submit', 'switch'].forEach(function (trigger) {
+    register('clear:refusal:' + trigger, function () { return clearRefusal(trigger); });
+});
+// AC-9017-1 (#9017) e AC-9016-1 (#9016): o 400 sem os erros do formulário, cada forma em cada contexto; e a robustez sem ID
+Object.keys(BAD400_RESPONSES).forEach(function (kind) {
+    BAD400_CONTEXTS.forEach(function (context) {
+        register('bad400:' + kind + ':' + context, function () { return bad400(kind, context); });
+    });
+});
+register('bad400:field-next', bad400FieldNext);
+['nojson', 'html'].forEach(function (kind) {
+    register('bad400:next:' + kind, function () { return bad400Next(kind); });
+});
+['cancel', 'switch'].forEach(function (trigger) {
+    ['http500', 'network', 'http403'].forEach(function (kind) {
+        register('submit:' + trigger + ':fail:' + kind, function () { return submitInterruptedFailure(trigger, kind); });
+    });
+});
+// AC-9107-2 (antes AC-9018-2 e AC-8961-8) e AC-8961-10: o motivo que os ouvintes do evento recebem
+['http400', 'http429', 'http500', 'html502', 'html202', 'network', 'timeout', 'http403', 'http404', 'html200'].forEach(function (kind) {
+    register('reasons:' + kind, function () { return failureReasons(kind); });
+});
+// AC-8961-5: o corte da consulta de workers
+['default', 'custom', 'hostload', 'zero'].forEach(function (how) {
+    register('workers:timeout:' + how, function () { return workersTimeout(how); });
+});
+// AC-8961-6 (o host com só um dos textos): o envio que falha e o corte da consulta de estado
+['http500', 'network'].forEach(function (kind) {
+    ['noserver', 'nonetwork'].forEach(function (template) {
+        register('form:' + kind + ':' + template, function () { return formFailure(kind, template); });
+    });
+});
+['noserver', 'nonetwork'].forEach(function (template) {
+    register('timeout:status:first:' + template, function () { return timeoutFirst(template); });
+});
+// AC-8961-5: o valor que o host atribui depois da 1ª consulta
+register('workers:timeout:later', workersTimeoutLater);
+// AC-8961-11: o envio e a revogação sem corte por tempo
+['default', '5000', 'zero'].forEach(function (how) {
+    register('timeout:out-of-scope:' + how, function () { return outOfScope(how); });
+});
+
+// ---------------------------------------------------------------- #9019: os campos de argumentos nas duas variantes
+// A variante larga mantém os ids de sempre; a estreita leva o sufixo `-md` (os do `response-form-task-args-md.html`).
+const ARGS_SELECTORS = {
+    wide: {args: '#task-args', kwargs: '#task-kwargs'},
+    narrow: {args: '#task-args-md', kwargs: '#task-kwargs-md'},
+};
+const TYPED_TEXT = '"a", "b"';
+// O que o servidor ecoa na mensagem de erro de um campo (o `ast.literal_eval` devolve o que o usuário digitou): marcação, de propósito.
+const ECHOED_TEXT = '<b>typed</b>';
+const REFUSALS = {
+    args: {args: ['bad args']},
+    kwargs: {kwargs: ['bad kwargs']},
+    command: {app_command: ['bad command']},
+    all: FIELD_ERRORS_400,
+    // o campo do comando recusado de novo, com outra mensagem (a segunda resposta de uma sequência)
+    second: {app_command: ['second bad command']},
+    echo: {app_command: [ECHOED_TEXT], args: [ECHOED_TEXT], kwargs: [ECHOED_TEXT]},
+    // campos que a tela não mapeia: um nome qualquer, e dois que existem em todo objeto (`constructor`, `__proto__`: o `JSON.parse` os
+    // cria como chaves PRÓPRIAS, como o corpo de um 400 de verdade; um literal `{__proto__: …}` mudaria o protótipo). O campo conhecido
+    // (`args`) vem DEPOIS deles: um erro de script no laço o esconderia.
+    unknown: JSON.parse('{"ghost": ["no such field"], "constructor": ["inherited name"], "__proto__": ["proto name"], "args": ["bad args"]}'),
+};
+function refusal(kind) {
+    return {status: 400, responseJSON: {form: {errors: REFUSALS[kind]}}};
+}
+
+// AC-9019-3 e -4: o usuário muda o texto de um campo (um evento por vez) e o apaga depois; o que o campo do formulário e o campo da
+// outra variante guardam, num mundo com as duas variantes ou com uma só (o host).
+function argsTyping(variants, variant, field, event) {
+    const world = createWorld({argsVariants: variants});
+    const selector = ARGS_SELECTORS[variant][field];
+    world.type(selector, TYPED_TEXT, [event]);
+    const result = {afterText: world.state()};
+    world.type(selector, '', [event]);
+    result.afterEmpty = world.state();
+    return result;
+}
+
+// AC-9019-2 e -10: o 400 com os erros do formulário, num mundo com as duas variantes ou com uma só.
+function argsRefusal(variants, kind) {
+    const world = createWorld({argsVariants: variants});
+    world.executeStart();
+    world.formError(refusal(kind));
+    return {after: world.state()};
+}
+
+// AC-9019-5 e -9: a recusa e, depois, a resposta seguinte (aceita, falha de rede ou outra recusa): o que sobra na tela.
+function errorsThenAnswer(first, second) {
+    const world = createWorld();
+    world.executeStart();
+    world.formError(refusal(first));
+    const result = {afterFirst: world.state()};
+    world.executeStart();
+    if (second === 'accepted') world.formValid('t1');
+    else if (second === 'network') world.formError({status: 0});
+    else world.formError(refusal(second));
+    result.afterSecond = world.state();
+    return result;
+}
+
+// AC-9019-8: a página de um host que traz só uma das variantes: digitar, a recusa e a resposta aceita.
+function hostFlow(variant) {
+    const world = createWorld({argsVariants: variant});
+    ['args', 'kwargs'].forEach(function (field) {
+        ['input', 'change'].forEach(function (event) { world.type(ARGS_SELECTORS[variant][field], TYPED_TEXT, [event]); });
+    });
+    const result = {afterTyping: world.state()};
+    world.executeStart();
+    world.formError(refusal('all'));
+    result.afterRefusal = world.state();
+    world.executeStart();
+    world.formValid('t1');
+    result.afterAccepted = world.state();
+    return result;
+}
+
+// AC-9019-3 e -4: um mundo por variante, argumento e evento, com as duas variantes e com a variante só
+['wide', 'narrow'].forEach(function (variant) {
+    ['args', 'kwargs'].forEach(function (field) {
+        ['input', 'change'].forEach(function (event) {
+            const suffix = variant + ':' + field + ':' + event;
+            register('args:type:both:' + suffix, function () { return argsTyping('both', variant, field, event); });
+            register('args:type:solo-' + suffix, function () { return argsTyping(variant, variant, field, event); });
+        });
+    });
+});
+// AC-9019-2 e -10: o 400 com as duas variantes (o erro de cada campo, o de todos, o texto ecoado) e com uma variante só
+['args', 'kwargs', 'command', 'all', 'echo', 'unknown'].forEach(function (kind) {
+    register('errors:400:both:' + kind, function () { return argsRefusal('both', kind); });
+});
+['wide', 'narrow'].forEach(function (variant) {
+    register('errors:400:solo-' + variant + ':all', function () { return argsRefusal(variant, 'all'); });
+});
+// AC-9019-5 e -9: a recusa seguida de resposta aceita, de falha de rede e de outra recusa
+[['all', 'accepted'], ['all', 'network'], ['all', 'second'], ['command', 'accepted'], ['command', 'network'], ['command', 'args']]
+    .forEach(function (pair) {
+        register('errors:clean:' + pair[0] + ':' + pair[1], function () { return errorsThenAnswer(pair[0], pair[1]); });
+    });
+// AC-9019-8: o host de uma variante só
+['wide', 'narrow'].forEach(function (variant) {
+    register('host:' + variant, function () { return hostFlow(variant); });
+});
+
+const initial = createWorld().state();
+process.stdout.write(JSON.stringify({
+    constants: {
+        texts: TEXTS,
+        page: PAGE,
+        serverErrorText: SERVER_ERROR_TEXT,
+        fieldErrors400: FIELD_ERRORS_400,
+        argsSelectors: ARGS_SELECTORS,
+        typedText: TYPED_TEXT,
+        echoedText: ECHOED_TEXT,
+        refusals: REFUSALS,
+        hiddenSelectors: {args: '#id_args', kwargs: '#id_kwargs'},
+        // #9005: os tipos de falha da consulta (a lista de `STATUS_FAILURES`, tirada daqui), os do meio (mais o corte real) e os textos
+        statusFailureKinds: Object.keys(STATUS_FAILURES),
+        midwayKinds: MIDWAY_KINDS,
+        midwayHostText: MIDWAY_HOST_TEXT,
+        // #9018 e #9107: as formas de resposta sem tarefa (a lista é tirada daqui), os contextos em que chegam, as formas que SÃO a tarefa
+        // (AC-9107-5 a -7) e os tipos de resposta sem tarefa do texto de host (AC-9107-8)
+        noTaskKinds: Object.keys(NOTASK_RESPONSES),
+        noTaskContexts: NOTASK_CONTEXTS,
+        wellFormedKinds: Object.keys(WELLFORMED_RESPONSES),
+        noTaskHostKinds: NOTASK_HOST_KINDS,
+        activeContexts: ACTIVE_CONTEXTS,
+        // #9106: as formas do envio respondido sem tarefa e com tarefa, os contextos em que chegam, as da revogação sem o campo `status` e as da
+        // sonda sem a forma (a lista é tirada daqui: uma forma nova entra sozinha nos testes), e os controles da sonda
+        submitNoTaskKinds: Object.keys(SUBMIT_NOTASK),
+        submitTaskKinds: Object.keys(SUBMIT_TASK),
+        submitContexts: SUBMIT_CONTEXTS,
+        revokeNoBodyKinds: Object.keys(REVOKE_NOBODY),
+        workersNoShapeKinds: Object.keys(WORKERS_NOSHAPE),
+        workersControlKinds: Object.keys(WORKERS_CONTROLS),
+        // #9017: as formas do 400 sem os erros do formulário (a lista é tirada daqui: uma forma nova entra sozinha nos testes) e os contextos
+        bad400NoField: Object.keys(BAD400_NOFIELD),
+        bad400Field: Object.keys(BAD400_FIELD),
+        bad400Contexts: BAD400_CONTEXTS,
+        translatedRunningText: TRANSLATED_RUNNING_TEXT,
+        initialButtons: {
+            execute: initial.execute.disabled,
+            cancel: initial.cancel.disabled,
+            revoke: initial.revoke.disabled,
+        },
+    },
+    scenarios: scenarios,
+}) + '\n');

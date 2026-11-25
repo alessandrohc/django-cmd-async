@@ -39,6 +39,7 @@ class CompiledCatalogTest(SimpleTestCase):
                                 msg='{0} has no compiled .mo'.format(po_path))
 
     def test_the_shipped_catalog_matches_a_fresh_compile(self):
+        """AC-8969-4 (controle): o catálogo pt_BR compilado traz cada mensagem que o .po traduz de forma definitiva (o msgfmt deixa de fora a entrada sem tradução e a fuzzy)."""
         po_paths = sorted(LOCALE_DIR.glob('*/LC_MESSAGES/django.po'))
         self.assertTrue(po_paths, msg='no .po found -- the glob is wrong')
 
@@ -57,6 +58,20 @@ class CompiledCatalogTest(SimpleTestCase):
                 self.assertEqual(shipped_header.get('plural-forms'),
                                  fresh_header.get('plural-forms'),
                                  msg='{0}: Plural-Forms drifted'.format(locale))
+
+
+class PoSourceTest(SimpleTestCase):
+    """The ``.po`` files carry no pending ``#, fuzzy`` entry (robustez, sem ID)."""
+
+    def test_no_po_has_a_fuzzy_entry(self):
+        # Uma entrada fuzzy não entra no .mo (o Django a ignora em runtime) e passa o teste de compilação acima: a tradução
+        # «feita» não chegaria ao usuário. O msgmerge as cria ao casar uma frase nova com uma parecida (#8954).
+        po_paths = sorted(LOCALE_DIR.glob('*/LC_MESSAGES/django.po'))
+        self.assertTrue(po_paths, msg='no .po found -- the glob is wrong')
+        for po_path in po_paths:
+            with self.subTest(locale=po_path.parent.parent.name):
+                self.assertNotRegex(po_path.read_text(encoding='utf-8'), r'(?m)^#,.*\bfuzzy\b',
+                                    msg='{0} has a pending fuzzy entry: review it and drop the flag'.format(po_path))
 
 
 class CatalogDiscoveryTest(SimpleTestCase):

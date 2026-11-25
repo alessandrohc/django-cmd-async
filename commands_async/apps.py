@@ -10,4 +10,5 @@ class CommandsAsyncConfig(AppConfig):
     verbose_name = _("Asynchronous commands")
 
     def ready(self):
-        """"""
+        """Registers the system check of the owner cache (importing the module registers it)."""
+        from . import checks  # noqa: F401

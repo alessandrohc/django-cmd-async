@@ -18,6 +18,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from django.test import SimpleTestCase, TestCase, override_settings
+from django.utils import translation
 
 from test_cmdasync.context_processors import NONCE
 from test_cmdasync.harness import INDEX_URL, create_user
@@ -188,6 +189,207 @@ class DataAttributeContractTest(TestCase):
         # would take it out of the catalog.
         self.assertIn('data-running-text="Running command..."', self.rendered())
 
+    def test_every_data_key_the_script_reads_is_published_by_the_page(self):
+        """AC-9016-2 (controle): cada chave que o cmdasync-page.js lê do painel (`$panel.data('<chave>')`) é um `data-<chave>` do #task-panel que a página do pacote publica, o `data-refused-text` do texto de recusa entre elas."""
+        # Sem isto, trocar a chave no script e no dublê de node ao mesmo tempo (os testes de node publicam a chave do dublê) deixa tudo
+        # verde, e a página real nunca mostra o texto: o dublê não lê o template (a frase dele tem o seu teste, o do AC-9016-2).
+        source = (STATIC / 'js' / 'cmdasync-page.js').read_text(encoding='utf-8')
+        keys = re.findall(r"\$panel\.data\(['\"]([a-z-]+)['\"]\)", source)
+        self.assertIn('refused-text', keys, msg='the script does not read the refusal text')
+        self.assertGreaterEqual(len(keys), 12, msg='the script reads fewer keys of the panel than it did')
+        index = TagIndex()
+        index.feed(self.rendered())
+        panel = index.by_id.get('task-panel')
+        self.assertIsNotNone(panel, msg='the page has no #task-panel')
+        for key in keys:
+            with self.subTest(key=key):
+                self.assertIn('data-' + key, panel, msg='the script reads "{0}" and the page does not publish it'.format(key))
+
+
+class TagIndex(HTMLParser):
+    """Indexa, por id, os atributos das tags da página (o HTMLParser já desfaz o escape dos valores)."""
+
+    def __init__(self):
+        super().__init__()
+        self.by_id = {}
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if attributes.get('id'):
+            self.by_id[attributes['id']] = attributes
+
+
+# As três frases da falha, exatamente como os AC-8866-1 e AC-8866-4 as dizem (a chave é o data-* do #task-panel).
+ALERT_TEXTS = {
+    'data-revoke-failed-text': 'The revocation request could not be sent.',
+    'data-forbidden-text': 'Access denied: your session may have expired, or you do not have permission to see this task.',
+    'data-not-found-text': 'Task not found.',
+}
+
+# Os dois textos de falha do #8961, exatamente como o AC-8961-7 os diz: o de erro de servidor e o de falha de conexão, em inglês
+# (sem tradução) e em português (o do .po pt_BR); a chave é o data-* do #task-panel.
+FAILURE_TEXTS = {
+    'data-server-error-text': 'The server could not answer the request, and the last command sent may still be running: check before running it again.',
+    'data-network-error-text': 'The connection to the server failed or took too long, and the last command sent may still be running: check before running it again.',
+}
+FAILURE_TEXTS_PT_BR = {
+    'data-server-error-text': 'O servidor não conseguiu responder ao pedido, e o último comando enviado pode continuar em execução: confira antes de executá-lo de novo.',
+    'data-network-error-text': 'A conexão com o servidor falhou ou demorou demais, e o último comando enviado pode continuar em execução: confira antes de executá-lo de novo.',
+}
+
+# O texto de recusa do #9016 (AC-9016-2), exatamente como o critério o diz: em inglês (sem tradução) e em português (o do .po pt_BR).
+REFUSAL_TEXT = ('data-refused-text',
+                'The server refused the request, and the command was not run. If your session has expired, reload the page; otherwise try again in a moment, or check that you have permission to run commands.')
+REFUSAL_TEXT_PT_BR = 'O servidor recusou o pedido, e o comando não foi executado. Se a sessão expirou, recarregue a página; senão, tente de novo daqui a pouco ou confira se você tem permissão para executar comandos.'
+
+
+class AlertContractTest(TestCase):
+    """O que o script usa nos avisos de falha e no texto de execução, publicado pela página do pacote (AC-8866-9, AC-8967-3)."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = create_user()
+
+    def setUp(self):
+        self.client.force_login(self.user)
+
+    def page(self):
+        index = TagIndex()
+        index.feed(self.client.get(INDEX_URL).content.decode('utf-8'))
+        return index.by_id
+
+    def test_the_page_has_an_alert_space_that_starts_hidden(self):
+        """AC-8866-9: a página traz o espaço do aviso, oculto enquanto não há aviso."""
+        space = self.page().get('task-alert')
+        self.assertIsNotNone(space, msg='the page has no #task-alert')
+        self.assertIn('d-none', space.get('class', '').split(), msg='the alert space must start hidden')
+
+    def test_the_page_publishes_the_failure_texts_untranslated(self):
+        """AC-8866-9: os textos da falha chegam ao script, exatamente nas frases dos critérios, quando não há tradução."""
+        panel = self.page()['task-panel']
+        for attribute, phrase in ALERT_TEXTS.items():
+            with self.subTest(attribute=attribute):
+                self.assertEqual(panel.get(attribute), phrase)
+
+    def test_the_page_publishes_the_running_text_translated(self):
+        """AC-8967-3: o texto de execução chega ao script como o template o publica: «Running command...» sem tradução, e traduzido quando há tradução."""
+        phrase = 'Running command...'
+        self.assertEqual(self.page()['task-panel'].get('data-running-text'), phrase)
+        with translation.override('pt-br'):
+            panel = self.page()['task-panel']
+            translated = translation.gettext(phrase)
+            self.assertNotEqual(translated, phrase, msg='the pt_BR catalog has no entry for this phrase')
+            self.assertEqual(panel.get('data-running-text'), translated)
+
+    def test_the_page_publishes_the_server_and_connection_failure_texts_untranslated(self):
+        """AC-8961-7: o painel publica o texto de erro de servidor e o de falha de conexão, exatamente nas frases do critério, quando não há tradução."""
+        panel = self.page()['task-panel']
+        for attribute, phrase in FAILURE_TEXTS.items():
+            with self.subTest(attribute=attribute):
+                self.assertEqual(panel.get(attribute), phrase)
+
+    def test_the_page_publishes_the_server_and_connection_failure_texts_in_pt_br(self):
+        """AC-8961-7: os dois textos chegam em pt_BR, exatamente nas frases do critério, quando o idioma é pt-br (o catálogo traduz as duas frases)."""
+        with translation.override('pt-br'):
+            panel = self.page()['task-panel']
+            for attribute, phrase in FAILURE_TEXTS.items():
+                with self.subTest(attribute=attribute):
+                    self.assertEqual(translation.gettext(phrase), FAILURE_TEXTS_PT_BR[attribute],
+                                     msg='the pt_BR catalog does not translate this phrase')
+                    self.assertEqual(panel.get(attribute), FAILURE_TEXTS_PT_BR[attribute])
+
+    def test_the_page_publishes_the_refusal_text_untranslated(self):
+        """AC-9016-2: o painel publica o texto de recusa, exatamente na frase do critério, quando não há tradução."""
+        attribute, phrase = REFUSAL_TEXT
+        self.assertEqual(self.page()['task-panel'].get(attribute), phrase)
+
+    def test_the_page_publishes_the_refusal_text_in_pt_br(self):
+        """AC-9016-2: o texto de recusa chega em pt_BR, exatamente na frase do critério, quando o idioma é pt-br (o catálogo traduz a frase)."""
+        attribute, phrase = REFUSAL_TEXT
+        with translation.override('pt-br'):
+            self.assertEqual(translation.gettext(phrase), REFUSAL_TEXT_PT_BR, msg='the pt_BR catalog does not translate this phrase')
+            self.assertEqual(self.page()['task-panel'].get(attribute), REFUSAL_TEXT_PT_BR)
+
+    def test_the_page_publishes_the_failure_texts_translated(self):
+        """AC-8866-9: os textos da falha chegam traduzidos para o idioma do usuário quando há tradução."""
+        with translation.override('pt-br'):
+            panel = self.page()['task-panel']
+            for attribute, phrase in ALERT_TEXTS.items():
+                with self.subTest(attribute=attribute):
+                    translated = translation.gettext(phrase)
+                    self.assertNotEqual(translated, phrase, msg='the pt_BR catalog has no entry for this phrase')
+                    self.assertEqual(panel.get(attribute), translated)
+
+
+# A frase de acesso negado do aviso dos workers (AC-8954-4), em inglês (sem tradução) e em português (a do .po pt_BR).
+WORKERS_FORBIDDEN_PHRASE = 'Access denied: your session may have expired, or you do not have permission to see the Celery workers.'
+WORKERS_FORBIDDEN_PHRASE_PT_BR = 'Acesso negado: sua sessão pode ter expirado, ou você não tem permissão para ver os workers do Celery.'
+
+
+class WorkersNoticeContractTest(TestCase):
+    """O que o script de workers usa no aviso dos workers (o toast), publicado pela página do pacote (AC-8954-4)."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = create_user()
+
+    def setUp(self):
+        self.client.force_login(self.user)
+
+    def notice(self):
+        index = TagIndex()
+        index.feed(self.client.get(INDEX_URL).content.decode('utf-8'))
+        return index.by_id.get('popup-msg')
+
+    def notice_html(self):
+        """O HTML do aviso dos workers (do #popup-msg até o #wrap), como a página o entrega."""
+        html = self.client.get(INDEX_URL).content.decode('utf-8')
+        start = html.index("id='popup-msg'")
+        return html[start:html.index('id="wrap"', start)]
+
+    def header_title(self):
+        """O texto do título do cabeçalho do aviso (o `<strong class="mr-auto">` do `.toast-header`), sem o ícone."""
+        match = re.search(r'<div class="toast-header">\s*<strong class="mr-auto">(?:<i[^>]*></i>)?([^<]*)</strong>', self.notice_html())
+        self.assertIsNotNone(match, msg='the notice has no header title')
+        return match.group(1)
+
+    def test_the_notice_header_is_a_neutral_title_untranslated(self):
+        """AC-8969-1: o cabeçalho do aviso dos workers traz o título «Celery workers», exatamente nessas palavras quando não há tradução, sem a palavra «Online»."""
+        title = self.header_title()
+        self.assertEqual(title, 'Celery workers')
+        self.assertNotIn('Online', title)
+
+    def test_the_notice_header_is_a_neutral_title_translated(self):
+        """AC-8969-1: o cabeçalho do aviso dos workers traz o título traduzido para o idioma do usuário quando há tradução (em pt_BR, «Workers do Celery»), sem a palavra «Online»."""
+        with translation.override('pt-br'):
+            # o título exato, e não só «diferente do inglês»: uma entrada fuzzy ou outra frase passaria no assertNotEqual
+            self.assertEqual(translation.gettext('Celery workers'), 'Workers do Celery', msg='the pt_BR catalog has no entry for this title')
+            title = self.header_title()
+            self.assertEqual(title, 'Workers do Celery')
+            self.assertNotIn('Online', title)
+
+    def test_the_notice_header_keeps_its_icon_and_close_button(self):
+        """AC-8969-2 (controle): o cabeçalho do aviso dos workers traz o ícone ao lado do título e o botão de fechar."""
+        notice = self.notice_html()
+        header = notice[notice.index('<div class="toast-header">'):notice.index('<div class="toast-body"')]
+        self.assertRegex(header, r'<strong class="mr-auto"><i class="fa fa-grav"></i>\S', msg='the icon is no longer beside the title')
+        self.assertRegex(header, r'<button[^>]*data-dismiss="toast"', msg='the header lost its close button')
+
+    def test_the_page_publishes_the_workers_forbidden_phrase_untranslated(self):
+        """AC-8954-4: o aviso dos workers traz a frase de acesso negado, exatamente na frase do critério, quando não há tradução."""
+        notice = self.notice()
+        self.assertIsNotNone(notice, msg='the page has no #popup-msg')
+        self.assertEqual(notice.get('data-forbidden-text'), WORKERS_FORBIDDEN_PHRASE)
+
+    def test_the_page_publishes_the_workers_forbidden_phrase_translated(self):
+        """AC-8954-4: o aviso dos workers traz a frase de acesso negado traduzida para o idioma do usuário quando há tradução."""
+        with translation.override('pt-br'):
+            translated = translation.gettext(WORKERS_FORBIDDEN_PHRASE)
+            # a frase em português do plano, e não só «diferente do inglês»: o msgmerge casa a frase nova com a de «… to see this
+            # task.» (fuzzy) e traria «… ver esta tarefa.», que passaria no assertNotEqual
+            self.assertEqual(translated, WORKERS_FORBIDDEN_PHRASE_PT_BR, msg='the pt_BR catalog has no entry for this phrase')
+            self.assertEqual(self.notice().get('data-forbidden-text'), WORKERS_FORBIDDEN_PHRASE_PT_BR)
+
 
 class DomSinkTest(SimpleTestCase):
     """Server data must never be handed to jQuery as markup.
@@ -198,6 +400,7 @@ class DomSinkTest(SimpleTestCase):
     """
 
     def test_no_page_script_writes_html(self):
+        """AC-9019-10 (controle): nenhum script da página entrega dado do servidor ao jQuery como marcação por `.html(`: a mensagem de erro de um campo entra por `.text()`."""
         for name in PAGE_SCRIPTS:
             with self.subTest(script=name):
                 source = (STATIC / name).read_text(encoding='utf-8')
@@ -211,6 +414,7 @@ class DomSinkTest(SimpleTestCase):
         self.assertNotIn('append(task.traceback)', source)
 
     def test_no_page_script_builds_markup_by_concatenation(self):
+        """AC-9019-10 (controle): nenhum script da página monta marcação concatenando um valor (a mensagem de erro de um campo, por exemplo)."""
         # '<p class="...">' + value + '</p>' is the pattern that put worker names
         # and error messages into the DOM as HTML.
         pattern = re.compile(r"""['"]\s*<[a-z]+[^'"]*['"]\s*\+""", re.IGNORECASE)

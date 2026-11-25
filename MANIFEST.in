@@ -9,3 +9,5 @@ recursive-include commands_async/templates *
 # It is kept out of the wheel by [tool.setuptools.packages.find] in pyproject.toml.
 include runtests.py
 recursive-include test_cmdasync *.py
+# The JS harness the page tests run under node (test_page_script.py).
+recursive-include test_cmdasync *.js

@@ -1,0 +1,2197 @@
+# coding=utf-8
+"""A tela de comandos em node: os scripts REAIS (`cmdhandler.js` e `cmdasync-page.js`) rodam com um dublê de jQuery, de DOM e de
+relógio (#8866).
+
+Execução (container `django`, com o `pyenv` do projeto; precisa do `node`, que vem no container):
+    cd /opt/project/packages/django-cmd-async && /opt/project/pyenv/bin/python runtests.py test_cmdasync.test_page_script -v 2
+
+O harness de node (`js_harness/world.js` e `js_harness/scenarios.js`) roda UMA vez por processo e devolve, em JSON, o que a tela
+mostra em cada cenário (resposta do servidor, clique do usuário, relógio); os métodos abaixo afirmam sobre esse JSON, um por
+critério, com o ID na 1ª linha da docstring. Os controles (comportamento que já vale hoje e tem de continuar valendo) levam
+"(controle)" depois do ID.
+
+Sem `node` o teste FALHA, não pula: um pulo daria verde sem provar nada (o mesmo risco do `.mo` velho sem o `msgfmt`,
+`test_locale.py`). O dublê repete as regras do jQuery 3 medidas no Chrome (ver o cabeçalho do `world.js`); os testes da última
+classe conferem, contra o código real, as suposições que ele fixa.
+"""
+import functools
+import json
+import re
+import shutil
+import subprocess
+from html.parser import HTMLParser
+from pathlib import Path
+
+from django.test import SimpleTestCase, TestCase
+
+from test_cmdasync.harness import INDEX_URL, create_user
+
+ROOT = Path(__file__).resolve().parent.parent
+SCENARIOS = Path(__file__).resolve().parent / 'js_harness' / 'scenarios.js'
+CMDHANDLER = ROOT / 'commands_async' / 'static' / 'cmdasync' / 'js' / 'cmdhandler.js'
+JQUERY_FORM = ROOT / 'commands_async' / 'static' / 'cmdasync' / 'js' / 'jquery.form.v4.4.2.min.js'
+STATIC_CMDASYNC = ROOT / 'commands_async' / 'static' / 'cmdasync'
+
+REVOKE_KINDS = ('http403', 'http404', 'http500', 'html200', 'falseWithError', 'falseNoError')
+REVOKE_PHASES = ('tracking', 'late')
+# Os tipos de falha da consulta de estado que chegam ao `.fail` do handler (o `FAILURE_KINDS` do scenarios.js).
+STATUS_FAILURE_KINDS = ('html200', 'http403', 'http404', 'http500', 'network')
+
+
+def interrupted_answer_scenarios():
+    """Os cenários em que a consulta de estado em voo TERMINA depois da interrupção, por resposta ou por falha (AC-8967-1).
+
+    Devolve (nome, o que é o fim): 'answer' para a resposta (pronta ou não) e 'failure' para a falha.
+    """
+    found = []
+    for trigger in ('cancel', 'switch'):
+        for answer in ('notready', 'ready'):
+            found.append(('first:{0}:{1}'.format(trigger, answer), 'answer'))
+        for waits in (2, 3):
+            found.append(('abort:{0}:{1}:flight'.format(trigger, waits), 'answer'))
+            found.append(('abort:{0}:{1}:flight:notready'.format(trigger, waits), 'answer'))
+            for kind in STATUS_FAILURE_KINDS:
+                found.append(('abort:{0}:{1}:flight:fail:{2}'.format(trigger, waits, kind), 'failure'))
+    found.append(('abort:cancel:2:flight:fail:callback-throws', 'failure'))
+    return found
+
+
+@functools.lru_cache(maxsize=1)
+def load_scenarios():
+    node = shutil.which('node')
+    if node is None:
+        raise AssertionError('node is not installed: the page script tests need it, and they do not skip without it')
+    completed = subprocess.run([node, str(SCENARIOS)], capture_output=True, text=True, timeout=120)
+    if completed.returncode != 0:
+        raise AssertionError('the node harness crashed: {0}'.format(completed.stderr))
+    return json.loads(completed.stdout.strip().splitlines()[-1])
+
+
+class ScenarioTestCase(SimpleTestCase):
+    """Base: carrega o JSON dos cenários uma vez e dá os asserts de estado da tela."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.output = load_scenarios()
+        cls.constants = cls.output['constants']
+        cls.texts = cls.constants['texts']
+        cls.login_target = '{0}?{1}={2}'.format(
+            cls.constants['page']['loginUrl'], cls.constants['page']['redirectField'], cls.constants['page']['indexUrl'])
+
+    def scenario(self, name):
+        found = self.output['scenarios'][name]
+        self.assertNotIn('harnessError', found, msg='the harness could not run {0}: {1}'.format(name, found.get('harnessError')))
+        return found
+
+    def assertAtRest(self, state, msg=''):
+        """A tela liberada: Execute habilitado, Cancel e Revoke desabilitados e nenhum indicador de progresso."""
+        for button, disabled in (('execute', False), ('cancel', True), ('revoke', True)):
+            self.assertEqual(state[button]['disabled'], disabled, msg='{0} button disabled? {1}'.format(button, msg))
+            self.assertFalse(state[button]['progressVisible'], msg='{0} button still shows progress. {1}'.format(button, msg))
+
+    def assertAlertShows(self, state, text, msg=''):
+        self.assertIsNotNone(state['alert'], msg='the page has no alert space. {0}'.format(msg))
+        self.assertFalse(state['alert']['hidden'], msg='the alert space is hidden. {0}'.format(msg))
+        self.assertEqual(state['alert']['text'], text, msg=msg)
+
+    def assertAlertEmpty(self, state, msg=''):
+        """Nenhum texto à mostra: sem o espaço, ou com o espaço oculto e vazio."""
+        if state['alert'] is None:
+            return
+        self.assertTrue(state['alert']['hidden'], msg='the alert space is visible. {0}'.format(msg))
+        self.assertEqual(state['alert']['text'], '', msg=msg)
+
+    def expected_revoke_text(self, kind):
+        return self.constants['serverErrorText'] if kind == 'falseWithError' else self.texts['revokeFailedText']
+
+
+class RevocationFailureTest(ScenarioTestCase):
+    """O pedido de revogação que falha (AC-8866-1, -2 e -17)."""
+
+    def test_a_failed_revocation_shows_its_reason_on_the_page(self):
+        """AC-8866-1: a revogação que falha mostra o motivo na tela, e não num alert() do navegador."""
+        for kind in REVOKE_KINDS:
+            for phase in REVOKE_PHASES:
+                name = 'revoke:{0}:full:{1}'.format(kind, phase)
+                with self.subTest(scenario=name):
+                    after = self.scenario(name)['after']
+                    self.assertAlertShows(after, self.expected_revoke_text(kind), msg=name)
+                    self.assertEqual(after['browserAlerts'], [], msg='a browser alert() window was used')
+                    self.assertEqual(after['uncaught'], [])
+
+    def test_a_failed_revocation_gives_the_revoke_button_back_while_tracking(self):
+        """AC-8866-2: com o Execute desabilitado, a falha deixa o Revoke habilitado e sem indicador; com o Execute habilitado, desabilitado."""
+        for kind in REVOKE_KINDS:
+            name = 'revoke:{0}:full:tracking'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                # o botão esperava o servidor desabilitado, com o indicador: é o que a falha desfaz
+                self.assertTrue(found['clicked']['revoke']['disabled'])
+                self.assertTrue(found['clicked']['revoke']['progressVisible'])
+                self.assertTrue(found['after']['execute']['disabled'], msg='precondition: the screen is still tracking')
+                self.assertFalse(found['after']['revoke']['disabled'], msg='the revoke button stayed disabled')
+                self.assertFalse(found['after']['revoke']['progressVisible'], msg='the revoke button kept its progress indicator')
+            name = 'revoke:{0}:full:late'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertAtRest(found['released'], msg='precondition: the screen was released before the failure arrived')
+                self.assertTrue(found['after']['revoke']['disabled'], msg='a late failure re-enabled revoke on a released screen')
+                self.assertFalse(found['after']['revoke']['progressVisible'])
+                self.assertFalse(found['after']['execute']['disabled'])
+
+    def test_an_accepted_revocation_leaves_the_screen_alone(self):
+        """AC-8866-17 (controle): a revogação aceita não mostra aviso e o Revoke segue desabilitado, com indicador, até a tela ser liberada."""
+        found = self.scenario('revoke:accepted')
+        accepted = found['afterAccepted']
+        self.assertAlertEmpty(accepted)
+        self.assertEqual(accepted['browserAlerts'], [])
+        self.assertTrue(accepted['revoke']['disabled'])
+        self.assertTrue(accepted['revoke']['progressVisible'])
+        released = found['afterRelease']
+        self.assertTrue(released['revoke']['disabled'])
+        self.assertFalse(released['revoke']['progressVisible'])
+        self.assertAtRest(released)
+
+
+class StatusFailureTest(ScenarioTestCase):
+    """A consulta de estado que não traz a tarefa (AC-8866-3, -4 e -5)."""
+
+    def test_the_login_page_sends_the_user_to_the_login(self):
+        """AC-8866-3: a consulta de estado que recebe 200 com o HTML do login leva o usuário ao login, com o retorno."""
+        after = self.scenario('status:html200:full')['after']
+        self.assertEqual(after['uncaught'], [], msg='the status callback raised on the login page')
+        self.assertEqual(after['locations'], [self.login_target])
+        self.assertAtRest(after, msg='the screen was left stuck: update-finish never fired')
+
+    def test_the_login_page_in_the_middle_of_the_follow_up_sends_the_user_to_the_login(self):
+        """AC-8866-3: a sessão que expira no meio do acompanhamento leva ao login (a consulta que sai do timer recebe o HTML do login)."""
+        found = self.scenario('status:html200:midway')
+        self.assertEqual(found['after']['uncaught'], [], msg='the status callback raised on the login page')
+        self.assertEqual(found['after']['locations'], [self.login_target])
+        self.assertAtRest(found['after'], msg='the screen was left stuck: update-finish never fired')
+        self.assertEqual(found['later']['liveTimers'], 0, msg='a new query stayed scheduled')
+
+    def test_an_error_page_with_an_http_error_status_is_not_the_login(self):
+        """AC-8866-3 (controle): um erro HTTP com HTML (502) não leva ao login."""
+        after = self.scenario('status:html502:full')['after']
+        self.assertEqual(after['locations'], [])
+        self.assertEqual(after['uncaught'], [])
+        self.assertAtRest(after)
+
+    def test_a_refused_status_query_tells_why(self):
+        """AC-8866-4: o 403 e o 404 da consulta de estado mostram o motivo de cada um, e só o dele."""
+        forbidden = self.scenario('status:http403:full')['after']
+        self.assertAlertShows(forbidden, self.texts['forbiddenText'], msg='403')
+        not_found = self.scenario('status:http404:full')['after']
+        self.assertAlertShows(not_found, self.texts['notFoundText'], msg='404')
+        self.assertNotEqual(forbidden['alert']['text'], not_found['alert']['text'])
+        self.assertEqual(forbidden['browserAlerts'] + not_found['browserAlerts'], [])
+
+    def test_a_failed_status_query_stops_and_releases_the_screen(self):
+        """AC-8866-5 (controle): 403, 404, 429, 500 e a falha de rede param de consultar e liberam a tela."""
+        for kind in ('http403', 'http404', 'http429', 'http500', 'network'):
+            with self.subTest(failure=kind):
+                found = self.scenario('status:{0}:full'.format(kind))
+                self.assertAtRest(found['after'])
+                self.assertEqual(found['after']['liveTimers'], 0, msg='a new query stayed scheduled')
+                self.assertEqual(found['later']['statusRequests'], 1, msg='a new query went out after the failure')
+                self.assertEqual(found['later']['liveTimers'], 0)
+
+
+class StatusFailureTextTest(ScenarioTestCase):
+    """O aviso da consulta de estado que falha por erro de servidor ou de rede (AC-9107-1, AC-8961-2, #8961, #9018 e #9107)."""
+
+    # os erros HTTP que não são 403, 404 nem o 200 que não é JSON; o `html202` é um 2xx com corpo HTML (o que o jQuery real manda ao `.fail`)
+    SERVER_KINDS = ('http400', 'http401', 'http405', 'http429', 'http500', 'http503', 'html502', 'html202')
+
+    def test_a_status_query_that_fails_with_an_http_error_tells_the_server_could_not_answer(self):
+        """AC-9107-1 (controle): o erro HTTP da consulta de estado que não é 403, 404 nem o login mostra o texto de erro de servidor (a metade que já valia; a resposta sem tarefa é o `NoTaskResponseTest`)."""
+        self.assertNotEqual(self.texts['serverFailureText'], self.texts['networkFailureText'], msg='precondition: the two texts differ')
+        for kind in self.SERVER_KINDS:
+            with self.subTest(failure=kind):
+                found = self.scenario('status:{0}:full'.format(kind))
+                after = found['after']
+                self.assertEqual(after['uncaught'], [], msg='the status callback raised')
+                self.assertAlertShows(after, self.texts['serverFailureText'], msg=kind)
+                # a parada e a liberação seguem as de hoje (AC-8866-5): o aviso não prende a tela nem agenda consulta
+                self.assertAtRest(after)
+                self.assertEqual(after['liveTimers'], 0, msg='a new query stayed scheduled')
+                self.assertEqual(found['later']['statusRequests'], 1, msg='a new query went out after the failure')
+
+    def test_a_status_query_without_an_answer_tells_the_connection_failed(self):
+        """AC-8961-2: a consulta de estado que falha sem resposta do servidor (a falha de rede) mostra o texto de falha de conexão."""
+        found = self.scenario('status:network:full')
+        after = found['after']
+        self.assertEqual(after['uncaught'], [])
+        self.assertAlertShows(after, self.texts['networkFailureText'], msg='network')
+        self.assertAtRest(after)
+        self.assertEqual(after['liveTimers'], 0, msg='a new query stayed scheduled')
+        self.assertEqual(found['later']['statusRequests'], 1, msg='a new query went out after the failure')
+
+    def test_the_notice_also_shows_when_the_follow_up_was_interrupted(self):
+        """AC-9107-1 (controle), AC-8961-2: com o acompanhamento interrompido (Cancel ou troca de comando), a consulta em voo que falha mostra o mesmo aviso (a metade que já valia)."""
+        cases = []
+        for trigger in ('cancel', 'switch'):
+            for waits in (2, 3):
+                cases.append(('abort:{0}:{1}:flight:fail:http500'.format(trigger, waits), 'serverFailureText'))
+                cases.append(('abort:{0}:{1}:flight:fail:network'.format(trigger, waits), 'networkFailureText'))
+            cases.append(('first:{0}:fail:http500'.format(trigger), 'serverFailureText'))
+            cases.append(('first:{0}:fail:network'.format(trigger), 'networkFailureText'))
+        self.assertEqual(len(cases), 12, msg='the case list changed size')
+        for name, text in cases:
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertEqual(found['afterAbort']['pendingStatus'], 1, msg='precondition: the query is in flight')
+                self.assertAlertEmpty(found['afterAbort'], msg='precondition: the Cancel or the switch hid the previous notice')
+                answered = found['afterAnswer']
+                self.assertEqual(answered['pendingStatus'], 0, msg='precondition: the query ended')
+                self.assertAlertShows(answered, self.texts[text], msg=name)
+                self.assertAtRest(answered)
+
+
+class StatusTimeoutTest(ScenarioTestCase):
+    """O tempo limite da consulta de estado e a propriedade `query_timeout` do handler (AC-8961-3, #8961)."""
+
+    def test_a_status_query_without_an_answer_is_cut_after_30_seconds_as_a_connection_failure(self):
+        """AC-8961-3: a consulta de estado sem resposta é cortada aos 30 s e tratada como a falha de rede (texto de conexão, tela liberada)."""
+        found = self.scenario('timeout:status:first:full')
+        self.assertEqual(found['start']['pendingStatus'], 1, msg='precondition: the query is in flight')
+        self.assertEqual(found['start']['statusTimeouts'], [30000], msg='the status query does not carry the 30 s limit')
+        waiting = found['at29999']
+        self.assertEqual(waiting['pendingStatus'], 1, msg='the query was cut before 30 seconds')
+        self.assertTrue(waiting['execute']['disabled'], msg='the screen was released before 30 seconds')
+        self.assertAlertEmpty(waiting, msg='a notice showed before the limit')
+        cut = found['at30000']
+        self.assertEqual(cut['uncaught'], [])
+        self.assertEqual(cut['pendingStatus'], 0, msg='the query was not cut at 30 seconds')
+        self.assertAlertShows(cut, self.texts['networkFailureText'], msg='the cut is a connection failure')
+        self.assertAtRest(cut)
+        self.assertEqual(cut['liveTimers'], 0, msg='a new query stayed scheduled')
+        self.assertEqual(found['later']['statusRequests'], 1, msg='a new query went out after the cut')
+
+    def test_each_status_query_has_its_own_limit_counted_from_its_send(self):
+        """AC-8961-3: a 2ª consulta do acompanhamento (enviada 1 s depois de uma resposta «não pronta») tem o limite dela, contado do envio dela."""
+        # Aqui não se afirma o painel: o que a falha da 2ª consulta em diante deixa nele (e o corte aos 30 s) é o AC-9005-1 (`FailureMidwayTest`).
+        found = self.scenario('timeout:status:second')
+        start = found['start']
+        self.assertEqual(start['statusRequests'], 2, msg='precondition: the second query went out')
+        self.assertEqual(start['pendingStatus'], 1, msg='precondition: the second query is in flight')
+        self.assertEqual(start['statusTimeouts'], [30000, 30000], msg='the queries do not carry the 30 s limit')
+        self.assertEqual(found['at29999']['pendingStatus'], 1, msg='the second query was cut before its own 30 seconds')
+        cut = found['at30000']
+        self.assertEqual(cut['pendingStatus'], 0, msg='the second query was not cut 30 seconds after its send')
+        self.assertAlertShows(cut, self.texts['networkFailureText'])
+        self.assertAtRest(cut)
+
+    def test_a_status_query_answered_in_time_is_not_cut(self):
+        """AC-8961-3 (controle): a consulta respondida antes do limite não é cortada depois dele."""
+        found = self.scenario('timeout:status:answered')
+        self.assertEqual(found['afterAnswer']['output'], 'done', msg='precondition: the answer ended the follow-up')
+        later = found['later']
+        self.assertEqual(later['uncaught'], [], msg='the cut of an answered query raised')
+        self.assertEqual(later['output'], 'done')
+        self.assertAlertEmpty(later, msg='an answered query was cut')
+        self.assertEqual(later['statusRequests'], 1)
+
+    def test_the_value_the_host_assigns_is_the_limit_and_zero_turns_the_cut_off(self):
+        """AC-8961-3: o `query_timeout` que o host atribui depois do `init()` é o limite da consulta (5000 corta aos 5 s), e 0 desliga o corte."""
+        custom = self.scenario('timeout:status:value:5000')
+        self.assertEqual(custom['start']['statusTimeouts'], [5000], msg='the status query does not carry the value the host assigned')
+        self.assertEqual(custom['beforeCut']['pendingStatus'], 1, msg='the query was cut before the value the host assigned')
+        self.assertEqual(custom['afterCut']['pendingStatus'], 0, msg='the query was not cut at the value the host assigned')
+        self.assertAlertShows(custom['afterCut'], self.texts['networkFailureText'])
+        self.assertAtRest(custom['afterCut'])
+        zero = self.scenario('timeout:status:value:zero')
+        self.assertEqual(zero['start']['statusTimeouts'], [0], msg='the status query does not carry the zero the host assigned')
+        self.assertEqual(zero['beforeCut']['pendingStatus'], 1, msg='the query was cut with the limit turned off')
+        self.assertAlertEmpty(zero['beforeCut'])
+        self.assertTrue(zero['beforeCut']['execute']['disabled'], msg='the screen was released with the limit turned off')
+
+    def test_the_value_assigned_before_the_init_survives_it(self):
+        """AC-8961-3: o valor que o host atribui ao `query_timeout` antes do `init()` sobrevive a ele, e a consulta seguinte o leva."""
+        found = self.scenario('timeout:status:before-init')
+        self.assertEqual(found['afterInit'], 5000, msg='the init() reset the value the host assigned')
+        self.assertEqual(found['afterRequest']['statusTimeouts'], [5000], msg='the query after the init() does not carry the value')
+
+    def test_the_cut_after_an_interruption_releases_the_screen_with_the_connection_notice(self):
+        """AC-8961-3, AC-8961-2: o Cancel ou a troca de comando com a consulta em voo, e o corte aos 30 s depois deles, liberam a tela com o aviso de conexão."""
+        for trigger in ('cancel', 'switch'):
+            with self.subTest(trigger=trigger):
+                found = self.scenario('timeout:status:interrupted:{0}'.format(trigger))
+                self.assertEqual(found['afterAbort']['pendingStatus'], 1, msg='precondition: the query is in flight')
+                cut = found['afterCut']
+                self.assertEqual(cut['pendingStatus'], 0, msg='the query was not cut at 30 seconds')
+                self.assertAlertShows(cut, self.texts['networkFailureText'])
+                self.assertAtRest(cut)
+
+
+class FormFailureTest(ScenarioTestCase):
+    """O envio do formulário que falha: o texto de cada falha e a tela (AC-9016-1, AC-9019-1 e AC-9017-1, #8961, #9016, #9019 e #9017)."""
+
+    def test_a_submit_that_fails_with_a_server_error_or_no_answer_tells_why(self):
+        """AC-9016-1 (controle): o envio que falha por 5xx mostra o texto de erro de servidor, e o que falha sem resposta, o de falha de conexão."""
+        for name, text in (('form:http500:full', 'serverFailureText'), ('form:http503:full', 'serverFailureText'),
+                           ('form:network:full', 'networkFailureText')):
+            with self.subTest(scenario=name):
+                after = self.scenario(name)['after']
+                self.assertEqual(after['uncaught'], [])
+                self.assertAlertShows(after, self.texts[text], msg=name)
+                self.assertAtRest(after)
+
+    def test_the_notice_also_shows_when_the_submit_was_interrupted(self):
+        """AC-9016-1: o Cancel ou a troca de comando com o envio em voo, que depois falha (5xx, sem resposta ou recusa 4xx), mostra o aviso da falha."""
+        for trigger in ('cancel', 'switch'):
+            for kind, text in (('http500', 'serverFailureText'), ('network', 'networkFailureText'), ('http403', 'refusedFailureText')):
+                name = 'submit:{0}:fail:{1}'.format(trigger, kind)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.assertTrue(found['afterAbort']['execute']['disabled'], msg='precondition: the submit is in flight')
+                    self.assertAlertEmpty(found['afterAbort'], msg='precondition: the Cancel or the switch hid the previous notice')
+                    self.assertAlertShows(found['afterFail'], self.texts[text], msg=name)
+                    self.assertAtRest(found['afterFail'])
+
+    def test_a_submit_refused_with_a_4xx_shows_the_refusal_text(self):
+        """AC-9016-1: o envio recusado com qualquer erro 4xx (de 401 a 499) mostra o texto de recusa no aviso, e não os de erro de servidor nem de falha de conexão, com o envio em voo, com o Cancel ou com a troca de comando antes da resposta."""
+        for name in ('form:4xx-sweep', 'form:4xx-sweep:cancel', 'form:4xx-sweep:switch'):
+            rows = self.scenario(name)['rows']
+            self.assertEqual([row['status'] for row in rows], [400] + list(range(401, 500)), msg='the sweep changed: ' + name)
+            for row in rows:
+                if row['status'] == 400:  # o 400 com os erros do formulário não é uma recusa sem campo: o teste seguinte o lê
+                    continue
+                with self.subTest(scenario=name, status=row['status']):
+                    self.assertEqual(row['uncaught'], [])
+                    self.assertIsNotNone(row['alert'], msg='the page has no alert space')
+                    self.assertFalse(row['alert']['hidden'], msg='the refusal shows no notice')
+                    self.assertEqual(row['alert']['text'], self.texts['refusedFailureText'], msg='status {0}'.format(row['status']))
+                    self.assertAtRest(row, msg='status {0}'.format(row['status']))
+
+    def test_no_other_failure_of_the_submit_shows_those_texts(self):
+        """AC-9016-1 (controle): cada texto só na sua falha: o 5xx mostra só o de erro de servidor e a falta de resposta só o de conexão; nenhum dos três aparece no 400 que marca um campo, no 202 com corpo que não é JSON nem no login."""
+        # a precondição: o mesmo espaço do aviso mostra um texto (o de erro de servidor no 5xx: o laço seguinte), então «vazio» não vale
+        # num espaço que nunca mostra; o texto de recusa fora da sua falha é o que os mutantes m2, m5 e m6 provam
+        for name, own in (('form:http500:full', 'serverFailureText'), ('form:http503:full', 'serverFailureText'),
+                          ('form:network:full', 'networkFailureText')):
+            with self.subTest(scenario=name):
+                self.assertAlertShows(self.scenario(name)['after'], self.texts[own], msg=name)
+        none_of_the_three = ['form:http400:full', 'form:html202', 'form:login200']
+        none_of_the_three += ['bad400:{0}:fresh'.format(kind) for kind in self.constants['bad400Field']]
+        for name in none_of_the_three:
+            with self.subTest(scenario=name):
+                after = self.scenario(name)['after']
+                self.assertEqual(after['uncaught'], [])
+                self.assertIsNotNone(after['alert'], msg='the page has no alert space')
+                self.assertAlertEmpty(after, msg=name)
+        for name in ('form:4xx-sweep', 'form:4xx-sweep:cancel', 'form:4xx-sweep:switch'):
+            with self.subTest(scenario=name, status=400):
+                row = self.scenario(name)['rows'][0]
+                self.assertEqual(row['status'], 400)
+                self.assertEqual(row['alert']['text'], '', msg='the 400 with the form errors showed a text')
+                self.assertTrue(row['alert']['hidden'])
+
+    def test_a_status_below_400_that_reaches_the_error_handler_shows_no_text(self):
+        """AC-9016-1 (controle): o limite de baixo da recusa: nenhum status de 201 a 399 que chega ao `error` do envio (o 2xx com corpo que não é JSON e todo 3xx, menos o 204 e o 304, que o jQuery trata como sucesso) mostra texto no aviso, e a tela solta sem erro de script."""
+        # a precondição: o mesmo espaço do aviso mostra um texto (o de erro de servidor no 5xx), então «vazio» não vale num espaço que nunca mostra
+        self.assertAlertShows(self.scenario('form:http500:full')['after'], self.texts['serverFailureText'],
+                              msg='precondition: the alert space works')
+        rows = self.scenario('form:below400-sweep')['rows']
+        self.assertEqual([row['status'] for row in rows], [status for status in range(201, 400) if status not in (204, 304)],
+                         msg='the sweep changed')
+        for row in rows:
+            with self.subTest(status=row['status']):
+                self.assertEqual(row['uncaught'], [])
+                self.assertIsNotNone(row['alert'], msg='the page has no alert space')
+                self.assertEqual(row['alert']['text'], '', msg='the submit answered with {0} showed a text'.format(row['status']))
+                self.assertTrue(row['alert']['hidden'])
+                self.assertAtRest(row, msg='status {0}'.format(row['status']))
+
+    def test_a_submit_refused_with_the_form_errors_shows_each_error_next_to_its_field(self):
+        """AC-9019-1 (controle): o 400 com os erros do formulário em JSON mostra o erro de cada campo (o do comando e os dos argumentos) ao lado do campo."""
+        after = self.scenario('form:http400:full')['after']
+        errors = self.constants['fieldErrors400']
+        self.assertEqual(after['uncaught'], [])
+        self.assertEqual(after['fieldErrors'], {field: [messages[0]] for field, messages in errors.items()},
+                         msg='the error of a field was not put next to the field')
+        for field in errors:
+            self.assertTrue(after['invalidFields'][field], msg='the field {0} was not marked invalid'.format(field))
+
+    def test_every_failed_submit_releases_the_screen(self):
+        """AC-9017-1 (controle): toda falha do envio (o 400 com os erros em JSON, os outros 4xx, o 5xx, a falta de resposta e o login) libera a tela."""
+        rows = self.scenario('form:4xx-sweep')['rows']
+        self.assertEqual(len(rows), 100, msg='the sweep changed size')
+        for row in rows:
+            with self.subTest(status=row['status']):
+                self.assertEqual(row['uncaught'], [])
+                self.assertAtRest(row, msg='status {0}'.format(row['status']))
+        for name in ('form:http500:full', 'form:http503:full', 'form:network:full', 'form:login200'):
+            with self.subTest(scenario=name):
+                self.assertAtRest(self.scenario(name)['after'], msg=name)
+
+
+# As classes de corpo que o AC-9017-1 enumera e a forma do harness (`BAD400_RESPONSES`) que prova cada uma.
+BAD400_CLASSES = {
+    'no body': ('nojson', 'emptybody'),
+    'a body that is no JSON': ('html',),
+    'JSON that is no object': ('json_null', 'json_string', 'json_number', 'json_array'),
+    'no form object with an errors object': ('json_noform', 'form_null', 'form_string', 'form_noerrors', 'errors_null',
+                                             'errors_string', 'errors_array'),
+    'a field error that is no list with a message': ('field_null', 'field_string', 'field_number', 'field_empty'),
+}
+
+
+class BadFormErrorsTest(ScenarioTestCase):
+    """O 400 do envio cujo corpo não traz os erros do formulário como o servidor os manda (AC-9017-1 e -2, #9017).
+
+    O `xhr` de cada forma é montado como o jQuery o monta: o `responseJSON` só existe se o corpo foi JSON (o teste de fonte
+    `DoubleAssumptionsTest` confere isso no jQuery entregue), então a página de um proxy, o corpo vazio e o texto não o levam.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.nofield = cls.constants['bad400NoField']
+        cls.field = cls.constants['bad400Field']
+        cls.kinds = cls.nofield + cls.field
+        cls.contexts = cls.constants['bad400Contexts']
+
+    def assertSweepCoversEveryClass(self):
+        for body_class, kinds in BAD400_CLASSES.items():
+            for kind in kinds:
+                self.assertIn(kind, self.kinds, msg='the sweep lost a form of the class "{0}"'.format(body_class))
+        self.assertEqual(set(self.contexts), {'fresh', 'cancel', 'switch', 'nospace', 'norefused'}, msg='the contexts of the sweep changed')
+
+    def test_a_400_without_the_form_errors_releases_the_screen(self):
+        """AC-9017-1: o 400 cujo corpo não traz os erros do formulário como o servidor os manda (sem corpo, não JSON, JSON de outra forma, erro de campo que não é lista) solta a tela sem erro de script, com o envio em voo, com o Cancel ou a troca antes da resposta e num template sem o espaço do aviso."""
+        self.assertSweepCoversEveryClass()
+        for kind in self.kinds:
+            for context in self.contexts:
+                name = 'bad400:{0}:{1}'.format(kind, context)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.assertTrue(found['before']['execute']['disabled'], msg='precondition: the submit is in flight. ' + name)
+                    if context == 'cancel':
+                        # sem isto o contexto seria uma cópia do `fresh` se o clique no Cancel deixasse de fazer efeito
+                        self.assertFalse(found['before']['cancel']['disabled'], msg='precondition: the Cancel is available. ' + name)
+                        self.assertTrue(found['afterAbort']['cancel']['disabled'], msg='precondition: the Cancel took effect. ' + name)
+                    if context == 'switch':
+                        self.assertNotEqual(found['afterAbort']['appCommandValue'], found['before']['appCommandValue'],
+                                            msg='precondition: the switch of command took effect. ' + name)
+                    if context in ('cancel', 'switch'):
+                        self.assertTrue(found['afterAbort']['execute']['disabled'],
+                                        msg='precondition: the submit is still in flight after the interruption. ' + name)
+                    self.assertEqual(found['after']['uncaught'], [], msg='the page raised a script error. ' + name)
+                    self.assertAtRest(found['after'], msg=name)
+
+    def test_a_400_that_marks_no_field_tells_the_request_was_refused(self):
+        """AC-9016-1: o 400 em que a tela não marca campo nenhum (sem corpo, não JSON, sem `form.errors`, com `errors` que não é um objeto, vazio ou só com campos que a tela não mostra) mostra o texto de recusa no aviso, com o envio em voo, com o Cancel ou a troca; o 400 que marca um campo não mostra texto."""
+        self.assertSweepCoversEveryClass()
+        for kind in ('errors_empty', 'errors_unmapped'):
+            self.assertIn(kind, self.nofield, msg='the sweep lost the form {0}'.format(kind))
+        # a mesma página mostra o texto de servidor para o 5xx: sem isso, «vazio» valeria também para uma página sem o aviso
+        self.assertAlertShows(self.scenario('form:http500:full')['after'], self.texts['serverFailureText'],
+                              msg='precondition: the alert space works')
+        # o `nospace` e o `norefused` ficam de fora: sem o espaço do aviso ou sem o texto não há o que ler (o AC-9016-3 os cobre)
+        for kind in self.nofield:
+            for context in ('fresh', 'cancel', 'switch'):
+                name = 'bad400:{0}:{1}'.format(kind, context)
+                with self.subTest(scenario=name):
+                    after = self.scenario(name)['after']
+                    self.assertEqual(after['uncaught'], [], msg=name)
+                    self.assertAlertShows(after, self.texts['refusedFailureText'], msg=name)
+                    self.assertAtRest(after, msg=name)
+        for kind in self.field:
+            for context in ('fresh', 'cancel', 'switch'):
+                name = 'bad400:{0}:{1}'.format(kind, context)
+                with self.subTest(scenario=name):
+                    after = self.scenario(name)['after']
+                    self.assertIsNotNone(after['alert'], msg='precondition: the page has the alert space. ' + name)
+                    self.assertAlertEmpty(after, msg=name)
+
+    def test_a_400_for_a_field_the_page_does_not_have_tells_the_request_was_refused(self):
+        # Robustez (sem ID): a página sem nenhum campo de argumentos que recebe um 400 `{"args": [...]}` não tem onde pôr o erro: mostra a
+        # recusa e solta a tela (a bandeira conta o campo que a página TEM, e não o nome do campo em `rel_inputs`).
+        after = self.scenario('bad400:nofield-on-page')['after']
+        self.assertEqual(after['uncaught'], [])
+        self.assertAlertShows(after, self.texts['refusedFailureText'])
+        self.assertAtRest(after)
+        self.assertEqual(after['fieldErrors']['args'], [], msg='the page has no args field, and a message was put somewhere')
+
+    def test_a_400_that_refuses_no_field_marks_and_writes_nothing_next_to_the_fields(self):
+        """AC-9019-5, AC-9019-9 (controle): o 400 cujo corpo não recusa campo nenhum não marca nem escreve mensagem ao lado do campo do comando nem dos argumentos, nas duas variantes."""
+        refused = self.scenario('form:http400:full')['after']
+        for field in ('app_command', 'args', 'kwargs'):
+            self.assertTrue(refused['invalidFields'][field],
+                            msg='precondition: a 400 with the form errors marks the field {0}'.format(field))
+            self.assertTrue(refused['fieldErrors'][field], msg='precondition: and writes its message next to the field')
+        self.assertTrue(self.nofield, msg='the sweep has no form that refuses no field')
+        for kind in self.nofield:
+            name = 'bad400:{0}:fresh'.format(kind)
+            with self.subTest(scenario=name):
+                after = self.scenario(name)['after']
+                self.assertEqual(after['fieldErrors'], {'app_command': [], 'args': [], 'kwargs': []}, msg=name)
+                self.assertEqual(after['invalidFields'], {'app_command': False, 'args': False, 'kwargs': False}, msg=name)
+                self.assertEqual(after['fieldErrorsNarrow'], {'args': [], 'kwargs': []}, msg=name)
+                self.assertEqual(after['invalidFieldsNarrow'], {'args': False, 'kwargs': False}, msg=name)
+
+    # Robustez (sem ID): o texto de nenhum critério a diz; o que a conferência do campo promete além de «sem erro de script».
+    def test_a_field_error_that_is_no_list_does_not_hide_the_next_field(self):
+        after = self.scenario('bad400:field-next')['after']
+        self.assertEqual(after['uncaught'], [], msg='the page raised a script error')
+        self.assertEqual(after['fieldErrors']['kwargs'], ['bad kwargs'], msg='the null error of args hid the message of kwargs')
+        self.assertTrue(after['invalidFields']['kwargs'], msg='the field kwargs was not marked')
+        self.assertAtRest(after)
+
+    def test_the_command_sent_after_a_400_without_the_form_errors_is_followed_to_its_end(self):
+        for kind in ('nojson', 'html'):
+            with self.subTest(kind=kind):
+                found = self.scenario('bad400:next:' + kind)
+                self.assertAtRest(found['afterFail'], msg='precondition: the 400 released the screen')
+                second = found['second']
+                self.assertEqual(second['uncaught'], [])
+                self.assertEqual(second['output'], 'SECOND OUTPUT', msg='the next command was not followed to its end')
+                self.assertAtRest(second, msg='the next command did not release the screen')
+
+
+class FailureReasonTest(ScenarioTestCase):
+    """O motivo que o handler avisa no evento `update-failed` (AC-9107-2 e AC-8961-10, #8961, #9018 e #9107)."""
+
+    def test_the_handler_tells_a_server_or_a_network_reason_before_it_releases_the_screen(self):
+        """AC-9107-2 (controle): a consulta de estado que falha por erro HTTP avisa o motivo `server`, a que falha sem resposta ou por tempo, `network`, e o `update-failed` sai antes do `update-finish`."""
+        for kind, reason in (('http400', 'server'), ('http429', 'server'), ('http500', 'server'), ('html502', 'server'),
+                             ('html202', 'server'), ('network', 'network'), ('timeout', 'network')):
+            with self.subTest(failure=kind):
+                found = self.scenario('reasons:{0}'.format(kind))
+                self.assertEqual(found['after']['uncaught'], [])
+                self.assertEqual(found['log'], ['failed:' + reason, 'finish'], msg=kind)
+
+    def test_the_handler_keeps_the_reasons_of_a_refusal_and_of_the_login_page(self):
+        """AC-8961-10 (controle): o 403, o 404 e o 200 que não é JSON seguem com os motivos `forbidden`, `not-found` e `login`, antes do `update-finish`."""
+        for kind, reason in (('http403', 'forbidden'), ('http404', 'not-found'), ('html200', 'login')):
+            with self.subTest(failure=kind):
+                found = self.scenario('reasons:{0}'.format(kind))
+                self.assertEqual(found['log'], ['failed:' + reason, 'finish'], msg=kind)
+
+
+class NoClientTimeoutTest(ScenarioTestCase):
+    """O envio do formulário e a revogação seguem sem corte por tempo (AC-8961-11, #8961)."""
+
+    def test_the_submit_and_the_revocation_are_not_cut_by_time_whatever_the_query_timeout(self):
+        """AC-8961-11 (controle): o pedido de revogação em voo segue em voo depois de 120 s e o envio não leva `timeout`, com o `query_timeout` padrão, 5000 e 0."""
+        for how in ('default', '5000', 'zero'):
+            with self.subTest(query_timeout=how):
+                found = self.scenario('timeout:out-of-scope:{0}'.format(how))
+                self.assertEqual(found['inFlight']['pendingRevoke'], 1, msg='precondition: the revocation is in flight')
+                later = found['later']
+                self.assertEqual(later['uncaught'], [])
+                self.assertEqual(later['pendingRevoke'], 1, msg='the revocation was cut by time')
+                self.assertEqual(later['revokeTimeouts'], [None], msg='the revocation carries a time limit')
+                self.assertIsNone(later['formTimeout'], msg='the submit carries a time limit')
+
+
+class CallbackFailureTest(ScenarioTestCase):
+    """Um callback de outro código que lança não pode prender a tela (AC-9005-3)."""
+
+    def test_a_callback_that_raises_on_a_refused_query_does_not_keep_the_screen_stuck(self):
+        """AC-9005-3 (controle): o ouvinte de host de `update-failed` que lança não prende a tela (o `update-finish` sai) e o erro dele chega ao host."""
+        # O update-finish sai num finally: a mesma classe de tela presa que o ticket corrige.
+        after = self.scenario('status:callback-throws')['after']
+        self.assertAtRest(after, msg='update-finish never fired after a callback raised')
+        self.assertEqual([failure['message'] for failure in after['uncaught']], ['Error: host callback raised'],
+                         msg='the callback error must still surface')
+        self.assertAlertShows(after, self.texts['forbiddenText'], msg='the page handler runs before the host callback')
+
+
+class AbortTest(ScenarioTestCase):
+    """Interromper o acompanhamento: o Cancel e a troca de comando na lista (AC-8866-6 e -16, AC-8955-1 e -2, AC-8967-1 a -6)."""
+
+    def test_an_interrupted_follow_up_ends_whole(self):
+        """AC-8866-6: com uma consulta agendada, o Cancel e a troca de comando encerram o acompanhamento por inteiro."""
+        for trigger in ('cancel', 'switch'):
+            for waits in (1, 2, 3):
+                name = 'abort:{0}:{1}:timer'.format(trigger, waits)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.assertEqual(found['before']['liveTimers'], 1, msg='precondition: a new query is scheduled')
+                    after = found['afterAbort']
+                    self.assertEqual(after['liveTimers'], 0, msg='the scheduled query was not cancelled')
+                    self.assertAtRest(after, msg='the screen was not released at once')
+                    self.assertEqual(found['afterAdvance']['statusRequests'], after['statusRequests'],
+                                     msg='a status query went out after the follow-up was interrupted')
+                    second = found['second']
+                    self.assertEqual(second['output'], 'SECOND OUTPUT', msg='the next command was not followed to its end')
+                    self.assertAtRest(second)
+
+    def test_switching_the_command_hides_the_copy_button(self):
+        """AC-8967-6 (controle): a troca de comando com a consulta agendada libera a tela na hora, com o painel vazio e o Copy escondido."""
+        # A troca limpa o painel antes de liberar a tela (a página), e o Copy acompanha o que o painel guarda.
+        for waits in (1, 2, 3):
+            with self.subTest(waits=waits):
+                after = self.scenario('abort:switch:{0}:timer'.format(waits))['afterAbort']
+                self.assertAtRest(after, msg='the screen was not released at once')
+                self.assertEqual(after['output'], '', msg='precondition: the panel was cleared')
+                self.assertTrue(after['copyHidden'], msg='the copy button is visible over an empty panel')
+
+    def test_cancelling_with_a_scheduled_query_leaves_the_panel_empty(self):
+        """AC-8967-2: o Cancel com uma consulta agendada libera a tela na hora, com o painel de saída vazio e o Copy escondido."""
+        for waits in (1, 2, 3):
+            name = 'abort:cancel:{0}:timer'.format(waits)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertEqual(found['before']['liveTimers'], 1, msg='precondition: a new query is scheduled')
+                self.assertEqual(found['before']['output'], self.texts['runningText'],
+                                 msg='precondition: the panel holds the text of the previous query')
+                after = found['afterAbort']
+                self.assertAtRest(after, msg='the screen was not released at once')
+                self.assertEqual(after['output'], '', msg='the panel kept the running text after the Cancel')
+                self.assertTrue(after['copyHidden'], msg='the copy button is visible over the running text')
+
+    def test_an_interrupted_query_that_ends_leaves_the_panel_empty(self):
+        """AC-8967-1: depois do Cancel ou da troca, a consulta em voo que termina (resposta ou falha) libera a tela com o painel vazio e o Copy escondido."""
+        scenarios = interrupted_answer_scenarios()
+        self.assertEqual(len(scenarios), 33, msg='the scenario list changed size')
+        for name, ending in scenarios:
+            with self.subTest(scenario=name, ending=ending):
+                found = self.scenario(name)
+                self.assertEqual(found['afterAbort']['pendingStatus'], 1, msg='precondition: the query is in flight')
+                answered = found['afterAnswer']
+                self.assertEqual(answered['pendingStatus'], 0, msg='precondition: the query ended')
+                self.assertAtRest(answered, msg='the screen was not released when the query ended')
+                self.assertEqual(answered['output'], '', msg='the panel is not empty after the query ended')
+                self.assertTrue(answered['copyHidden'], msg='the copy button is visible after the query ended')
+
+    def test_a_failed_first_query_after_the_interruption_leaves_the_panel_empty(self):
+        """AC-8967-1 (controle): a 1ª consulta que falha depois da interrupção libera a tela com o painel vazio (ele nunca guardou o texto)."""
+        for trigger in ('cancel', 'switch'):
+            for kind in STATUS_FAILURE_KINDS:
+                name = 'first:{0}:fail:{1}'.format(trigger, kind)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.assertEqual(found['afterAbort']['pendingStatus'], 1, msg='precondition: the first query is in flight')
+                    answered = found['afterAnswer']
+                    self.assertAtRest(answered, msg='the screen was not released when the query failed')
+                    self.assertEqual(answered['output'], '')
+                    self.assertTrue(answered['copyHidden'])
+
+    def test_a_host_callback_that_raises_on_update_failed_does_not_leave_the_running_text(self):
+        """AC-8967-1: o ouvinte de host de `update-failed` que lança não impede o painel vazio (o `empty()` vem antes dele)."""
+        found = self.scenario('abort:cancel:2:flight:fail:callback-throws')
+        self.assertEqual([failure['message'] for failure in found['afterAnswer']['uncaught']], ['Error: host callback raised'],
+                         msg='precondition: the host callback raised')
+        self.assertEqual(found['afterAbort']['output'], self.texts['runningText'], msg='precondition: the panel held the running text')
+        answered = found['afterAnswer']
+        self.assertAtRest(answered, msg='the screen was not released')
+        self.assertEqual(answered['output'], '', msg='the panel kept the running text')
+        self.assertTrue(answered['copyHidden'])
+
+    def test_the_running_text_shows_while_the_follow_up_goes_on(self):
+        """AC-8967-3 (controle): com o acompanhamento ativo, a resposta «não pronta» deixa o texto de execução no painel."""
+        for name in ('abort:none:1', 'abort:none:2'):
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertEqual(found['before']['output'], self.texts['runningText'])
+                self.assertEqual(found['after']['output'], self.texts['runningText'], msg='the text went away while following')
+                self.assertEqual(found['after']['pendingStatus'], 1, msg='precondition: the follow-up goes on')
+
+    def test_the_running_text_is_the_one_the_template_publishes(self):
+        """AC-8967-3: o texto de execução no painel é o que o template publica (traduzido quando há tradução), e não o literal em inglês."""
+        found = self.scenario('abort:none:1:translated')
+        translated = 'Executando comando...'
+        self.assertNotEqual(translated, self.texts['runningText'], msg='precondition: the published text is not the English one')
+        self.assertEqual(found['before']['output'], translated, msg='the page wrote a text the template did not publish')
+        self.assertEqual(found['after']['output'], translated, msg='the text went away while following')
+        self.assertEqual(found['after']['pendingStatus'], 1, msg='precondition: the follow-up goes on')
+
+    def test_the_updating_event_is_notified_once_per_answer_while_following(self):
+        """AC-9018-5 (controle): com o acompanhamento ativo, cada resposta que traz a tarefa (pronta ou não) avisa o `updating` uma vez."""
+        for name, answers in (('abort:none:1', 1), ('abort:none:2', 2)):
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertEqual(found['before']['updatingCalls'], answers)
+                # a consulta que saiu depois ainda não foi respondida: nenhum aviso a mais
+                self.assertEqual(found['after']['updatingCalls'], answers)
+        with self.subTest(scenario='follow:ready'):
+            found = self.scenario('follow:ready')
+            self.assertEqual(found['afterNotReady']['updatingCalls'], 1)
+            self.assertEqual(found['afterReady']['updatingCalls'], 2, msg='the ready answer did not notify updating')
+            self.assertEqual(found['afterReady']['output'], 'TASK OUTPUT', msg='precondition: the ready answer ended the follow-up')
+
+    def test_the_updating_event_is_not_notified_after_an_interruption(self):
+        """AC-8967-5: depois do Cancel ou da troca, a resposta da consulta em voo (pronta ou não) não avisa o `updating`."""
+        cases = []
+        for trigger in ('cancel', 'switch'):
+            for answer in ('notready', 'ready'):
+                cases.append(('first:{0}:{1}'.format(trigger, answer), 0))
+            for waits in (2, 3):
+                cases.append(('abort:{0}:{1}:flight'.format(trigger, waits), waits))
+                cases.append(('abort:{0}:{1}:flight:notready'.format(trigger, waits), waits))
+        for name, before_interruption in cases:
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertEqual(found['afterAbort']['updatingCalls'], before_interruption,
+                                 msg='precondition: one notification per answer before the interruption')
+                self.assertEqual(found['afterAnswer']['pendingStatus'], 0, msg='precondition: the query was answered')
+                self.assertEqual(found['afterAnswer']['updatingCalls'], before_interruption,
+                                 msg='updating was notified for the answer of an interrupted follow-up')
+
+    def test_without_the_abort_the_scheduled_query_goes_out(self):
+        """AC-8866-6 (controle): sem interromper, a consulta agendada sai."""
+        found = self.scenario('abort:none:2')
+        self.assertEqual(found['before']['liveTimers'], 1)
+        self.assertEqual(found['after']['statusRequests'], found['before']['statusRequests'] + 1)
+
+    def test_an_interruption_during_the_submit_ends_the_follow_up_whole(self):
+        """AC-8955-1: o Cancel e a troca de comando durante o envio do formulário liberam a tela quando a resposta chega, sem consulta nem saída, e o comando seguinte é acompanhado até o fim."""
+        for trigger in ('cancel', 'switch'):
+            with self.subTest(trigger=trigger):
+                found = self.scenario('submit:{0}'.format(trigger))
+                self.assertEqual(found['before']['statusRequests'], 0, msg='precondition: the form is still in flight')
+                answered = found['afterAnswer']
+                self.assertEqual(answered['statusRequests'], 0, msg='a status query went out after the interruption')
+                self.assertEqual(answered['pendingStatus'], 0)
+                self.assertAtRest(answered, msg='the screen was not released when the answer of the form arrived')
+                self.assertEqual(answered['output'], '', msg='an output was shown after the interruption')
+                self.assertEqual(found['afterAdvance']['statusRequests'], 0, msg='a status query went out later')
+                second = found['second']
+                self.assertEqual(second['output'], 'SECOND OUTPUT', msg='the next command was not followed to its end')
+                self.assertAtRest(second)
+        with self.subTest(trigger='none'):
+            # controle: sem a interrupção o mesmo envio consulta o estado
+            found = self.scenario('submit:none')
+            self.assertEqual(found['afterAnswer']['statusRequests'], 1)
+            self.assertEqual(found['afterAnswer']['pendingStatus'], 1)
+
+    def test_an_interruption_with_the_first_query_in_flight_releases_the_screen_when_it_answers(self):
+        """AC-8955-2: o Cancel e a troca de comando com a 1ª consulta em voo liberam a tela quando a resposta chega, sem a saída da tarefa nem outra consulta, e o comando seguinte é acompanhado até o fim."""
+        for trigger in ('cancel', 'switch'):
+            for answer in ('notready', 'ready'):
+                name = 'first:{0}:{1}'.format(trigger, answer)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.assertEqual(found['afterAbort']['pendingStatus'], 1, msg='precondition: the first query is in flight')
+                    self.assertEqual(found['afterAbort']['statusRequests'], 1)
+                    answered = found['afterAnswer']
+                    self.assertAtRest(answered, msg='the screen was not released when the first query answered')
+                    self.assertNotIn('TASK OUTPUT', answered['output'], msg='the task output was shown after the interruption')
+                    self.assertEqual(answered['liveTimers'], 0, msg='a new query was scheduled')
+                    self.assertEqual(found['afterAdvance']['statusRequests'], 1, msg='another query went out')
+                    second = found['second']
+                    self.assertEqual(second['output'], 'SECOND OUTPUT', msg='the next command was not followed to its end')
+                    self.assertAtRest(second)
+        with self.subTest(case='control'):
+            # controle: sem a interrupção, a resposta «não pronta» agenda a 2ª consulta e ela sai
+            found = self.scenario('abort:none:1')
+            self.assertEqual(found['before']['liveTimers'], 1)
+            self.assertEqual(found['after']['statusRequests'], found['before']['statusRequests'] + 1)
+
+    def test_an_interrupted_follow_up_releases_the_screen_when_the_query_in_flight_answers(self):
+        """AC-8866-16 (controle): com a consulta em voo (da 2ª em diante), a tela é liberada quando a resposta chega, sem a saída da tarefa."""
+        for trigger in ('cancel', 'switch'):
+            for waits in (2, 3):
+                name = 'abort:{0}:{1}:flight'.format(trigger, waits)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.assertEqual(found['afterAbort']['pendingStatus'], 1, msg='precondition: the query is in flight')
+                    answered = found['afterAnswer']
+                    self.assertAtRest(answered)
+                    self.assertNotIn('TASK OUTPUT', answered['output'], msg='the task output was shown after the interruption')
+
+
+class FailureMidwayTest(ScenarioTestCase):
+    """A consulta de estado que falha no meio do acompanhamento, sem interrupção, deixa o painel vazio (AC-9005-1 a -5, #9005)."""
+
+    def following(self, state, text, msg=''):
+        """A precondição de cada caso do meio: o acompanhamento seguia, a consulta que vai falhar estava em voo e o painel guardava o texto de execução."""
+        self.assertTrue(state['execute']['disabled'], msg='precondition: the screen was not following. {0}'.format(msg))
+        self.assertEqual(state['pendingStatus'], 1, msg='precondition: the query that fails was not in flight. {0}'.format(msg))
+        self.assertEqual(state['output'], text, msg='precondition: the panel did not hold the running text. {0}'.format(msg))
+
+    def released_empty(self, state, msg=''):
+        """A tela solta com o painel de saída vazio e o Copy escondido."""
+        self.assertAtRest(state, msg=msg)
+        self.assertEqual(state['output'], '', msg='the panel kept its text after the failure. {0}'.format(msg))
+        self.assertTrue(state['copyHidden'], msg='the copy button is visible over an empty panel. {0}'.format(msg))
+
+    def test_a_status_query_that_fails_midway_leaves_the_panel_empty_and_the_copy_hidden(self):
+        """AC-9005-1: a consulta de estado que falha a partir da 2ª, sem interrupção (cada tipo de falha e o corte aos 30 s), solta a tela com o painel de saída vazio e o Copy escondido."""
+        kinds = self.constants['midwayKinds']
+        self.assertIn('cut', kinds, msg='precondition: the sweep has the real 30 s cut')
+        self.assertEqual(kinds[:-1], self.constants['statusFailureKinds'], msg='precondition: the sweep is the list of failure kinds of the harness')
+        for waits in (1, 2):
+            for kind in kinds:
+                name = 'midway:{0}:{1}'.format(waits, kind)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.following(found['before'], self.texts['runningText'], name)
+                    after = found['after']
+                    self.assertEqual(after['uncaught'], [], msg=name)
+                    self.assertEqual(after['pendingStatus'], 0, msg='precondition: the query ended. {0}'.format(name))
+                    self.released_empty(after, name)
+
+    def test_the_first_status_query_that_fails_leaves_the_panel_empty_and_the_copy_hidden(self):
+        """AC-9005-1 (controle): a 1ª consulta que falha (o painel nunca guardou o texto de execução) solta a tela com o painel vazio e o Copy escondido."""
+        kinds = self.constants['statusFailureKinds']
+        self.assertGreater(len(kinds), 1, msg='precondition: the sweep has the failure kinds')
+        for kind in kinds:
+            name = 'status:{0}:full'.format(kind)
+            with self.subTest(scenario=name):
+                after = self.scenario(name)['after']
+                self.assertEqual(after['uncaught'], [], msg=name)
+                self.released_empty(after, name)
+
+    def test_a_host_listener_that_raises_does_not_leave_the_running_text_in_the_panel(self):
+        """AC-9005-1: com um ouvinte de host de `update-failed` que lança, a falha do meio solta a tela com o painel vazio e o Copy escondido (o painel já está vazio quando ele lança)."""
+        found = self.scenario('midway:2:http403:throws')
+        self.following(found['before'], self.texts['runningText'])
+        after = found['after']
+        self.assertEqual([failure['message'] for failure in after['uncaught']], ['Error: host callback raised'],
+                         msg='precondition: the host listener raised')
+        self.released_empty(after)
+
+    def test_the_running_text_that_leaves_the_panel_is_the_one_the_template_publishes(self):
+        """AC-9005-1: o texto de execução que sai do painel na falha do meio é o que o template publica (traduzido quando há tradução), e não o literal em inglês."""
+        found = self.scenario('midway:1:http500:translated')
+        translated = self.constants['translatedRunningText']
+        self.assertNotEqual(translated, self.texts['runningText'], msg='precondition: the published text is not the English one')
+        self.following(found['before'], translated)
+        self.assertEqual(found['after']['uncaught'], [])
+        self.released_empty(found['after'])
+
+    def test_the_text_a_host_listener_writes_in_the_panel_stays(self):
+        """AC-9005-2 (controle): o texto que um ouvinte de host de `update-failed` ou de `update-finish` escreve no painel, numa falha do meio, fica no painel quando a tela é solta."""
+        for listener in ('failed', 'finish'):
+            name = 'midway:2:http500:writes-{0}'.format(listener)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.following(found['before'], self.texts['runningText'], name)
+                after = found['after']
+                self.assertEqual(after['uncaught'], [], msg=name)
+                self.assertAtRest(after, msg=name)
+                self.assertEqual(after['output'], self.constants['midwayHostText'],
+                                 msg='the text the host wrote in the panel was erased. {0}'.format(name))
+
+    def test_the_command_sent_after_a_failed_status_query_is_followed_to_the_end(self):
+        """AC-9005-4 (controle): depois de uma falha do meio (a tela de login, o 5xx, a falha de rede, o corte aos 30 s), o comando enviado em seguida é acompanhado: mostra a saída e solta a tela."""
+        for kind in ('html200', 'http500', 'network', 'cut'):
+            name = 'midway:2:{0}:next'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertAtRest(found['after'], msg='precondition: the failure released the screen. {0}'.format(name))
+                second = found['second']
+                self.assertEqual(second['uncaught'], [], msg=name)
+                self.assertEqual(second['output'], 'SECOND OUTPUT', msg='the next command was not followed to its end. {0}'.format(name))
+                self.assertAtRest(second, msg=name)
+
+    def test_a_failed_status_query_does_not_notify_updating(self):
+        """AC-9005-5 (controle): a consulta de estado que falha (a 1ª, a 2ª e a 3ª) não avisa os ouvintes do `updating`: só a resposta «não pronta» o avisa."""
+        for waits in (0, 1, 2):
+            for kind in self.constants['midwayKinds']:
+                name = 'midway:{0}:{1}'.format(waits, kind)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.assertEqual(found['before']['updatingCalls'], waits,
+                                     msg='precondition: one notification per answered query. {0}'.format(name))
+                    self.assertEqual(found['after']['updatingCalls'], waits, msg='the failed query notified updating. {0}'.format(name))
+
+
+class NoTaskResponseTest(ScenarioTestCase):
+    """A consulta de estado que recebe uma resposta sem tarefa (o 204, o 304, um 2xx com JSON sem um objeto `task` com `id` em texto não vazio e `ready` booleano) termina como a falha `server` (AC-9107-1 a -4 e -8, #9018 e #9107)."""
+
+    def following(self, before, context, msg=''):
+        """A precondição de cada caso: a consulta que vai receber a resposta está em voo, a tela segue presa e, na 2ª e na 3ª consulta ativas, o painel guardava o texto de execução."""
+        self.assertTrue(before['execute']['disabled'], msg='precondition: the screen was not held. {0}'.format(msg))
+        self.assertEqual(before['pendingStatus'], 1, msg='precondition: the query that gets the response was not in flight. {0}'.format(msg))
+        self.assertEqual(before['uncaught'], [], msg='precondition: a script error before the response. {0}'.format(msg))
+        if context in ('active:1', 'active:2'):
+            self.assertEqual(before['output'], self.texts['runningText'], msg='precondition: the panel did not hold the running text. {0}'.format(msg))
+
+    def sweep(self, check):
+        """Cada forma de resposta sem tarefa em cada contexto (a lista vem do harness), com a precondição conferida; `check(nome, contexto, cenário)` afirma."""
+        kinds = self.constants['noTaskKinds']
+        contexts = self.constants['noTaskContexts']
+        self.assertEqual(len(kinds), 28, msg='precondition: the eleven forms of #9018 and the seventeen of #9107 (a task that is an object but not the one the server sends)')
+        for form in ('s204', 's304', 'json_taskarray', 'json_taskstring', 'json_tasknumber', 'json_null',
+                     'json_taskempty', 'json_taskbool_true', 'json_taskbool_false', 'json_task_noid', 'json_task_idnull', 'json_task_idempty',
+                     'json_task_idnumber', 'json_task_idbool', 'json_task_idlist', 'json_task_idobject', 'json_task_noready',
+                     'json_task_readynull', 'json_task_readystring', 'json_task_readynumber', 'json_task_readylist',
+                     'json_task_readyobject', 'json_task_terminal_noid'):
+            self.assertIn(form, kinds, msg='precondition: the sweep has the form {0}'.format(form))
+        self.assertEqual(len(contexts), 7, msg='precondition: three active contexts and four interrupted ones')
+        for kind in kinds:
+            for context in contexts:
+                name = 'notask:{0}:{1}'.format(kind, context)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.following(found['before'], context, name)
+                    check(name, context, found)
+
+    def test_a_response_with_no_task_tells_the_server_could_not_answer(self):
+        """AC-9107-1: a consulta de estado que recebe uma resposta sem tarefa (o 204, o 304, ou um 2xx com JSON cujo `task` falta, não é um objeto ou é um objeto sem `id` em texto não vazio ou sem `ready` booleano) mostra o texto de erro de servidor, com o acompanhamento ativo ou interrompido com a consulta em voo (um caso por forma e por contexto)."""
+        def check(name, context, found):
+            self.assertEqual(found['after']['uncaught'], [], msg='the status callback raised. {0}'.format(name))
+            self.assertAlertEmpty(found['before'], msg='precondition: no notice before the response. {0}'.format(name))
+            self.assertAlertShows(found['after'], self.texts['serverFailureText'], msg=name)
+        self.sweep(check)
+
+    def test_a_response_with_no_task_tells_the_reason_before_it_releases_the_screen(self):
+        """AC-9107-2: a consulta de estado que recebe uma resposta sem tarefa avisa o `update-failed` com o motivo `server` e depois o `update-finish`."""
+        def check(name, context, found):
+            self.assertEqual(found['after']['uncaught'], [], msg='the status callback raised. {0}'.format(name))
+            self.assertEqual(found['log'], ['failed:server', 'finish'], msg=name)
+        self.sweep(check)
+
+    def test_a_response_with_no_task_stops_the_query_and_releases_the_screen_with_an_empty_panel(self):
+        """AC-9107-3: a consulta de estado que recebe uma resposta sem tarefa para de consultar e solta a tela, com o painel de saída vazio e o Copy escondido (nos casos sem ouvinte de host que escreva no painel: o texto de host é outro critério)."""
+        def check(name, context, found):
+            after, later = found['after'], found['later']
+            self.assertEqual(after['uncaught'], [], msg='the status callback raised. {0}'.format(name))
+            self.assertAtRest(after, msg=name)
+            self.assertEqual(after['output'], '', msg='the panel kept its text. {0}'.format(name))
+            self.assertTrue(after['copyHidden'], msg='the copy button is visible over an empty panel. {0}'.format(name))
+            # parar de consultar: nenhuma consulta saiu nem ficou agendada. O `liveTimers` é lido logo depois da resposta e o `uncaught`, 5 s
+            # depois: um `.done` que agendasse a consulta seguinte teria um timer vivo agora, e ele dispararia e lançaria em `task.id`
+            # (antes do `$.ajax`) quando a tarefa não existe, sem aumentar `statusRequests`
+            self.assertEqual(after['liveTimers'], 0, msg='a new query stayed scheduled. {0}'.format(name))
+            self.assertEqual(later['statusRequests'], found['before']['statusRequests'], msg='a new query went out after the response. {0}'.format(name))
+            self.assertEqual(later['liveTimers'], 0, msg='a timer is alive 5 s after the response. {0}'.format(name))
+            self.assertEqual(later['uncaught'], [], msg='a script error in the 5 s after the response. {0}'.format(name))
+        self.sweep(check)
+
+    def test_a_response_with_no_task_does_not_notify_updating(self):
+        """AC-9107-4: a consulta de estado que recebe uma resposta sem tarefa, com o acompanhamento ativo, não avisa os ouvintes do `updating`."""
+        checked = []
+
+        def check(name, context, found):
+            if not context.startswith('active:'):
+                return
+            waits = int(context.split(':')[1])
+            checked.append(name)  # antes dos asserts: a conta dos casos não pode depender de eles passarem
+            self.assertEqual(found['before']['updatingCalls'], waits, msg='precondition: one notification per answered query. {0}'.format(name))
+            self.assertEqual(found['after']['updatingCalls'], waits, msg='updating was notified for a response with no task. {0}'.format(name))
+        self.sweep(check)
+        self.assertEqual(len(checked), 84, msg='precondition: twenty-eight forms in the three active contexts')
+
+    def test_a_host_listener_that_raises_does_not_keep_the_screen_stuck_on_a_response_with_no_task(self):
+        # Robustez (sem ID; o sem-tarefa passa pelo mesmo caminho da falha, que guarda isso no AC-9005-3): o ouvinte de host de `update-failed`
+        # que lança não prende a tela (o `update-finish` sai) e o erro dele chega ao host.
+        for name, context in (('notask:s204:active:2:throws', 'active:2'), ('notask:json_empty:cancel:second:throws', 'cancel:second')):
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.following(found['before'], context, name)
+                after = found['after']
+                self.assertAtRest(after, msg='update-finish never fired after a callback raised. {0}'.format(name))
+                self.assertEqual([failure['message'] for failure in after['uncaught']], ['Error: host callback raised'], msg=name)
+                self.assertEqual(found['log'], ['failed:server', 'finish'], msg=name)
+
+    def test_the_text_a_host_listener_writes_in_the_panel_stays_on_a_response_with_no_task(self):
+        """AC-9107-8: o texto que um ouvinte de host de `update-failed` ou de `update-finish` escreve no painel fica quando a consulta de estado, com o acompanhamento ativo, recebe uma resposta sem tarefa e a tela é solta (o painel é esvaziado antes dos ouvintes). Um caso por tipo de resposta, por consulta ativa e por ouvinte."""
+        kinds = self.constants['noTaskHostKinds']
+        contexts = self.constants['activeContexts']
+        self.assertEqual(sorted(kinds), ['json_empty', 'json_task_noid', 'json_task_noready', 's204'],
+                         msg='precondition: the 204, JSON with no task, a task with no id and a task with no ready')
+        self.assertEqual(contexts, ['active:0', 'active:1', 'active:2'], msg='precondition: the three active queries')
+        checked = []
+        for kind in kinds:
+            for context in contexts:
+                for host in ('writes-failed', 'writes-finish'):
+                    name = 'notask:{0}:{1}:{2}'.format(kind, context, host)
+                    checked.append(name)  # antes dos asserts: a conta dos casos não pode depender de eles passarem
+                    with self.subTest(scenario=name):
+                        found = self.scenario(name)
+                        self.following(found['before'], context, name)
+                        after = found['after']
+                        self.assertEqual(after['uncaught'], [], msg=name)
+                        self.assertAtRest(after, msg=name)
+                        self.assertEqual(after['output'], self.constants['midwayHostText'], msg='the text the host wrote in the panel was erased. {0}'.format(name))
+        self.assertEqual(len(checked), 24, msg='precondition: four kinds, three active queries and two listeners')
+
+    def test_the_command_sent_after_a_response_with_no_task_is_followed_to_the_end(self):
+        # Robustez (sem ID; o AC-9005-4 guarda isso para a falha): depois da resposta sem tarefa o comando seguinte mostra a saída e solta a tela.
+        for kind in ('s204', 's304', 'json_empty', 'json_taskarray', 'json_taskempty'):
+            name = 'notask:{0}:active:2:next'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertAtRest(found['after'], msg='precondition: the response released the screen. {0}'.format(name))
+                second = found['second']
+                self.assertEqual(second['uncaught'], [], msg=name)
+                self.assertEqual(second['output'], 'SECOND OUTPUT', msg='the next command was not followed to its end. {0}'.format(name))
+                self.assertAtRest(second, msg=name)
+
+    def test_a_response_with_no_task_with_a_template_without_the_alert_space_releases_the_screen_silently(self):
+        # Robustez (sem ID; o AC-8866-15 e o AC-8961-6 guardam isso para a falha): o host sem o espaço do aviso nem os textos solta a tela em
+        # silêncio, com o painel vazio, sem texto à mostra e sem erro de script.
+        for name, context in (('notask:s204:active:2:nospace', 'active:2'), ('notask:json_empty:cancel:second:nospace', 'cancel:second')):
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.following(found['before'], context, name)
+                after = found['after']
+                self.assertEqual(after['uncaught'], [], msg=name)
+                self.assertAtRest(after, msg=name)
+                self.assertEqual(after['output'], '', msg='the panel kept its text. {0}'.format(name))
+                self.assertTrue(after['copyHidden'], msg='the copy button is visible over an empty panel. {0}'.format(name))
+                self.assertAlertEmpty(after, msg=name)
+
+    def test_an_empty_200_still_sends_the_user_to_the_login(self):
+        # Robustez (sem ID; o AC-8866-3 vale para ele): o 200 sem corpo (`body: ''`, a forma fiel ao jQuery: `parsererror` com status 200, como todo
+        # 200 que não é JSON) continua levando ao login, e não ao aviso de erro de servidor; é o que o README diz.
+        after = self.scenario('status:empty200')['after']
+        self.assertEqual(after['uncaught'], [])
+        self.assertEqual(after['locations'], [self.login_target])
+        self.assertAtRest(after, msg='the screen was left stuck: update-finish never fired')
+        self.assertAlertEmpty(after, msg='the login redirect must not show the server notice')
+
+
+class WellFormedTaskTest(ScenarioTestCase):
+    """A resposta da consulta de estado que É a tarefa (`task` com `id` em texto não vazio e `ready` booleano, como o servidor manda) continua sendo a tarefa, e não a falha `server` (AC-9107-5, -6 e -7, #9107).
+
+    São `SHALL CONTINUE TO` (controles): passam no código de antes do #9107 e a mutação prova que discriminam: a conferência que exige `failed` ou
+    `output` falha nas formas mínimas, a consulta seguinte com o `id` da consulta anterior falha no `other-9` e a resposta bem formada
+    interrompida que vai ao `query_failed` mostra o aviso.
+    """
+
+    # a precondição é a mesma da varredura da resposta sem tarefa (a consulta que recebe a resposta está em voo e a tela segue presa)
+    following = NoTaskResponseTest.following
+
+    def test_a_response_that_is_a_task_is_not_the_failure_server_while_following(self):
+        """AC-9107-5 (controle): com o acompanhamento ativo, o `task` com `id` em texto não vazio e `ready` booleano, com ou sem `failed`, `output`, `traceback` e outros campos, é a tarefa: a não pronta segue acompanhada, a pronta mostra a saída (ou o traceback) e solta a tela, e nenhuma delas mostra o aviso de erro de servidor nem avisa `update-failed`."""
+        expected_output = {'min_ready': '', 'full_ready': 'OUT', 'extra_ready': 'OUT', 'failed_task': 'TB'}
+        kinds = self.constants['wellFormedKinds']
+        self.assertEqual(sorted(kinds), sorted(['min_notready', 'extra_notready', 'other_id', 'other_id_extra', 'min_ready', 'full_ready', 'extra_ready', 'failed_task']),
+                         msg='precondition: the well-formed forms of the harness')
+        checked = []
+        for kind in kinds:
+            for context in self.constants['activeContexts']:
+                name = 'wellformed:{0}:{1}'.format(kind, context)
+                checked.append(name)  # antes dos asserts: a conta dos casos não pode depender de eles passarem
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.following(found['before'], context, name)
+                    after = found['after']
+                    waits = int(context.split(':')[1])
+                    self.assertEqual(after['uncaught'], [], msg='the status callback raised. {0}'.format(name))
+                    self.assertAlertEmpty(after, msg='the server notice was shown for a task. {0}'.format(name))
+                    if kind in expected_output:
+                        self.assertAtRest(after, msg='a finished task did not release the screen. {0}'.format(name))
+                        self.assertEqual(after['output'], expected_output[kind], msg='the output of the task was not shown. {0}'.format(name))
+                        self.assertEqual(found['log'], ['finish'], msg='a task that finished notified update-failed. {0}'.format(name))
+                    else:
+                        self.assertTrue(after['execute']['disabled'], msg='a task that is not ready released the screen. {0}'.format(name))
+                        self.assertEqual(after['output'], self.texts['runningText'], msg='the running text was lost. {0}'.format(name))
+                        self.assertEqual(after['updatingCalls'], waits + 1, msg='the answer was not followed as a task. {0}'.format(name))
+                        self.assertEqual(found['log'], [], msg='a task that is not ready notified an event of the end. {0}'.format(name))
+        self.assertEqual(len(checked), 24, msg='precondition: eight forms and three active queries')
+
+    def test_the_next_query_asks_for_the_id_the_response_carried(self):
+        """AC-9107-6 (controle): com o acompanhamento ativo, a resposta com `ready` falso e `id` em texto não vazio é seguida da consulta de `status/` com o `id` que ela trouxe, e não com o da consulta anterior."""
+        for kind in ('other_id', 'other_id_extra'):
+            for context in self.constants['activeContexts']:
+                name = 'wellformed:{0}:{1}'.format(kind, context)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.following(found['before'], context, name)
+                    asked_before, asked = found['statusUrlsBefore'], found['statusUrls']
+                    self.assertEqual(set(asked_before), {'status/t1'}, msg='precondition: the earlier queries asked for the task of the form. {0}'.format(name))
+                    self.assertEqual(asked[:len(asked_before)], asked_before, msg=name)
+                    self.assertEqual(asked[len(asked_before):], ['status/other-9'],
+                                     msg='the next query did not ask for the id the response carried. {0}'.format(name))
+                    self.assertEqual(found['later']['uncaught'], [], msg=name)
+
+    def test_a_response_that_is_a_task_after_the_follow_up_was_interrupted_shows_no_notice_and_no_failure(self):
+        """AC-9107-7 (controle): com o acompanhamento interrompido (Cancel ou troca de comando, com a 1ª ou a 2ª consulta em voo), a resposta que é a tarefa, pronta ou não, solta a tela sem o aviso de erro de servidor e sem avisar `update-failed` (só o `update-finish`)."""
+        interrupted = [context for context in self.constants['noTaskContexts'] if not context.startswith('active:')]
+        self.assertEqual(interrupted, ['cancel:first', 'cancel:second', 'switch:first', 'switch:second'],
+                         msg='precondition: Cancel and the command switch, with the first and the second query in flight')
+        checked = []
+        for kind in ('min_notready', 'full_ready'):
+            for context in interrupted:
+                name = 'wellformed:{0}:{1}'.format(kind, context)
+                checked.append(name)  # antes dos asserts: a conta dos casos não pode depender de eles passarem
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.following(found['before'], context, name)
+                    after = found['after']
+                    self.assertEqual(after['uncaught'], [], msg=name)
+                    self.assertAtRest(after, msg='the interrupted follow-up did not release the screen. {0}'.format(name))
+                    self.assertEqual(after['output'], '', msg='the panel kept a text after the interruption. {0}'.format(name))
+                    self.assertAlertEmpty(after, msg='the server notice was shown for a task after the interruption. {0}'.format(name))
+                    self.assertEqual(found['log'], ['finish'], msg='the release notified update-failed or did not notify update-finish. {0}'.format(name))
+        self.assertEqual(len(checked), 8, msg='precondition: two answers, two ways to interrupt and two queries in flight')
+
+
+class SubmitNoTaskTest(ScenarioTestCase):
+    """O envio do formulário respondido com sucesso e sem tarefa (o 204, o 304, um 2xx com JSON cujo corpo não é um objeto, ou cujo `task` falta, não
+    é um objeto ou é um objeto sem `id` em texto não vazio) termina como a falha `server` (AC-9106-1 a -4 e -9, #9106).
+
+    Cada forma de resposta em cada contexto (o envio em voo com o acompanhamento ativo e interrompido pelo Cancel ou pela troca de comando): a lista
+    vem do harness. O ouvinte de host do `form-valid` fica À FRENTE da lista: o `on_form_valid` lança com a resposta sem tarefa e pularia um que
+    entrasse depois dele.
+    """
+
+    def following(self, found, name):
+        """A precondição de cada caso: o envio está em voo e a tela presa, sem consulta de estado e sem erro de script antes da resposta."""
+        before = found['before']
+        self.assertTrue(before['execute']['disabled'], msg='precondition: the screen was not held while the form was in flight. {0}'.format(name))
+        self.assertEqual(before['uncaught'], [], msg='precondition: a script error before the answer. {0}'.format(name))
+        self.assertEqual(before['statusRequests'], 0, msg='precondition: a status query before the answer. {0}'.format(name))
+
+    def sweep(self, check):
+        """Cada forma sem tarefa em cada contexto (a lista vem do harness), com a precondição conferida; `check(nome, cenário)` afirma."""
+        kinds = self.constants['submitNoTaskKinds']
+        contexts = self.constants['submitContexts']
+        self.assertEqual(len(kinds), 25, msg='precondition: the 204, the 304, six bodies that are no object, the 202, two objects with no task and fourteen tasks that are not the one the server sends')
+        for form in ('s204', 's304', 'body_null', 'body_list', 'body_text', 'body_number', 'body_true', 'body_false', 'json202', 'json_empty',
+                     'json_other', 'task_null', 'task_true', 'task_false', 'task_text', 'task_number', 'task_list', 'task_empty', 'task_noid',
+                     'id_null', 'id_empty', 'id_number', 'id_bool', 'id_list', 'id_object'):
+            self.assertIn(form, kinds, msg='precondition: the sweep has the form {0}'.format(form))
+        self.assertEqual(contexts, ['active', 'cancel', 'switch'], msg='precondition: the follow-up active, and interrupted by Cancel and by the command switch')
+        for kind in kinds:
+            for context in contexts:
+                name = 'submitnotask:{0}:{1}'.format(kind, context)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    self.following(found, name)
+                    check(name, found)
+
+    def test_a_submit_answered_with_no_task_tells_the_server_could_not_answer(self):
+        """AC-9106-1: o envio respondido com sucesso e sem tarefa mostra no aviso o texto de erro de servidor, com o acompanhamento ativo ou interrompido pelo Cancel ou pela troca de comando (um caso por forma e por contexto)."""
+        def check(name, found):
+            self.assertAlertEmpty(found['before'], msg='precondition: no notice before the answer. {0}'.format(name))
+            self.assertEqual(found['after']['uncaught'], [], msg='the success callback of the form raised. {0}'.format(name))
+            self.assertAlertShows(found['after'], self.texts['serverFailureText'], msg=name)
+        self.sweep(check)
+
+    def test_a_submit_answered_with_no_task_tells_the_reason_before_it_releases_the_screen(self):
+        """AC-9106-2: o envio respondido sem tarefa avisa o `update-failed` com o motivo `server` e depois o `update-finish`."""
+        def check(name, found):
+            self.assertEqual(found['after']['uncaught'], [], msg='the success callback of the form raised. {0}'.format(name))
+            self.assertEqual(found['log'], ['failed:server', 'finish'], msg=name)
+        self.sweep(check)
+
+    def test_a_submit_answered_with_no_task_releases_the_screen_without_asking_for_a_status(self):
+        """AC-9106-3: o envio respondido sem tarefa solta a tela (Execute habilitado, Cancel e Revoke desabilitados, sem indicador), sem consultar o estado de uma tarefa e sem lançar erro de script."""
+        def check(name, found):
+            after, later = found['after'], found['later']
+            self.assertEqual(after['uncaught'], [], msg='the success callback of the form raised. {0}'.format(name))
+            self.assertAtRest(after, msg=name)
+            # nenhuma consulta de estado: nem agora nem agendada (o timer vivo dispararia a consulta, e uma consulta a `status/undefined` e afins)
+            self.assertEqual(after['statusRequests'], 0, msg='a status query went out. {0}'.format(name))
+            self.assertEqual(after['liveTimers'], 0, msg='a status query stayed scheduled. {0}'.format(name))
+            self.assertEqual(found['statusUrls'], [], msg='a status query went out. {0}'.format(name))
+            self.assertEqual(later['statusRequests'], 0, msg='a status query went out in the 5 s after the answer. {0}'.format(name))
+            self.assertEqual(later['uncaught'], [], msg='a script error in the 5 s after the answer. {0}'.format(name))
+        self.sweep(check)
+
+    def test_a_template_without_the_alert_space_nor_the_texts_releases_the_screen_silently(self):
+        """AC-9106-3: o envio respondido sem tarefa, com um template sem o espaço do aviso nem o texto de erro de servidor, solta a tela sem lançar erro de script e sem consultar o estado."""
+        for kind in ('s204', 'task_noid'):
+            name = 'submitnotask:{0}:nospace'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertIsNone(found['before']['alert'], msg='precondition: the page has no alert space')
+                self.assertTrue(found['before']['execute']['disabled'], msg='precondition: the screen was held')
+                after = found['after']
+                self.assertEqual(after['uncaught'], [], msg='the success callback of the form raised. {0}'.format(name))
+                self.assertAtRest(after, msg=name)
+                self.assertEqual(after['statusRequests'], 0, msg='a status query went out. {0}'.format(name))
+                self.assertEqual(found['later']['statusRequests'], 0, msg='a status query went out in the 5 s after the answer. {0}'.format(name))
+                self.assertEqual(found['later']['uncaught'], [], msg=name)
+
+    def test_a_submit_answered_with_no_task_does_not_notify_form_valid(self):
+        """AC-9106-4: o envio respondido sem tarefa não avisa os ouvintes do `form-valid` do handler (o ouvinte de host entra à frente da lista)."""
+        # a pré-condição positiva: o mesmo ouvinte, à frente da lista, é avisado quando o servidor manda a tarefa
+        self.assertEqual(sorted(self.constants['submitTaskKinds']), ['extra', 'nocommand', 'ok', 'other_id'],
+                         msg='precondition: the forms that are the task')
+        for kind in self.constants['submitTaskKinds']:
+            with self.subTest(precondition=kind):
+                self.assertEqual(self.scenario('submittask:{0}'.format(kind))['formValidCalls'], 1,
+                                 msg='precondition: the host listener, first in the list, was not notified of a task')
+
+        def check(name, found):
+            self.assertEqual(found['formValidCalls'], 0, msg='a form-valid listener was notified of an answer with no task. {0}'.format(name))
+        self.sweep(check)
+
+    def test_a_submit_answered_with_no_task_leaves_no_mark_of_an_earlier_refusal(self):
+        """AC-9106-9: o envio respondido sem tarefa não deixa ao lado dos campos a mensagem nem a marca de erro de uma recusa (400) anterior, nas duas variantes dos argumentos e no campo do comando."""
+        no_message = {'app_command': [], 'args': [], 'kwargs': []}
+        not_marked = {'app_command': False, 'args': False, 'kwargs': False}
+        kinds = self.constants['submitNoTaskKinds']
+        contexts = self.constants['submitContexts']
+        self.assertEqual((len(kinds), len(contexts)), (25, 3), msg='precondition: the same forms and contexts as the sweep')
+        checked = []
+        for kind in kinds:
+            for context in contexts:
+                name = 'marks:{0}:{1}'.format(kind, context)
+                checked.append(name)  # antes dos asserts: a conta dos casos não pode depender de eles passarem
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    marked, before, after = found['marked'], found['before'], found['after']
+                    # a precondição: o 400 marcou e escreveu a mensagem ao lado de cada campo, nas duas variantes, e o envio seguinte em voo as mantém
+                    for state, when in ((marked, 'after the 400'), (before, 'while the next submit was in flight')):
+                        for field in ('app_command', 'args', 'kwargs'):
+                            self.assertTrue(state['invalidFields'][field], msg='precondition: the field {0} is not marked {1}. {2}'.format(field, when, name))
+                            self.assertTrue(state['fieldErrors'][field], msg='precondition: the field {0} has no message {1}. {2}'.format(field, when, name))
+                        self.assertEqual(state['invalidFieldsNarrow'], {'args': True, 'kwargs': True},
+                                         msg='precondition: the narrow variant is not marked {0}. {1}'.format(when, name))
+                        self.assertTrue(all(state['fieldErrorsNarrow'][field] for field in ('args', 'kwargs')),
+                                        msg='precondition: the narrow variant has no message {0}. {1}'.format(when, name))
+                    self.assertTrue(before['execute']['disabled'], msg='precondition: the second submit was in flight. {0}'.format(name))
+                    self.assertEqual(after['fieldErrors'], no_message, msg='a message of the earlier 400 was left next to a field. {0}'.format(name))
+                    self.assertEqual(after['invalidFields'], not_marked, msg='a field stayed marked by the earlier 400. {0}'.format(name))
+                    self.assertEqual(after['fieldErrorsNarrow'], {'args': [], 'kwargs': []},
+                                     msg='a message of the earlier 400 was left next to a narrow field. {0}'.format(name))
+                    self.assertEqual(after['invalidFieldsNarrow'], {'args': False, 'kwargs': False},
+                                     msg='a narrow field stayed marked by the earlier 400. {0}'.format(name))
+        self.assertEqual(len(checked), 75, msg='precondition: twenty-five forms in three contexts')
+
+
+class SubmitTaskTest(ScenarioTestCase):
+    """O envio respondido com a tarefa (um objeto com `id` em texto não vazio, com ou sem `command` e outros campos) continua sendo a tarefa (AC-9106-7 e -8, #9106).
+
+    São `SHALL CONTINUE TO` (controles): passam no código de antes do #9106 e a mutação prova que discriminam: a conferência que também exige `ready` ou
+    `command` recusa as formas mínimas, a conferência invertida trata a tarefa como a falha e a consulta com o `id` de outra tarefa falha no `other_id`.
+    """
+
+    # a precondição é a do envio sem tarefa: o envio em voo e a tela presa antes da resposta
+    following = SubmitNoTaskTest.following
+
+    def kinds(self):
+        kinds = self.constants['submitTaskKinds']
+        self.assertEqual(sorted(kinds), ['extra', 'nocommand', 'ok', 'other_id'],
+                         msg='precondition: the task as the server sends it, with no command, with more fields and with the id of another task')
+        return kinds
+
+    def test_a_submit_answered_with_a_task_notifies_form_valid_and_follows_the_task(self):
+        """AC-9106-7 (controle): com o acompanhamento ativo, o envio respondido com a tarefa avisa os ouvintes do `form-valid`, e a tarefa é acompanhada (sem o aviso de erro de servidor e sem avisar `update-failed`)."""
+        for kind in self.kinds():
+            name = 'submittask:{0}'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.following(found, name)
+                self.assertEqual(found['formValidCalls'], 1, msg='the form-valid listener was not notified of the task. {0}'.format(name))
+                self.assertEqual(found['after']['uncaught'], [], msg=name)
+                self.assertAlertEmpty(found['after'], msg='the server notice was shown for a task. {0}'.format(name))
+                self.assertEqual(found['log'], [], msg='an answer with a task notified an event of the end. {0}'.format(name))
+                # a tarefa foi acompanhada: a tela segue presa e o painel mostra o texto de execução depois da 1ª resposta «não pronta»
+                after = found['afterNotReady']
+                self.assertEqual(after['uncaught'], [], msg=name)
+                self.assertTrue(after['execute']['disabled'], msg='the screen was released for a task that is not ready. {0}'.format(name))
+                self.assertEqual(after['output'], self.texts['runningText'], msg='the task was not followed. {0}'.format(name))
+                self.assertAlertEmpty(after, msg=name)
+
+    def test_the_first_status_query_asks_for_the_id_the_submit_answer_carried(self):
+        """AC-9106-8 (controle): com o acompanhamento ativo, o envio respondido com a tarefa faz a 1ª consulta de estado pelo endereço `status/` seguido do `id` que a resposta trouxe."""
+        for kind in self.kinds():
+            name = 'submittask:{0}'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.following(found, name)
+                task_id = 'other-9' if kind == 'other_id' else 't1'
+                self.assertEqual(found['statusUrls'], ['status/{0}'.format(task_id)],
+                                 msg='the first query did not ask for the id the answer carried. {0}'.format(name))
+                self.assertEqual(found['after']['pendingStatus'], 1, msg='precondition: the first query is in flight. {0}'.format(name))
+
+
+class RevocationNoBodyTest(ScenarioTestCase):
+    """O pedido de revogação respondido com sucesso e sem um objeto JSON com o campo `status` (o 204, o 304, o JSON que não é um objeto, o objeto sem `status`) é o que falhou (AC-9106-5, #9106)."""
+
+    def test_a_revocation_answered_without_a_status_failed(self):
+        """AC-9106-5: a revogação respondida com sucesso e sem um objeto JSON com `status` é o pedido que falhou: mostra o aviso da falha e deixa o botão Revoke como a falha manda, avisa uma vez o `revoke-failed` e não lança erro de script (um caso por forma e por fase)."""
+        kinds = self.constants['revokeNoBodyKinds']
+        self.assertEqual(len(kinds), 10, msg='precondition: the 204, the 304, six bodies that are no object and two objects with no status')
+        for form in ('s204', 's304', 'body_null', 'body_list', 'body_text', 'body_number', 'body_true', 'body_false', 'json_empty', 'json_other'):
+            self.assertIn(form, kinds, msg='precondition: the sweep has the form {0}'.format(form))
+        for kind in kinds:
+            for phase in ('tracking', 'late'):
+                name = 'revokenobody:{0}:{1}'.format(kind, phase)
+                with self.subTest(scenario=name):
+                    found = self.scenario(name)
+                    # a precondição: o pedido saiu e o botão espera o servidor (desabilitado, com o indicador)
+                    self.assertTrue(found['clicked']['revoke']['disabled'], msg='precondition: the revoke button was not waiting. {0}'.format(name))
+                    self.assertTrue(found['clicked']['revoke']['progressVisible'], msg='precondition: no progress indicator. {0}'.format(name))
+                    self.assertAlertEmpty(found['clicked'], msg='precondition: a notice before the answer. {0}'.format(name))
+                    after = found['after']
+                    self.assertEqual(after['uncaught'], [], msg='the revocation callback raised. {0}'.format(name))
+                    self.assertAlertShows(after, self.texts['revokeFailedText'], msg=name)
+                    self.assertEqual(after['browserAlerts'], [], msg='a browser alert() window was used. {0}'.format(name))
+                    self.assertEqual(found['failed'], [None], msg='revoke-failed was not notified once, with no text. {0}'.format(name))
+                    if phase == 'tracking':
+                        self.assertTrue(after['execute']['disabled'], msg='precondition: the screen is still tracking. {0}'.format(name))
+                        self.assertFalse(after['revoke']['disabled'], msg='the revoke button stayed disabled. {0}'.format(name))
+                        self.assertFalse(after['revoke']['progressVisible'], msg='the revoke button kept its progress indicator. {0}'.format(name))
+                    else:
+                        self.assertAtRest(found['released'], msg='precondition: the screen was released before the answer arrived. {0}'.format(name))
+                        self.assertTrue(after['revoke']['disabled'], msg='a late failure re-enabled revoke on a released screen. {0}'.format(name))
+                        self.assertFalse(after['revoke']['progressVisible'], msg=name)
+
+
+class WorkersNoShapeTest(ScenarioTestCase):
+    """A consulta de workers respondida com sucesso e sem a forma que o servidor manda (o 204, o 304, o JSON que não é um objeto, o objeto sem `status`, o `status` verdadeiro sem a lista `workers`) é a consulta que falhou: refaz aos 5 s e deixa o aviso como estava (AC-9106-6 e -10, #9106)."""
+
+    def kinds(self):
+        kinds = self.constants['workersNoShapeKinds']
+        self.assertEqual(len(kinds), 16, msg='precondition: the 204, the 304, six bodies that are no object, two objects with no status and six answers with a status and no list')
+        for form in ('s204', 's304', 'body_null', 'body_list', 'body_text', 'body_number', 'body_true', 'body_false', 'json_empty', 'json_other',
+                     'true_noworkers', 'true_workers_null', 'true_workers_text', 'true_workers_number', 'true_workers_bool', 'true_workers_object'):
+            self.assertIn(form, kinds, msg='precondition: the sweep has the form {0}'.format(form))
+        return kinds
+
+    def test_an_answer_without_the_form_makes_the_probe_ask_again_after_5_seconds(self):
+        """AC-9106-6: a consulta de workers respondida com sucesso e sem a forma que o servidor manda refaz a consulta 5 segundos depois (e não antes), sem lançar erro de script (um caso por forma)."""
+        for kind in self.kinds():
+            name = 'workersnoshape:{0}'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertEqual(found['asked']['pendingWorkers'], 1, msg='precondition: the query is in flight. {0}'.format(name))
+                self.assertEqual(found['asked']['workersRequests'], 1, msg='precondition: one query so far. {0}'.format(name))
+                self.assertEqual(found['afterAnswer']['uncaught'], [], msg='the probe raised on the answer. {0}'.format(name))
+                self.assertEqual(found['at4999']['workersRequests'], 1, msg='the query was asked again before 5 seconds. {0}'.format(name))
+                self.assertEqual(found['at5000']['workersRequests'], 2, msg='the query was not asked again after 5 seconds. {0}'.format(name))
+                self.assertEqual(found['at5000']['uncaught'], [], msg='a script error when the query was asked again. {0}'.format(name))
+
+    def test_the_probe_asked_again_after_an_answer_without_the_form_keeps_the_options_of_the_page(self):
+        """AC-9106-6: a sonda aberta pela página, que recebe uma resposta sem a forma que o servidor manda, refaz a consulta 5 segundos depois com as opções da página: a sessão que cai depois dela leva ao login (um caso por forma)."""
+        for kind in self.kinds():
+            name = 'workerspage:{0}'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertEqual(found['afterAnswer']['uncaught'], [], msg='the probe raised on the answer. {0}'.format(name))
+                self.assertEqual(found['afterAnswer']['workersRequests'], 1, msg='precondition: one query so far. {0}'.format(name))
+                self.assertEqual(found['asked']['workersRequests'], 2, msg='precondition: the query was asked again after 5 seconds. {0}'.format(name))
+                self.assertEqual(found['afterLogin']['uncaught'], [], msg=name)
+                self.assertEqual(found['afterLogin']['locations'], [self.login_target],
+                                 msg='the login page after the query asked again did not take the user to the login: the page lost its options. {0}'.format(name))
+                self.assertEqual(found['later']['workersRequests'], 2, msg='a query went out after the login page. {0}'.format(name))
+
+    def test_the_forms_the_server_sends_still_behave_as_before(self):
+        """AC-9106-6 (controle): a lista de workers mostra os nomes e não refaz a consulta, a lista vazia mostra 0 e não refaz, e o `status` falso com `message` mostra a mensagem e refaz aos 5 s."""
+        self.assertEqual(sorted(self.constants['workersControlKinds']), ['emptylist', 'listed', 'nobody'],
+                         msg='precondition: the forms the server sends')
+        listed = self.scenario('workersnoshape:control:listed')
+        self.assertEqual(listed['afterAnswer']['uncaught'], [])
+        self.assertEqual(listed['afterAnswer']['toast'], {'body': ['w1', 'w2'], 'badge': '2', 'shown': 1})
+        self.assertEqual(listed['at5000']['workersRequests'], 1, msg='the list asked again')
+        empty = self.scenario('workersnoshape:control:emptylist')
+        self.assertEqual(empty['afterAnswer']['uncaught'], [])
+        self.assertEqual(empty['afterAnswer']['toast'], {'body': [], 'badge': '0', 'shown': 1})
+        self.assertEqual(empty['at5000']['workersRequests'], 1, msg='the empty list asked again')
+        nobody = self.scenario('workersnoshape:control:nobody')
+        self.assertEqual(nobody['afterAnswer']['uncaught'], [])
+        self.assertEqual(nobody['afterAnswer']['toast'], {'body': ['no worker'], 'badge': '', 'shown': 1})
+        self.assertEqual(nobody['at4999']['workersRequests'], 1, msg='the query was asked again before 5 seconds')
+        self.assertEqual(nobody['at5000']['workersRequests'], 2, msg='the answer with a false status did not ask again after 5 seconds')
+
+    def test_an_answer_without_the_form_leaves_the_notice_as_it_was(self):
+        """AC-9106-10: a consulta de workers respondida com sucesso e sem a forma que o servidor manda deixa o aviso como estava, fechado ou aberto, com o texto e o contador que tinha (um caso por forma)."""
+        closed = {'body': [], 'badge': '', 'shown': 0}
+        opened = {'body': ['celery@w1', '<b>w2</b>'], 'badge': '2', 'shown': 1}
+        for kind in self.kinds():
+            name = 'workersnoshape:{0}'.format(kind)
+            with self.subTest(scenario=name, notice='closed'):
+                found = self.scenario(name)
+                self.assertEqual(found['asked']['toast'], closed, msg='precondition: the notice was closed. {0}'.format(name))
+                self.assertEqual(found['afterAnswer']['toast'], closed, msg='the answer opened or changed the notice. {0}'.format(name))
+            name = 'workerskeep:{0}'.format(kind)
+            with self.subTest(scenario=name, notice='open'):
+                found = self.scenario(name)
+                self.assertEqual(found['opened']['toast'], opened, msg='precondition: the notice shows the names of the workers and their count. {0}'.format(name))
+                self.assertEqual(found['asked']['toast'], opened, msg='precondition: asking again does not touch the notice. {0}'.format(name))
+                self.assertEqual(found['asked']['pendingWorkers'], 1, msg='precondition: the second query is in flight. {0}'.format(name))
+                self.assertEqual(found['afterAnswer']['toast'], opened, msg='the answer changed the open notice. {0}'.format(name))
+                self.assertEqual(found['at5000']['toast'], opened, msg='the query asked again changed the open notice. {0}'.format(name))
+
+
+class RevokeWindowTest(ScenarioTestCase):
+    """O Revoke entre o envio do formulário e a resposta do servidor (AC-8955-3, -4 e -5)."""
+
+    def test_the_revoke_button_waits_for_the_server_to_answer_the_form(self):
+        """AC-8955-3: do envio até a resposta com a tarefa o Revoke está desabilitado (mesmo se um pedido por script falhar); com a resposta, habilitado."""
+        for run in ('first', 'second'):
+            with self.subTest(run=run):
+                found = self.scenario('revoke-window:{0}'.format(run))
+                window = found['inWindow']
+                self.assertTrue(window['execute']['disabled'], msg='precondition: the form is in flight')
+                self.assertTrue(window['revoke']['disabled'], msg='the revoke button is enabled before the server answered the form')
+                self.assertFalse(found['clicked'], msg='a click reached the disabled revoke button')
+                self.assertEqual(found['afterClick']['revokeRequests'], 0)
+                # um pedido de revogação por script na janela (a guarda e o aviso) deixa o botão como está
+                scripted = found['afterScript']
+                self.assertTrue(scripted['revoke']['disabled'], msg='a script request enabled the revoke button before the answer')
+                self.assertFalse(scripted['revoke']['progressVisible'])
+                answered = found['afterAnswer']
+                self.assertTrue(answered['execute']['disabled'], msg='precondition: the follow-up goes on')
+                self.assertFalse(answered['revoke']['disabled'], msg='the revoke button stayed disabled after the server answered the form')
+                self.assertFalse(answered['revoke']['progressVisible'])
+
+    def test_a_late_failure_of_the_previous_revocation_does_not_enable_the_button_in_the_submit_window(self):
+        """AC-8955-3: a falha tardia da revogação de uma execução anterior, na janela do envio seguinte, mostra o aviso e deixa o Revoke desabilitado."""
+        found = self.scenario('revoke-window:late-failure')
+        self.assertAtRest(found['released'], msg='precondition: the screen was released by the conclusion')
+        window = found['inWindow']
+        self.assertTrue(window['execute']['disabled'], msg='precondition: a new form is in flight')
+        self.assertTrue(window['revoke']['disabled'], msg='precondition: no task was accepted yet, the revoke button is disabled')
+        after = found['afterFailure']
+        self.assertAlertShows(after, self.texts['revokeFailedText'])
+        self.assertTrue(after['revoke']['disabled'], msg='the late failure enabled the revoke button in the submit window')
+        self.assertFalse(after['revoke']['progressVisible'])
+
+    def test_the_revoke_click_after_the_answer_asks_for_the_task_of_that_execution(self):
+        """AC-8955-4 (controle): o clique no Revoke depois da resposta pede a revogação da tarefa dessa execução, e não a de uma anterior."""
+        found = self.scenario('revoke:after-answer')
+        self.assertFalse(found['afterAnswer']['revoke']['disabled'], msg='precondition: the revoke button is enabled after the answer')
+        self.assertTrue(found['clicked'])
+        self.assertEqual(found['revokeUrls'], ['status/t2'])
+
+    def test_a_script_revocation_without_an_accepted_task_is_a_failed_revocation(self):
+        """AC-8955-5: a revogação pedida por script sem tarefa aceita na execução em curso não envia pedido nenhum, não lança erro e mostra o aviso de falha."""
+        for kind in ('before-any-submit', 'first-window', 'second-window', 'refused'):
+            name = 'script-revoke:{0}:full'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertIsNone(found['threw'], msg='the script request raised an error')
+                after = found['after']
+                self.assertEqual(found['revokeUrls'], [], msg='a revocation request was sent')
+                self.assertEqual(after['revokeRequests'], 0)
+                self.assertEqual(after['uncaught'], [])
+                self.assertAlertShows(after, self.texts['revokeFailedText'], msg=name)
+                self.assertEqual(after['browserAlerts'], [], msg='a browser alert() window was used')
+        with self.subTest(scenario='script-revoke:first-window:nospace'):
+            # um host sem o espaço do aviso (AC-8866-15): nenhum erro e nenhum texto
+            found = self.scenario('script-revoke:first-window:nospace')
+            self.assertIsNone(found['threw'], msg='the script request raised an error')
+            self.assertEqual(found['revokeUrls'], [])
+            self.assertEqual(found['after']['uncaught'], [])
+            self.assertAlertEmpty(found['after'])
+
+
+class FollowUpRobustnessTest(ScenarioTestCase):
+    """Robustez (sem ID): os caminhos do desenho que os critérios não provam sozinhos."""
+
+    def test_a_duplicate_submit_the_page_refuses_leaves_the_follow_up_alone(self):
+        # Robustez (sem ID): o beforeSubmit que o ajax() entrega ao ajaxForm repassa a recusa da página e não reinicia o estado.
+        found = self.scenario('robust:duplicate:after-cancel')
+        self.assertIs(found['duplicateProceeded'], False, msg='the page no longer refuses a second submit, or the wrapper swallowed the refusal')
+        self.assertAtRest(found['afterAnswer'], msg='the second submit undid the interruption already asked')
+        self.assertEqual(found['afterAnswer']['statusRequests'], 0)
+        found = self.scenario('robust:duplicate:following')
+        self.assertIs(found['duplicateProceeded'], False)
+        self.assertEqual(found['revokeUrls'], ['status/t1'], msg='the second submit reset the task of the follow-up in course')
+
+    def test_a_refused_form_after_an_interruption_leaves_the_next_command_followed(self):
+        # Robustez (sem ID): o envio recusado (400) depois de uma interrupção deixa o estado do acompanhamento sujo até o próximo envio.
+        found = self.scenario('robust:refused-after-interrupt')
+        self.assertAtRest(found['afterRefusal'], msg='precondition: the refused form released the screen')
+        second = found['second']
+        self.assertEqual(second['output'], 'SECOND OUTPUT', msg='the command after the refused form was not followed to its end')
+        self.assertAtRest(second)
+
+    def test_a_host_that_fires_form_valid_without_the_handler_submit_is_followed_as_before(self):
+        # Robustez (sem ID): sem o begin() (running falso), o form-valid chama o request(), que reinicia o update.
+        found = self.scenario('robust:host-without-begin')
+        self.assertAtRest(found['released'], msg='precondition: the interruption in the submit released the screen')
+        self.assertEqual(found['released']['statusRequests'], 0, msg='precondition: no query went out')
+        self.assertEqual(found['afterDirect']['statusRequests'], 1, msg='the first query did not go out')
+        answered = found['afterAnswer']
+        self.assertEqual(answered['output'], 'HOST OUTPUT', msg='the answer of the first query was not shown')
+        self.assertAtRest(answered)
+
+    def test_the_screen_released_by_an_interruption_still_revokes_the_last_task(self):
+        # Robustez (sem ID): a fronteira do AC-8955-5: a tela liberada (não o envio em curso) pede a última tarefa, sem aviso.
+        found = self.scenario('robust:released-boundary')
+        self.assertAtRest(found['released'], msg='precondition: the interruption released the screen')
+        self.assertIsNone(found['threw'])
+        self.assertEqual(found['revokeUrls'], ['status/t1'], msg='the last task was not asked to be revoked')
+        self.assertAlertEmpty(found['after'])
+
+    def test_ajax_without_a_before_submit_of_the_host_still_begins_the_follow_up(self):
+        # Robustez (sem ID): o embrulho do beforeSubmit não pode chamar uma página que não existe.
+        found = self.scenario('robust:ajax-without-before-submit')
+        self.assertEqual(found['beforeSubmitType'], 'function', msg='ajax() did not give the form a beforeSubmit')
+        self.assertNotIn('threw', found, msg='the beforeSubmit raised: {0}'.format(found.get('threw')))
+        self.assertEqual(found['returnedType'], 'undefined')
+        # o envio começou (begin): a interrupção pedida antes da resposta encerra sem consulta
+        self.assertEqual(found['afterFormValid']['statusRequests'], 0, msg='the interruption did not stop the first query')
+
+
+class AjaxRegistrationTest(ScenarioTestCase):
+    """O `ajax()` do handler chamado mais de uma vez pelo host registra o acompanhamento uma só vez (AC-8968-1 a -3)."""
+
+    CHAIN_SCENARIOS = ('ajax:again:new', 'ajax:again:same', 'ajax:again:many', 'ajax:again:mixed', 'ajax:reinit:many')
+
+    def assertOneChain(self, found, name):
+        """Uma só cadeia de consultas: uma consulta depois do form-valid, uma nova por resposta «não pronta», e a pronta a termina."""
+        sent = found['afterFormValid']
+        self.assertEqual((sent['statusRequests'], sent['pendingStatus']), (1, 1),
+                         msg='{0}: more than one status query went out for the task'.format(name))
+        waiting = found['afterNotReady']
+        self.assertEqual((waiting['pendingStatus'], waiting['liveTimers']), (0, 1),
+                         msg='{0}: the not-ready answer did not leave exactly one new query scheduled'.format(name))
+        timed = found['afterTimer']
+        self.assertEqual((timed['statusRequests'], timed['pendingStatus'], timed['liveTimers']), (2, 1, 0),
+                         msg='{0}: the timer did not send exactly one query'.format(name))
+        done = found['afterReady']
+        self.assertEqual((done['pendingStatus'], done['liveTimers']), (0, 0),
+                         msg='{0}: the ready answer did not end the follow-up (a query in flight or a timer is left)'.format(name))
+        self.assertEqual(found['afterLater']['statusRequests'], 2, msg='{0}: a query went out after the follow-up ended'.format(name))
+
+    def test_a_task_is_followed_by_one_chain_of_queries_however_many_times_ajax_was_called(self):
+        """AC-8968-1: com o ajax() chamado mais de uma vez desde o último init() (objeto novo, o devolvido ou os dois), a tarefa é acompanhada por uma só cadeia de consultas de estado."""
+        for name in self.CHAIN_SCENARIOS:
+            with self.subTest(scenario=name):
+                self.assertOneChain(self.scenario(name), name)
+
+    def test_an_interruption_during_the_submit_ends_the_follow_up_whole_with_ajax_called_again(self):
+        """AC-8968-2: o Cancel e a troca de comando durante o envio, com o ajax() chamado de novo com o objeto que ele devolveu, liberam a tela quando a resposta chega, sem consulta, e o comando seguinte é acompanhado até o fim."""
+        for trigger in ('cancel', 'switch'):
+            with self.subTest(trigger=trigger):
+                found = self.scenario('ajax:again:same:interrupt:{0}'.format(trigger))
+                self.assertEqual(found['before']['statusRequests'], 0, msg='precondition: the form is still in flight')
+                self.assertTrue(found['clicked'], msg='precondition: the interruption reached the handler (the button was enabled)')
+                answered = found['afterAnswer']
+                self.assertEqual(answered['statusRequests'], 0, msg='a status query went out for the interrupted task')
+                self.assertEqual(answered['pendingStatus'], 0)
+                self.assertEqual(answered['liveTimers'], 0)
+                self.assertAtRest(answered, msg='the screen was not released when the answer of the form arrived')
+                self.assertEqual(answered['output'], '', msg='an output was shown after the interruption')
+                self.assertEqual(found['afterAdvance']['statusRequests'], 0, msg='a status query went out later')
+                second = found['second']
+                self.assertEqual(second['output'], 'SECOND OUTPUT', msg='the next command was not followed to its end')
+                self.assertAtRest(second)
+
+    def test_the_follow_up_starts_after_the_init_and_one_ajax_call(self):
+        """AC-8968-3 (controle): o ajax(), o init() e uma só chamada do ajax() de novo ainda acompanham a tarefa, com uma só cadeia."""
+        self.assertOneChain(self.scenario('ajax:reinit'), 'ajax:reinit')
+
+    def test_a_host_that_replaces_on_form_valid_after_the_init_gets_its_function_called(self):
+        # Robustez (sem ID): depois de um init(), o ajax() liga o on_form_valid que o objeto tem então (a troca do host vale).
+        found = self.scenario('ajax:reinit:override')
+        self.assertEqual(found['calls'], ['t1'], msg='the on_form_valid the host put in place was not the one called, or it was called twice')
+        self.assertEqual(found['after']['statusRequests'], 0, msg='the default on_form_valid ran as well')
+
+    def test_init_without_ajax_does_not_wire_the_follow_up(self):
+        # Robustez (sem ID): o init() sem o ajax() não liga o acompanhamento; um form-valid disparado à mão não consulta.
+        found = self.scenario('robust:init-without-ajax')
+        self.assertEqual(found['after']['statusRequests'], 0, msg='a form-valid after init() with no ajax() started a follow-up')
+
+
+class AlertClearingTest(ScenarioTestCase):
+    """O aviso de falha some na ação seguinte do usuário (AC-8866-12)."""
+
+    def test_the_next_user_action_hides_the_previous_alert(self):
+        """AC-8866-12: enviar, interromper, trocar de comando na lista ou pedir de novo a revogação esconde o aviso anterior."""
+        for trigger in ('submit', 'cancel', 'switch', 'revoke'):
+            with self.subTest(trigger=trigger):
+                found = self.scenario('clear:{0}'.format(trigger))
+                self.assertIsNotNone(found['before']['alert'], msg='precondition: the page has an alert space')
+                self.assertFalse(found['before']['alert']['hidden'], msg='precondition: an alert is on screen')
+                self.assertNotEqual(found['before']['alert']['text'], '')
+                self.assertTrue(found['after']['alert']['hidden'], msg='the alert stayed on screen')
+                self.assertEqual(found['after']['alert']['text'], '')
+        with self.subTest(trigger='none'):
+            # controle: sem a ação do usuário o aviso fica
+            found = self.scenario('clear:none')
+            self.assertIsNotNone(found['before']['alert'])
+            self.assertFalse(found['before']['alert']['hidden'])
+            self.assertEqual(found['after']['alert'], found['before']['alert'])
+
+    def test_the_refusal_notice_goes_away_on_the_next_action(self):
+        """AC-8866-12: o aviso de recusa do envio (o 403) some quando o usuário envia de novo ou troca de comando."""
+        for trigger in ('submit', 'switch'):
+            with self.subTest(refusal=trigger):
+                found = self.scenario('clear:refusal:{0}'.format(trigger))
+                self.assertIsNotNone(found['before']['alert'], msg='precondition: the page has an alert space')
+                self.assertFalse(found['before']['alert']['hidden'], msg='precondition: the refusal notice is on screen')
+                self.assertEqual(found['before']['alert']['text'], self.texts['refusedFailureText'])
+                self.assertTrue(found['after']['alert']['hidden'], msg='the refusal notice stayed on screen')
+                self.assertEqual(found['after']['alert']['text'], '')
+
+
+class TaskOutputTest(ScenarioTestCase):
+    """O fim da tarefa e o login do formulário, que continuam como estão (AC-8866-13 e -14)."""
+
+    def test_a_finished_task_shows_its_output_as_text(self):
+        """AC-8866-13 (controle): a tarefa que termina mostra a saída (ou o traceback) como texto e libera a tela."""
+        for kind, expected in (('output', '<b>bold</b> output'), ('traceback', 'Traceback <i>x</i>')):
+            with self.subTest(kind=kind):
+                after = self.scenario('done:{0}'.format(kind))['after']
+                self.assertEqual(after['output'], expected)
+                self.assertEqual(after['outputNodes'], ['text'], msg='the output must reach the DOM as a text node only')
+                self.assertFalse(after['copyHidden'])
+                self.assertAtRest(after)
+
+    def test_the_form_answered_with_the_login_page_goes_to_the_login(self):
+        """AC-8866-14 (controle): o formulário respondido com a tela de login leva ao login, com o retorno."""
+        after = self.scenario('form:login200')['after']
+        self.assertEqual(after['locations'], [self.login_target])
+        self.assertAtRest(after)
+
+
+class FormLoginDataTypeTest(ScenarioTestCase):
+    """O formulário pede JSON: é o que faz o HTML do login cair no error dele (AC-8866-14)."""
+
+    def test_the_form_asks_for_json_so_the_login_page_reaches_its_error_handler(self):
+        """AC-8866-14 (controle): o formulário pede dataType json; sem ele o HTML do login chegaria ao success e não ao error."""
+        found = self.scenario('form:login200')
+        self.assertEqual(found['dataType'], 'json', msg='the form no longer asks for json: the login page would reach success')
+
+
+class ScriptsLoadTest(ScenarioTestCase):
+    """Os scripts carregam e a página inicializa (AC-8866-10)."""
+
+    def test_the_page_initialises_without_a_script_error(self):
+        """AC-8866-10 (controle): os scripts executam com a página montada, com a lista de comandos ligada e desligada, e o ready completa."""
+        for name, items in (('boot:list', 2), ('boot:text', 0)):
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                self.assertEqual(found['state']['uncaught'], [])
+                self.assertEqual(found['state']['consoleErrors'], [])
+                booted = found['boot']
+                self.assertTrue(booted['ajaxFormBound'], msg='the ready function stopped before binding the form')
+                self.assertTrue(booted['cancelBound'])
+                self.assertTrue(booted['revokeBound'])
+                self.assertGreaterEqual(booted['updateFinishCallbacks'], 1)
+                self.assertEqual(booted['itemsBound'], items)
+
+    def test_the_page_initialises_with_the_workers_probe_on(self):
+        """AC-8954-9 (controle): os scripts, com o de workers e o setting ligados, executam com a página montada e o ready completa."""
+        found = self.scenario('boot:workers')
+        self.assertEqual(found['state']['uncaught'], [])
+        self.assertEqual(found['state']['consoleErrors'], [])
+        self.assertEqual(found['state']['workersRequests'], 1, msg='the page did not start the workers probe')
+        booted = found['boot']
+        self.assertTrue(booted['ajaxFormBound'], msg='the ready function stopped before binding the form')
+        self.assertTrue(booted['cancelBound'])
+        self.assertTrue(booted['revokeBound'])
+
+
+class WorkersProbeTest(ScenarioTestCase):
+    """A consulta de workers da tela de comandos (`celery.workers.status.js`, com o setting ligado): a recusa que o tempo não conserta
+    para a consulta, a que o tempo conserta a refaz (AC-8954-1 a -3 e -5 a -8)."""
+
+    def test_a_forbidden_probe_stops_asking(self):
+        """AC-8954-1: o 403 da consulta de workers, na 1ª consulta ou depois de consultas que falharam ou não acharam worker, para a consulta."""
+        for prior in ('first', 'network', 'nobody', 'nobody+network'):
+            name = 'workers:forbidden:{0}'.format(prior)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                before = found['beforeForbidden']
+                self.assertEqual(before['pendingWorkers'], 1, msg='precondition: the query is in flight')
+                self.assertEqual(found['afterForbidden']['liveTimers'], 0, msg='a new query was scheduled after the refusal')
+                self.assertEqual(found['later']['workersRequests'], before['workersRequests'], msg='a query went out after the refusal')
+        with self.subTest(case='control'):
+            # controle: com a falha de rede no lugar do 403, a consulta sai de novo
+            found = self.scenario('workers:retry:network')
+            self.assertEqual(found['at5000']['workersRequests'], found['afterAnswer']['workersRequests'] + 1)
+
+    def test_a_forbidden_probe_tells_why_in_the_notice(self):
+        """AC-8954-2: o 403 mostra no aviso dos workers a frase de acesso negado, como texto e no lugar do que o aviso mostrava."""
+        phrase = self.texts['workersForbiddenText']
+        for prior in ('first', 'nobody'):
+            name = 'workers:forbidden:{0}'.format(prior)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                toast = found['afterForbidden']['toast']
+                self.assertEqual(toast['body'], [phrase], msg='the notice does not carry only the phrase of the refusal')
+                self.assertEqual(toast['shown'], found['beforeForbidden']['toast']['shown'] + 1,
+                                 msg='the refusal did not open the notice')
+
+    def test_the_login_page_on_the_probe_sends_the_user_to_the_login(self):
+        """AC-8954-3: o HTML do login na consulta de workers, na 1ª consulta ou depois de falhas, leva ao login com o retorno e para a consulta."""
+        for prior in ('first', 'network', 'nobody+network'):
+            name = 'workers:login:{0}'.format(prior)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                before = found['beforeLogin']
+                self.assertEqual(before['pendingWorkers'], 1, msg='precondition: the query is in flight')
+                after = found['afterLogin']
+                self.assertEqual(after['uncaught'], [])
+                self.assertEqual(after['locations'], [self.login_target], msg='the user was not sent to the login')
+                self.assertEqual(after['liveTimers'], 0, msg='a new query was scheduled after the login page')
+                self.assertEqual(found['later']['workersRequests'], before['workersRequests'], msg='a query went out after the login page')
+
+    def test_a_host_without_the_notice_the_plugin_or_the_phrase_stops_without_an_error(self):
+        """AC-8954-5: sem o aviso, sem o plugin de toast ou sem a frase, o 403 para a consulta sem erro de script e sem abrir um aviso sem texto."""
+        for toast in ('nophrase', 'noplugin', 'none'):
+            name = 'workers:host:{0}'.format(toast)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                before = found['beforeForbidden']
+                after = found['afterForbidden']
+                self.assertEqual(before['pendingWorkers'], 1, msg='precondition: the query is in flight')
+                self.assertEqual(after['uncaught'], [], msg='the refusal raised a script error')
+                self.assertEqual(after['liveTimers'], 0, msg='a new query was scheduled after the refusal')
+                self.assertEqual(found['later']['workersRequests'], before['workersRequests'], msg='a query went out after the refusal')
+                self.assertEqual(after['toast']['shown'], 0, msg='a notice without text was opened')
+                self.assertEqual(after['toast']['body'], [])
+
+    def test_a_probe_asked_without_the_login_destination_stops_on_the_login_page(self):
+        """AC-8954-8: a consulta chamada sem o destino do login para ao receber a tela de login, sem erro de script."""
+        found = self.scenario('workers:noarg:login')
+        self.assertEqual(found['asked']['pendingWorkers'], 1, msg='precondition: the query is in flight')
+        after = found['afterAnswer']
+        self.assertEqual(after['uncaught'], [], msg='the login page raised a script error')
+        self.assertEqual(after['liveTimers'], 0, msg='a new query was scheduled after the login page')
+        self.assertEqual(found['at5000']['workersRequests'], 1, msg='a query went out after the login page')
+        self.assertEqual(after['locations'], [], msg='the page went to a login without a destination')
+
+    def test_a_probe_that_fails_for_a_reason_that_passes_asks_again_after_5_seconds(self):
+        """AC-8954-6 (controle): o `status` falso, a falha de rede e o erro de servidor refazem a consulta 5 segundos depois."""
+        for kind in ('nobody', 'network', 'http500', 'http502'):
+            name = 'workers:retry:{0}'.format(kind)
+            with self.subTest(scenario=name):
+                found = self.scenario(name)
+                asked = found['afterAnswer']['workersRequests']
+                self.assertEqual(found['at4999']['workersRequests'], asked, msg='the query was asked again before 5 seconds')
+                self.assertEqual(found['at5000']['workersRequests'], asked + 1, msg='the query was not asked again after 5 seconds')
+        with self.subTest(case='asked without an argument'):
+            found = self.scenario('workers:noarg:network')
+            self.assertEqual(found['at4999']['workersRequests'], 1)
+            self.assertEqual(found['at5000']['workersRequests'], 2)
+        with self.subTest(case='a handler without failure_reason'):
+            found = self.scenario('workers:retry:network:noreason')
+            self.assertEqual(found['afterAnswer']['uncaught'], [])
+            self.assertEqual(found['at4999']['workersRequests'], 1)
+            self.assertEqual(found['at5000']['workersRequests'], 2)
+
+    def test_the_probe_result_reaches_the_notice_as_text(self):
+        """AC-8954-7 (controle): o resultado da consulta de workers vai ao aviso como texto, e a lista não refaz a consulta."""
+        listed = self.scenario('workers:result:listed')
+        toast = listed['afterAnswer']['toast']
+        self.assertEqual(toast['body'], ['celery@w1', '<b>w2</b>'], msg='each worker name is one text of the notice')
+        self.assertEqual(toast['badge'], '2')
+        self.assertEqual(toast['shown'], 1)
+        self.assertEqual(listed['afterAnswer']['liveTimers'], 0)
+        self.assertEqual(listed['later']['workersRequests'], 1, msg='the list asked again')
+        nobody = self.scenario('workers:result:nobody')
+        self.assertEqual(nobody['afterAnswer']['toast']['body'], ['no Celery worker answered'])
+        self.assertEqual(nobody['afterAnswer']['toast']['shown'], 1)
+
+    def test_a_probe_without_an_answer_is_cut_after_30_seconds_and_asked_again_5_seconds_later(self):
+        """AC-8961-5: a consulta de workers sem resposta é cortada aos 30 s e refeita 5 segundos depois, sem abrir o aviso dos workers."""
+        found = self.scenario('workers:timeout:default')
+        self.assertEqual(found['start']['pendingWorkers'], 1, msg='precondition: the query is in flight')
+        self.assertEqual(found['start']['workersTimeouts'], [30000], msg='the workers query does not carry the 30 s limit')
+        self.assertEqual(found['beforeCut']['pendingWorkers'], 1, msg='the query was cut before 30 seconds')
+        cut = found['atCut']
+        self.assertEqual(cut['uncaught'], [], msg='the cut raised a script error')
+        self.assertEqual(cut['pendingWorkers'], 0, msg='the query was not cut at 30 seconds')
+        self.assertEqual(cut['workersRequests'], 1)
+        self.assertEqual(cut['toast']['shown'], 0, msg='the cut opened the notice')
+        self.assertEqual(found['beforeAgain']['workersRequests'], 1, msg='the query was asked again before 5 seconds')
+        self.assertEqual(found['again']['workersRequests'], 2, msg='the query was not asked again 5 seconds after the cut')
+        self.assertEqual(found['again']['pendingWorkers'], 1)
+
+    def test_the_probe_reads_the_query_timeout_when_each_query_goes_out(self):
+        """AC-8961-5: o limite da consulta de workers é o `query_timeout` de quando ela sai (a 1ª, no carregamento, usa o que o host atribuiu até então), e 0 desliga o corte."""
+        for how in ('custom', 'hostload'):
+            with self.subTest(case=how):
+                found = self.scenario('workers:timeout:{0}'.format(how))
+                self.assertEqual(found['start']['pendingWorkers'], 1, msg='precondition: the query is in flight')
+                self.assertEqual(found['start']['workersTimeouts'], [5000], msg='the workers query does not carry the value of the host')
+                self.assertEqual(found['beforeCut']['pendingWorkers'], 1, msg='the query was cut before the value of the host')
+                self.assertEqual(found['atCut']['pendingWorkers'], 0, msg='the query was not cut at the value of the host')
+                self.assertEqual(found['atCut']['uncaught'], [])
+                self.assertEqual(found['beforeAgain']['workersRequests'], 1, msg='the query was asked again before 5 seconds')
+                self.assertEqual(found['again']['workersRequests'], 2, msg='the query was not asked again 5 seconds after the cut')
+        with self.subTest(case='zero'):
+            found = self.scenario('workers:timeout:zero')
+            self.assertEqual(found['start']['workersTimeouts'], [0], msg='the workers query does not carry the zero of the host')
+            self.assertEqual(found['later']['pendingWorkers'], 1, msg='the query was cut with the limit turned off')
+            self.assertEqual(found['later']['workersRequests'], 1)
+
+    def test_a_value_assigned_after_the_first_query_is_the_limit_of_the_next_one(self):
+        """AC-8961-5: o `query_timeout` que o host atribui depois da 1ª consulta é o limite da consulta seguinte em diante (a sonda o lê a cada rodada, e não o guarda na 1ª)."""
+        default = self.scenario('workers:timeout:default')
+        self.assertEqual(default['again']['workersTimeouts'], [30000, 30000], msg='the second query of the probe does not carry the default')
+        found = self.scenario('workers:timeout:later')
+        self.assertEqual(found['start']['workersTimeouts'], [30000], msg='precondition: the first query carries the default')
+        self.assertEqual(found['atFirstCut']['pendingWorkers'], 0, msg='precondition: the first query was cut at its own 30 seconds')
+        self.assertEqual(found['secondSent']['workersTimeouts'], [30000, 5000],
+                         msg='the next query does not carry the value the host assigned after the first one')
+        self.assertEqual(found['beforeSecondCut']['pendingWorkers'], 1, msg='the next query was cut before the value the host assigned')
+        self.assertEqual(found['atSecondCut']['pendingWorkers'], 0, msg='the next query was not cut at the value the host assigned')
+
+
+class HostTemplateTest(ScenarioTestCase):
+    """Um host com template próprio, sem o espaço do aviso ou sem os textos (AC-8866-15)."""
+
+    def test_a_host_template_without_the_alert_parts_is_tolerated(self):
+        """AC-8866-15: sem o espaço do aviso ou sem os textos, nenhum erro de script; o servidor ainda manda no que aparece."""
+        for template in ('nospace', 'spaceonly'):
+            for kind in ('http403', 'http404'):
+                name = 'status:{0}:{1}'.format(kind, template)
+                with self.subTest(scenario=name):
+                    after = self.scenario(name)['after']
+                    self.assertEqual(after['uncaught'], [])
+                    self.assertAtRest(after)
+                    self.assertAlertEmpty(after, msg=name)
+            for kind in REVOKE_KINDS:
+                name = 'revoke:{0}:{1}:tracking'.format(kind, template)
+                with self.subTest(scenario=name):
+                    after = self.scenario(name)['after']
+                    self.assertEqual(after['uncaught'], [])
+                    # a revogação que falha segue o AC-8866-2: o Revoke volta habilitado com o Execute desabilitado
+                    self.assertTrue(after['execute']['disabled'])
+                    self.assertFalse(after['revoke']['disabled'], msg='the revoke button stayed disabled')
+                    if template == 'nospace' or kind != 'falseWithError':
+                        self.assertAlertEmpty(after, msg=name)
+                    else:
+                        self.assertAlertShows(after, self.constants['serverErrorText'], msg=name)
+
+    def test_a_failure_midway_with_a_template_without_the_alert_space_leaves_the_panel_empty(self):
+        # Robustez (sem ID; o texto de nenhum critério a diz): o host sem o espaço do aviso nem os textos solta a tela em silêncio depois
+        # da falha do meio, como a 1ª consulta que falha já a solta (#9005): painel vazio, Copy escondido, nenhum texto e nenhum erro de script.
+        found = self.scenario('midway:2:http500:nospace')
+        self.assertEqual(found['before']['output'], self.texts['runningText'], msg='precondition: the panel held the running text')
+        after = found['after']
+        self.assertEqual(after['uncaught'], [])
+        self.assertAtRest(after)
+        self.assertEqual(after['output'], '', msg='the panel kept the running text')
+        self.assertTrue(after['copyHidden'], msg='the copy button is visible over an empty panel')
+        self.assertAlertEmpty(after)
+
+    def test_a_host_template_without_the_refusal_text_handles_the_refusal_silently(self):
+        """AC-9016-3 (controle): sem o texto de recusa (com ou sem o espaço do aviso, com ou sem os outros textos), o envio recusado (um 4xx e o 400 em que a tela não marca campo) solta a tela, sem erro de script e sem texto no aviso."""
+        for template in ('nospace', 'spaceonly', 'oldtexts', 'norefused'):
+            for kind in ('http403', 'http429'):
+                name = 'form:{0}:{1}'.format(kind, template)
+                with self.subTest(scenario=name):
+                    after = self.scenario(name)['after']
+                    self.assertEqual(after['uncaught'], [])
+                    self.assertAtRest(after)
+                    self.assertAlertEmpty(after, msg=name)
+        self.assertTrue(self.constants['bad400NoField'], msg='the sweep has no 400 that marks no field')
+        for kind in self.constants['bad400NoField']:
+            for context in ('nospace', 'norefused'):
+                name = 'bad400:{0}:{1}'.format(kind, context)
+                with self.subTest(scenario=name):
+                    after = self.scenario(name)['after']
+                    self.assertEqual(after['uncaught'], [])
+                    self.assertAtRest(after)
+                    self.assertAlertEmpty(after, msg=name)
+
+    def test_a_host_template_publishes_the_texts_the_model_says(self):
+        """AC-9016-3: o modelo de host que traz só o texto de recusa o mostra na recusa e nenhum texto no 5xx; o que traz os outros dois sem o de recusa mostra o de servidor e o de conexão (o dublê publica cada texto onde o modelo manda)."""
+        self.assertAlertShows(self.scenario('form:http403:onlyrefused')['after'], self.texts['refusedFailureText'],
+                              msg='the host with only the refusal text shows it')
+        for name in ('form:http500:onlyrefused', 'form:network:onlyrefused'):
+            with self.subTest(scenario=name):
+                self.assertAlertEmpty(self.scenario(name)['after'], msg=name)
+        self.assertAlertShows(self.scenario('form:http500:norefused')['after'], self.texts['serverFailureText'],
+                              msg='the host without the refusal text still shows the server error text')
+        self.assertAlertShows(self.scenario('form:network:norefused')['after'], self.texts['networkFailureText'],
+                              msg='the host without the refusal text still shows the connection text')
+
+    def test_a_host_template_without_the_alert_parts_does_not_raise(self):
+        # Robustez (sem ID): o que já vale hoje; nada lança e a consulta recusada libera a tela.
+        for template in ('nospace', 'spaceonly'):
+            for kind in ('http403', 'http404'):
+                with self.subTest(template=template, failure=kind):
+                    after = self.scenario('status:{0}:{1}'.format(kind, template))['after']
+                    self.assertEqual(after['uncaught'], [])
+                    self.assertAtRest(after)
+            for kind in REVOKE_KINDS:
+                with self.subTest(template=template, revoke=kind):
+                    self.assertEqual(self.scenario('revoke:{0}:{1}:tracking'.format(kind, template))['after']['uncaught'], [])
+
+    def test_a_host_template_without_the_failure_texts_handles_the_failures_silently(self):
+        """AC-8961-6: sem os textos de erro de servidor e de conexão (com ou sem o espaço do aviso), a consulta de estado (erro de servidor, rede, tempo limite) e o envio (5xx, rede) não lançam erro de script, liberam a tela e não mostram texto."""
+        for template in ('nospace', 'spaceonly', 'oldtexts'):
+            for kind in ('http500', 'http429', 'html502', 'network'):
+                name = 'status:{0}:{1}'.format(kind, template)
+                with self.subTest(scenario=name):
+                    after = self.scenario(name)['after']
+                    self.assertEqual(after['uncaught'], [])
+                    self.assertAtRest(after)
+                    self.assertAlertEmpty(after, msg=name)
+            name = 'timeout:status:first:{0}'.format(template)
+            with self.subTest(scenario=name):
+                cut = self.scenario(name)['at30000']
+                self.assertEqual(cut['uncaught'], [])
+                self.assertEqual(cut['pendingStatus'], 0, msg='the query was not cut')
+                self.assertAtRest(cut)
+                self.assertAlertEmpty(cut, msg=name)
+            for kind in ('http500', 'network'):
+                name = 'form:{0}:{1}'.format(kind, template)
+                with self.subTest(scenario=name):
+                    after = self.scenario(name)['after']
+                    self.assertEqual(after['uncaught'], [])
+                    self.assertAtRest(after)
+                    self.assertAlertEmpty(after, msg=name)
+
+    def test_a_host_template_with_only_one_failure_text_shows_that_one_on_the_submit_and_the_cut(self):
+        """AC-8961-6: o host que traz só um dos dois textos mostra o dele também no envio e no corte da consulta, e fica sem texto na outra falha (nunca o texto da outra)."""
+        # noserver traz só o texto de conexão; nonetwork, só o de servidor
+        for template, kind, text in (('noserver', 'http500', None), ('noserver', 'network', 'networkFailureText'),
+                                     ('nonetwork', 'http500', 'serverFailureText'), ('nonetwork', 'network', None)):
+            name = 'form:{0}:{1}'.format(kind, template)
+            with self.subTest(scenario=name):
+                after = self.scenario(name)['after']
+                self.assertEqual(after['uncaught'], [])
+                self.assertAtRest(after)
+                if text is None:
+                    self.assertAlertEmpty(after, msg=name)
+                else:
+                    self.assertAlertShows(after, self.texts[text], msg=name)
+        # o corte da consulta de estado é uma falha de conexão
+        for template, text in (('noserver', 'networkFailureText'), ('nonetwork', None)):
+            name = 'timeout:status:first:{0}'.format(template)
+            with self.subTest(scenario=name):
+                cut = self.scenario(name)['at30000']
+                self.assertEqual(cut['uncaught'], [])
+                self.assertEqual(cut['pendingStatus'], 0, msg='precondition: the query was cut')
+                self.assertAtRest(cut)
+                if text is None:
+                    self.assertAlertEmpty(cut, msg=name)
+                else:
+                    self.assertAlertShows(cut, self.texts[text], msg=name)
+
+    def test_a_host_template_with_only_one_failure_text_shows_that_one(self):
+        """AC-8961-6: o host que traz só um dos dois textos mostra o dele na falha que ele cobre e fica sem texto na outra, sem erro de script."""
+        # noserver traz só o texto de conexão; nonetwork, só o de servidor
+        for template, kind, text in (('noserver', 'http500', None), ('noserver', 'network', 'networkFailureText'),
+                                     ('nonetwork', 'http500', 'serverFailureText'), ('nonetwork', 'network', None)):
+            name = 'status:{0}:{1}'.format(kind, template)
+            with self.subTest(scenario=name):
+                after = self.scenario(name)['after']
+                self.assertEqual(after['uncaught'], [])
+                self.assertAtRest(after)
+                if text is None:
+                    self.assertAlertEmpty(after, msg=name)
+                else:
+                    self.assertAlertShows(after, self.texts[text], msg=name)
+
+
+def balanced_call(source, start):
+    """Devolve o texto de `source` do `(` em `start` até o `)` que o fecha."""
+    depth = 0
+    for index in range(start, len(source)):
+        if source[index] == '(':
+            depth += 1
+        elif source[index] == ')':
+            depth -= 1
+            if depth == 0:
+                return source[start:index + 1]
+    raise AssertionError('unbalanced parentheses in cmdhandler.js')
+
+
+class ButtonCollector(HTMLParser):
+    """Coleta, por id, os atributos das tags da página."""
+
+    def __init__(self):
+        super().__init__()
+        self.by_id = {}
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if attributes.get('id'):
+            self.by_id[attributes['id']] = attributes
+
+
+class DoubleAssumptionsTest(TestCase):
+    """As suposições que o dublê de node fixa, conferidas contra o código e o template reais."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = create_user()
+
+    def test_the_status_query_and_the_revocation_ask_for_json(self):
+        # O dublê manda o HTML do login ao .fail (parsererror) só quando o $.ajax pede dataType json: se um dos dois
+        # deixar de pedir, o dublê passaria a provar o que o navegador não faz.
+        source = CMDHANDLER.read_text(encoding='utf-8')
+        # os comentários saem antes: uma menção a `$.ajax(` num comentário não é uma chamada
+        source = re.sub(r'/\*.*?\*/', '', source, flags=re.S)
+        source = re.sub(r'//[^\n]*', '', source)
+        calls = [balanced_call(source, match.end() - 1) for match in re.finditer(r'\$\.ajax\(', source)]
+        self.assertEqual(len(calls), 2, msg='expected the status query and the revocation')
+        for call in calls:
+            with self.subTest(call=call[:60]):
+                self.assertRegex(call, r'dataType\s*:\s*[\'"]json[\'"]', msg='this $.ajax does not ask for dataType json')
+
+    def test_jquery_form_asks_before_submit_before_the_ajax_and_aborts_on_false(self):
+        # O dublê (world.js, executeStart) chama o beforeSubmit à mão e segue o envio se ele não devolver false, e não executa o
+        # jquery.form: é essa ordem que o begin() do ajax() usa (o begin() roda no beforeSubmit, antes do $.ajax do envio, e uma
+        # página que o recusa não começa nada). Lida na fonte entregue (jquery.form.v4.4.2.min.js, ajaxSubmit); se a versão
+        # do jquery.form mudar, este teste obriga a conferir a ordem de novo.
+        source = JQUERY_FORM.read_text(encoding='utf-8')
+        calls = list(re.finditer(r't\.beforeSubmit&&!1===t\.beforeSubmit\([^)]*\)\)return', source))
+        self.assertEqual(len(calls), 1, msg='the beforeSubmit that aborts the submit on false was not found, or is found twice')
+        position = calls[0].start()
+        validate = source.index('form-submit-validate')
+        ajax = re.search(r'\.ajax\(', source)
+        self.assertLess(position, validate, msg='the beforeSubmit no longer runs before the form-submit-validate event')
+        self.assertLess(position, ajax.start(), msg='the beforeSubmit no longer runs before the $.ajax of the submit')
+
+    def test_jquery_form_unbinds_the_form_events_before_it_binds_the_new_options(self):
+        # O dublê (world.js, ajaxForm) guarda só o último objeto de opções: o jquery.form de verdade, chamado de novo no mesmo
+        # elemento, desliga os eventos do formulário antes de ligar os do objeto novo (ajaxFormUnbind), então um host que chama o
+        # ajax() mais de uma vez tem um `success` por envio e o que acumula é a lista de ouvintes do handler (#8968). Lido na fonte
+        # entregue (jquery.form.v4.4.2.min.js, ajaxForm); se a versão mudar, este teste obriga a conferir de novo.
+        source = JQUERY_FORM.read_text(encoding='utf-8')
+        found = re.findall(r'ajaxFormUnbind\(\)\.on\(["\']submit\.form-plugin["\']', source)
+        self.assertEqual(len(found), 1, msg='ajaxForm no longer unbinds the form events before it binds the new ones (or does it twice)')
+
+    def test_the_vendored_jquery_cuts_a_query_with_a_positive_timeout_as_a_timeout(self):
+        # O dublê (world.js, $.ajax) corta o pedido sem resposta quando `timeout > 0` passa, com `textStatus` «timeout» e `status` 0, e
+        # não corta com 0, null nem undefined: é o que o jQuery entregue faz (jquery-3.7.1.min.js, linha do `setTimeout` do `ajax`).
+        # Se a versão mudar, este teste obriga a conferir o corte de novo (#8961).
+        source = (STATIC_CMDASYNC / 'js' / 'jquery-3.7.1.min.js').read_text(encoding='utf-8')
+        self.assertRegex(source, r'async&&0<\w+\.timeout&&\(\w+=\w+\.setTimeout\(function\(\)\{\w+\.abort\("timeout"\)\},\w+\.timeout\)\)',
+                         msg='the vendored jQuery no longer cuts a query with a positive timeout by abort("timeout")')
+
+    def test_the_vendored_jquery_resolves_a_204_as_success_with_no_data_as_the_double_does(self):
+        # O cenário `html202` do dublê (2xx com corpo HTML) chega ao `.fail` como `parsererror` com o status do 2xx; o 204 não: o jQuery
+        # o resolve como sucesso («nocontent») e o `.done` recebe `data` indefinido, e o dublê (world.js, `outcome`) o repete desde o
+        # #9018 (o `NOTASK_RESPONSES.s204`). Lido na fonte entregue (jquery-3.7.1.min.js); se a versão mudar, este teste obriga a
+        # conferir o que o dublê supõe (#8961, #9018).
+        source = (STATIC_CMDASYNC / 'js' / 'jquery-3.7.1.min.js').read_text(encoding='utf-8')
+        self.assertRegex(source, r'204===\w+\|\|"HEAD"===\w+\.type\?\w+="nocontent"',
+                         msg='the vendored jQuery no longer resolves a 204 as success (nocontent)')
+
+    def test_the_vendored_jquery_resolves_a_304_as_success_with_no_data_as_the_double_does(self):
+        # O 304 chega ao `.done` como o 204: «notmodified» e `data` indefinido (o `data` só é atribuído no 3º ramo da cadeia). O dublê
+        # (world.js, `outcome`) o repete (o `NOTASK_RESPONSES.s304`, #9018). Lido na fonte entregue (jquery-3.7.1.min.js, a linha do
+        # `204===e||"HEAD"===v.type?l="nocontent":304===e?l="notmodified":(l=s.state,o=s.data,i=!(a=s.error))`).
+        source = (STATIC_CMDASYNC / 'js' / 'jquery-3.7.1.min.js').read_text(encoding='utf-8')
+        self.assertRegex(source, r'204===\w+\|\|"HEAD"===\w+\.type\?\w+="nocontent":304===\w+\?\w+="notmodified":\(\w+=\w+\.state,\w+=\w+\.data,',
+                         msg='the vendored jQuery no longer resolves a 304 as success with no data (notmodified)')
+
+    def test_the_vendored_jquery_sets_response_json_only_after_the_json_conversion_succeeds(self):
+        # O 400 sem corpo, com HTML ou com texto chega ao `error` do envio sem `xhr.responseJSON`: o `ajaxConvert` atribui
+        # `jqXHR[responseFields[tipo]]` no COMEÇO de cada volta do laço dos tipos, e a conversão `text json` (`JSON.parse`) acontece entre
+        # a volta de `text` e a de `json`; quando ela lança, o `ajaxConvert` devolve `parsererror` sem entrar na volta de `json`. O
+        # harness monta o `xhr` assim (scenarios.js, `BAD400_RESPONSES`). Lido na fonte entregue (jquery-3.7.1.min.js); se a
+        # versão mudar, este teste obriga a conferir o que o harness supõe (#9017).
+        source = (STATIC_CMDASYNC / 'js' / 'jquery-3.7.1.min.js').read_text(encoding='utf-8')
+        self.assertRegex(source, r'responseFields:\{xml:"responseXML",text:"responseText",json:"responseJSON"\}',
+                         msg='the vendored jQuery no longer names the response fields the way the harness assumes')
+        self.assertRegex(source, r'"text json":JSON\.parse', msg='the vendored jQuery no longer converts a JSON answer by JSON.parse')
+        loop = re.compile(r'while\((\w+)\)if\(\w+\.responseFields\[\1\]&&\(\w+\[\w+\.responseFields\[\1\]\]=\w+\).*?'
+                          r'try\{\w+=\w+\(\w+\)\}catch\(\w+\)\{return\{state:"parsererror"', flags=re.S)
+        self.assertRegex(source, loop,
+                         msg='the vendored jQuery no longer sets each response field at the top of the loop, before the conversion that can fail')
+
+    def test_the_vendored_jquery_text_with_no_value_changes_nothing_as_the_double_does(self):
+        # O erro nulo de um campo chega ao `.text()` da página como `undefined` (`(errors[name] || [])[0]`); o dublê (world.js, `text`)
+        # trata `.text(undefined)` como o getter-setter do jQuery: sem valor, nada muda. No jQuery entregue (jquery-3.7.1.min.js) o `text`
+        # passa o `arguments.length` ao `access`, que só chama o setter quando o valor não é `undefined` e, senão, devolve o objeto
+        # (`return i?e:…`). Se a versão mudar, este teste obriga a conferir o que o dublê supõe (#9017).
+        source = (STATIC_CMDASYNC / 'js' / 'jquery-3.7.1.min.js').read_text(encoding='utf-8')
+        self.assertRegex(source, r'text:function\(\w+\)\{return \w+\(this,function\(\w+\)\{return void 0===\w+\?\w+\.text\(this\):this\.empty\(\)'
+                                 r'\.each\(function\(\)\{[^}]*textContent=\w+\)\}\)\},null,\w+,arguments\.length\)\}',
+                         msg='the vendored jQuery no longer passes arguments.length to access() from text()')
+        access = re.compile(r'else if\(void 0!==\w+&&\(\w+=!0,.*?return \w+\?\w+:\w+\?\w+\.call\(\w+\):', flags=re.S)
+        self.assertRegex(source, access, msg='the vendored jQuery no longer skips the setter and returns the object for an undefined value')
+
+    def test_the_wide_variant_of_the_arguments_shows_above_768_px(self):
+        """AC-9019-7 (controle): a regra entregue esconde a variante larga dos argumentos até 768 px e a estreita acima de 768 px, e cada template traz a classe da sua variante."""
+        css = (STATIC_CMDASYNC / 'styles.css').read_text(encoding='utf-8')
+        narrow = re.search(r'@media screen and \(max-width:\s*768px\)\s*\{(.*?)\n\}', css, flags=re.S)
+        wide = re.search(r'@media screen and \(min-width:\s*769px\)\s*\{(.*?)\n\}', css, flags=re.S)
+        self.assertIsNotNone(narrow, msg='the rules for the screens up to 768 px are gone')
+        self.assertIsNotNone(wide, msg='the rules for the screens above 768 px are gone')
+        self.assertRegex(narrow.group(1), r'\.form-task-args-lg\s*\{\s*display:\s*none;\s*\}', msg='the wide variant is not hidden up to 768 px')
+        self.assertRegex(narrow.group(1), r'\.form-task-args-md\s*\{\s*display:\s*block;\s*\}', msg='the narrow variant is not shown up to 768 px')
+        self.assertRegex(wide.group(1), r'\.form-task-args-md\s*\{\s*display:\s*none;\s*\}', msg='the narrow variant is not hidden above 768 px')
+        self.assertNotIn('form-task-args-lg', wide.group(1), msg='the wide variant is hidden above 768 px')
+        templates = ROOT / 'commands_async' / 'templates' / 'cmdasync'
+        for name, css_class in (('response-form-task-args-lg.html', 'form-task-args-lg'), ('response-form-task-args-md.html', 'form-task-args-md')):
+            with self.subTest(template=name):
+                self.assertIn(css_class, (templates / name).read_text(encoding='utf-8'), msg='the template lost its variant class')
+
+    def test_jquery_form_hands_the_jqxhr_to_the_error_of_the_page(self):
+        # O dublê chama o `error` do ajaxForm com o jqXHR como 1º argumento, e a falha de rede chega a ele com `status` 0: o jquery.form
+        # embrulha o `error` do host e o repassa com o que o $.ajax entrega (`t.error=function(e,r,a){…w.apply(n,[e,r,a,p])}`). O
+        # formulário não tem campo de arquivo, então o caminho de iframe (que não passa pelo $.ajax) não é usado (#8961).
+        source = JQUERY_FORM.read_text(encoding='utf-8')
+        self.assertRegex(source, r't\.error=function\(e,r,a\)\{var n=t\.context\|\|this;w\.apply\(n,\[e,r,a,p\]\)\}',
+                         msg='the jquery.form no longer hands the jqXHR of the $.ajax to the error of the page')
+
+    def test_jquery_form_hands_the_data_the_status_and_the_jqxhr_to_the_success_of_the_page(self):
+        # Robustez (sem ID): o dublê (`world.formAnswer`, #9106) chama o `success` do ajaxForm com `(data, textStatus, jqXHR, $form)`, que é o que o
+        # jquery.form repassa de um sucesso do $.ajax (`t.success=function(e,r,a){…T[i].apply(n,[e,r,a||p,p])}`: o 3º argumento é o jqXHR, e o 4º o
+        # formulário). O `data` indefinido do 204 e do 304 chega assim, e o `query_failed(xhr, statusText)` do envio sem tarefa recebe um jqXHR. O formulário
+        # não tem campo de arquivo, então o caminho de iframe (que monta um `xhr` próprio) não é usado.
+        source = JQUERY_FORM.read_text(encoding='utf-8')
+        self.assertRegex(source, r't\.success=function\(e,r,a\)\{for\(var n=t\.context\|\|this,i=0,o=T\.length;i<o;i\+\+\)T\[i\]\.apply\(n,\[e,r,a\|\|p,p\]\)\}',
+                         msg='the jquery.form no longer hands (data, textStatus, jqXHR, form) to the success of the page')
+
+    def test_the_double_publishes_the_failure_texts_the_template_publishes(self):
+        """AC-8961-7: as frases que o painel da página publica são as mesmas que o dublê de node usa nos cenários de falha."""
+        # O dublê (world.js, TEXTS) publica os dois textos novos nos data-* do painel; se o template mudar a frase, os testes de node
+        # passariam a provar um texto que a tela não mostra (os testes de `test_page.py` conferem o template contra as frases do critério).
+        self.client.force_login(self.user)
+        panel = ButtonCollector()
+        panel.feed(self.client.get(INDEX_URL).content.decode('utf-8'))
+        texts = load_scenarios()['constants']['texts']
+        self.assertEqual(panel.by_id['task-panel'].get('data-server-error-text'), texts['serverFailureText'])
+        self.assertEqual(panel.by_id['task-panel'].get('data-network-error-text'), texts['networkFailureText'])
+
+    def test_the_double_publishes_the_refusal_text_the_template_publishes(self):
+        """AC-9016-2: a frase do texto de recusa que o painel da página publica é a mesma que o dublê de node usa nos cenários de recusa."""
+        self.client.force_login(self.user)
+        panel = ButtonCollector()
+        panel.feed(self.client.get(INDEX_URL).content.decode('utf-8'))
+        texts = load_scenarios()['constants']['texts']
+        self.assertEqual(panel.by_id['task-panel'].get('data-refused-text'), texts['refusedFailureText'])
+
+    def test_the_workers_script_reaches_only_the_body_and_the_counter_of_the_notice(self):
+        """AC-8969-3 (controle): dentro do aviso, o script da consulta de workers só alcança o corpo e o contador, então o título, o ícone e o botão de fechar ficam como o template os entrega."""
+        # Teste de fonte: o dublê de node (world.js) devolve vazio para um seletor que ele não conhece, então não pegaria uma escrita
+        # nova no cabeçalho. Uma escrita que não passe por `$toast.find(...)` (`.children()`, um seletor global) passa este teste.
+        source = (STATIC_CMDASYNC / 'js' / 'celery.workers.status.js').read_text(encoding='utf-8')
+        # os comentários saem antes: uma menção a `$toast.find(` num comentário não é uma chamada
+        source = re.sub(r'/\*.*?\*/', '', source, flags=re.S)
+        source = re.sub(r'//[^\n]*', '', source)
+        selectors = set(re.findall(r'\$toast\.find\(\s*[\'"]([^\'"]+)[\'"]\s*\)', source))
+        self.assertEqual(selectors, {'.toast-body', '.online'}, msg='the script reaches a part of the notice other than the body and the counter')
+        self.assertNotIn('toast-header', source, msg='the script names the header of the notice')
+
+    def test_the_workers_script_does_not_reach_the_notice_by_traversal_or_a_global_selector(self):
+        """AC-8969-3 (controle): o script da consulta de workers não alcança o aviso por travessia (`.prev()`, `.children()`…) nem por um seletor global: só pelo `$toast`, e só o corpo e o contador."""
+        # Reforço do teste acima (o verificador): o título do aviso ficaria a um `.prev()` do contador, ou a um `$('.mr-auto')`, sem
+        # que o seletor do `$toast.find(...)` mudasse. O que sobra sem teste (a Premissa 3 da spec o aceita): `$('#popup-msg').find(...)`,
+        # um seletor em variável, `.add(...)`, `document.querySelector` e uma API do DOM (`firstElementChild`).
+        source = (STATIC_CMDASYNC / 'js' / 'celery.workers.status.js').read_text(encoding='utf-8')
+        source = re.sub(r'/\*.*?\*/', '', source, flags=re.S)
+        source = re.sub(r'//[^\n]*', '', source)
+        for method in ('prev', 'next', 'prevAll', 'nextAll', 'prevUntil', 'nextUntil', 'siblings', 'children', 'contents', 'parent',
+                       'parents', 'closest', 'first', 'last', 'eq', 'get'):
+            with self.subTest(method=method):
+                self.assertNotRegex(source, r'\.' + method + r'\(', msg='the script walks the DOM with .{0}()'.format(method))
+        # `$('#popup-msg')` é o aviso; `$('<p ...>')` cria um elemento; qualquer outro seletor global alcançaria o que o `$toast` não alcança
+        reached = [text for text in re.findall(r'\$\(\s*[\'"]([^\'"]*)[\'"]\s*\)', source) if text != '#popup-msg' and not text.startswith('<')]
+        self.assertEqual(reached, [], msg='the script reaches the page with a global selector')
+
+    def test_the_notice_of_the_page_has_the_body_and_the_badge_the_double_assumes(self):
+        """AC-8969-5 (controle): o aviso dos workers traz o corpo (.toast-body) onde o script escreve os nomes e as mensagens e o contador (.online) onde ele escreve o número de workers online."""
+        # O dublê (world.js) dá ao #popup-msg um `.toast-body` e um `.online` à mão; o script de workers escreve a frase do 403, os
+        # nomes e a mensagem no `.toast-body` e o número no `.online`. Lido na página real (#8954): se o template renomear um dos
+        # dois, o aviso sai vazio na tela e os testes de node seguem verdes.
+        self.client.force_login(self.user)
+        html = self.client.get(INDEX_URL).content.decode('utf-8')
+        start = html.index("id='popup-msg'")
+        notice = html[start:html.index('id="wrap"', start)]
+        self.assertRegex(notice, r'class="[^"]*\btoast-body\b', msg='the notice of the page lost its .toast-body')
+        self.assertRegex(notice, r'class="[^"]*\bonline\b', msg='the notice of the page lost its .online badge')
+
+    def test_the_page_loads_the_bootstrap_bundle_that_registers_the_toast_plugin(self):
+        # O script de workers só abre o aviso quando `$.fn.toast` existe (um host sem o bootstrap.bundle não o tem, e a chamada lançaria):
+        # a página do pacote tem de carregar o bundle, e o bundle vendido tem de registrar o plugin, senão o guarda engole o aviso
+        # em silêncio (#8954).
+        self.client.force_login(self.user)
+        html = self.client.get(INDEX_URL).content.decode('utf-8')
+        loaded = re.findall(r'<script[^>]*src="[^"]*(bootstrap-[0-9.]+)/js/bootstrap\.bundle\.min\.js"', html)
+        self.assertEqual(len(loaded), 1, msg='the page does not load the bootstrap bundle exactly once')
+        bundle = STATIC_CMDASYNC / loaded[0] / 'js' / 'bootstrap.bundle.min.js'
+        self.assertRegex(bundle.read_text(encoding='utf-8'), r'\.fn\.toast=[A-Za-z]+\._jQueryInterface',
+                         msg='the vendored bundle does not register the toast plugin')
+
+    def test_the_double_starts_from_the_template_state_of_the_buttons(self):
+        # O dublê assume Execute habilitado e Cancel e Revoke desabilitados; é o que o template entrega.
+        self.client.force_login(self.user)
+        collector = ButtonCollector()
+        collector.feed(self.client.get(INDEX_URL).content.decode('utf-8'))
+        initial = load_scenarios()['constants']['initialButtons']
+        for button, key in (('btn-task-submit', 'execute'), ('btn-task-cancel', 'cancel'), ('btn-task-revoke', 'revoke')):
+            with self.subTest(button=button):
+                self.assertIn(button, collector.by_id)
+                self.assertEqual('disabled' in collector.by_id[button], initial[key])

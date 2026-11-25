@@ -1,6 +1,6 @@
-<div class="toast fade" data-delay="5000" id='popup-msg'>
+{% load i18n %}{# data-forbidden-text: what workers_check_status shows when the probe is refused (403). #}<div class="toast fade" data-delay="5000" id='popup-msg' data-forbidden-text="{% trans "Access denied: your session may have expired, or you do not have permission to see the Celery workers." %}">
     <div class="toast-header">
-        <strong class="mr-auto"><i class="fa fa-grav"></i>Celery Workers Online</strong>
+        <strong class="mr-auto"><i class="fa fa-grav"></i>{% trans "Celery workers" %}</strong>
         <span class="badge badge-secondary online"></span>
         <button type="button" class="ml-2 mb-1 close" data-dismiss="toast">&times;</button>
     </div>
